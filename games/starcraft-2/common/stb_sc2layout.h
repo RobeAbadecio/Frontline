@@ -1,0 +1,1572 @@
+/*
+ * stb_sc2layout.h — SC2 .SC2Layout XML parser and frame builder (single-header).
+ *
+ * Parses StarCraft II UI layout files (.SC2Layout) into sc2BaseFrame_t arrays.
+ * Uses common/tinyxml.h for XML parsing.
+ *
+ * Declarations-only mode (default):
+ *   Include this header normally to get types and extern declarations.
+ *
+ * Implementation mode:
+ *   #define STB_SC2LAYOUT_IMPLEMENTATION before including this header in exactly
+ *   one .c file to get the full parser and layout builder.
+ *
+ * Host services required (provided by the server game module):
+ *   sc2_layout_import for archive reads and authoritative asset indexing.
+ */
+#ifndef stb_sc2layout_h
+#define stb_sc2layout_h
+
+#include "common/shared.h"
+
+/* -------------------------------------------------------------------------- */
+/* Constants                                                                   */
+/* -------------------------------------------------------------------------- */
+#define SC2_MAX_FRAMES     4096
+#define SC2_MAX_TEMPLATES  8192 // native GameUI needs independent inherited descendants; deep instances exceed 4096
+#define SC2_MAX_INCLUDES   128
+#define SC2_MAX_ANCHORS    4
+#define SC2_MAX_CONSTANTS  256
+#define SC2_MAX_TEXTURES   8
+#define SC2_MAX_CHILDREN   64
+
+/* SC2 UI interaction flags */
+#define SC2_UIFLAG_PRESSED              (1 << 0)
+#define SC2_UIFLAG_HOVERED              (1 << 1)
+#define SC2_UIFLAG_CHECKED              (1 << 2)
+#define SC2_UIFLAG_HIDDEN               (1 << 3)
+#define SC2_UIFLAG_DISABLED             (1 << 4)
+#define SC2_UIFLAG_HIDDEN_IN_HIERARCHY  (1 << 5)
+
+/* SC2 frame flags (sc2Frame_t.flags) */
+#define SC2_FRAME_HAS_WIDTH             (1 << 0)
+#define SC2_FRAME_HAS_HEIGHT            (1 << 1)
+#define SC2_FRAME_VISIBLE               (1 << 2)
+#define SC2_FRAME_HAS_VISIBLE           (1 << 3)
+#define SC2_FRAME_ACCEPTS_MOUSE         (1 << 4)
+#define SC2_FRAME_HAS_COLOR             (1 << 5)
+#define SC2_FRAME_HAS_ALPHA             (1 << 6)
+#define SC2_FRAME_COLLAPSE_LAYOUT       (1 << 7)
+#define SC2_FRAME_HIGHLIGHT_ON_HOVER    (1 << 8)
+#define SC2_FRAME_HIGHLIGHT_ON_FOCUS    (1 << 9)
+#define SC2_FRAME_BATCH_IMAGES          (1 << 10)
+#define SC2_FRAME_BATCH_TEXT            (1 << 11)
+#define SC2_FRAME_HAS_DESC_FLAGS        (1 << 12)
+#define SC2_FRAME_DESC_FLAGS_INTERNAL   (1 << 13)
+
+/* SC2 texture flags */
+#define SC2_TEX_TILED                   (1 << 0)
+#define SC2_TEX_HAS_TEXTURE             (1 << 1)
+#define SC2_TEX_LAYER_HIDDEN            (1 << 2)
+
+/* SC2 anchor flags */
+#define SC2_ANCHOR_HAS                  (1 << 0)
+
+/* SC2 backdrop flags */
+#define SC2_BACKDROP_TILE               (1 << 0)
+
+/* UI flags for sc2BaseFrame_t */
+#define SC2_UIF_HIDDEN   (1 << 10)
+#define SC2_UIF_DISABLED (1 << 11)
+#define SC2_UIF_PRESSED  (1 << 12)
+#define SC2_UIF_HOVERED  (1 << 13)
+
+/* -------------------------------------------------------------------------- */
+/* SC2 anchor side indices                                                     */
+/* -------------------------------------------------------------------------- */
+typedef enum {
+    SC2_SIDE_TOP,
+    SC2_SIDE_BOTTOM,
+    SC2_SIDE_LEFT,
+    SC2_SIDE_RIGHT,
+    SC2_SIDE_COUNT,
+} SC2Side;
+
+/* SC2 anchor position */
+typedef enum {
+    SC2_POS_MIN,
+    SC2_POS_MID,
+    SC2_POS_MAX,
+    SC2_POS_COUNT,
+} SC2Pos;
+
+/* SC2 frame type */
+typedef enum {
+    SC2_FRAMETYPE_FRAME,
+    SC2_FRAMETYPE_BUTTON,
+    SC2_FRAMETYPE_IMAGE,
+    SC2_FRAMETYPE_LABEL,
+    SC2_FRAMETYPE_EDITBOX,
+    SC2_FRAMETYPE_TOOLTIP,
+    SC2_FRAMETYPE_MODEL,
+    SC2_FRAMETYPE_CONSOLE_PANEL,
+    SC2_FRAMETYPE_COMMAND_PANEL,
+    SC2_FRAMETYPE_COMMAND_BUTTON,
+    SC2_FRAMETYPE_COMMAND_TOOLTIP,
+    SC2_FRAMETYPE_INFO_PANEL,
+    SC2_FRAMETYPE_MINIMAP_PANEL,
+    SC2_FRAMETYPE_MINIMAP,
+    SC2_FRAMETYPE_RESOURCE_PANEL,
+    SC2_FRAMETYPE_PORTRAIT_PANEL,
+    SC2_FRAMETYPE_PORTRAIT,
+    SC2_FRAMETYPE_GAME_UI,
+    SC2_FRAMETYPE_WORLD_PANEL,
+    SC2_FRAMETYPE_COUNTDOWN_LABEL,
+    SC2_FRAMETYPE_HERO_PANEL,
+    SC2_FRAMETYPE_INVENTORY_PANEL,
+    SC2_FRAMETYPE_IDLE_BUTTON,
+    SC2_FRAMETYPE_AI_BUTTON,
+    SC2_FRAMETYPE_PYLON_BUTTON,
+    SC2_FRAMETYPE_MESSAGE_DISPLAY,
+    SC2_FRAMETYPE_ALERT_PANEL,
+    SC2_FRAMETYPE_ALERT_DISPLAY,
+    SC2_FRAMETYPE_CHAT_BAR,
+    SC2_FRAMETYPE_MENU_BAR,
+    SC2_FRAMETYPE_SUBTITLE_PANEL,
+    SC2_FRAMETYPE_TIME_PANEL,
+    SC2_FRAMETYPE_CREDITS_PANEL,
+    SC2_FRAMETYPE_CONTROL_GROUP_PANEL,
+    SC2_FRAMETYPE_MINIMAP_PANEL_TOOLTIP,
+    SC2_FRAMETYPE_REVEAL_PANEL,
+    SC2_FRAMETYPE_ALLIANCE_PANEL,
+    SC2_FRAMETYPE_TEAM_RESOURCE_PANEL,
+    SC2_FRAMETYPE_LEADER_PANEL,
+    SC2_FRAMETYPE_OBSERVER_PANEL,
+    SC2_FRAMETYPE_REPLAY_PANEL,
+    SC2_FRAMETYPE_TALKER_PANEL,
+    SC2_FRAMETYPE_PURCHASE_PANEL,
+    SC2_FRAMETYPE_RESEARCH_PANEL,
+    SC2_FRAMETYPE_PLANET_PANEL,
+    SC2_FRAMETYPE_CASH_PANEL,
+    SC2_FRAMETYPE_RESOURCE_REQUEST_ALERT,
+    SC2_FRAMETYPE_PAUSE_PANEL,
+    SC2_FRAMETYPE_CONVERSATION_PANEL,
+    SC2_FRAMETYPE_OBJECTIVE_PANEL,
+    SC2_FRAMETYPE_TRIGGER_DIALOG,
+    SC2_FRAMETYPE_TRIGGER_WINDOW,
+    SC2_FRAMETYPE_SYSTEM_ALERT_PANEL,
+    SC2_FRAMETYPE_TIP_ALERT,
+    SC2_FRAMETYPE_TIP_ALERT_MOVING,
+    SC2_FRAMETYPE_CINEMATIC_TEXT,
+    SC2_FRAMETYPE_TEXT_CRAWL,
+    SC2_FRAMETYPE_FLASH_FRAME,
+    SC2_FRAMETYPE_LEROY_BUTTON,
+    SC2_FRAMETYPE_MAP_INFO_PANEL,
+    SC2_FRAMETYPE_PERF_OVERLAY,
+    SC2_FRAMETYPE_PROFILER,
+    SC2_FRAMETYPE_ACHIEVEMENT_PANEL,
+    SC2_FRAMETYPE_SCREEN_CREDITS,
+    SC2_FRAMETYPE_UNKNOWN,
+} sc2FrameType;
+
+/* -------------------------------------------------------------------------- */
+/* Flattened frame types                                                       */
+/* -------------------------------------------------------------------------- */
+#define BZ_SC2_MODEL_FIELDS 0xffu // field bits; two transforms, five camera attributes and projection; complete model payload
+
+typedef struct {
+    uiFramePointPos_t targetPos;
+    bool used;
+    uint32_t relative_index;
+    float offset;
+    cstring_t relative_name;   /* non-NULL = unresolved named-relative (pending post-pass) */
+} sc2BaseFramePoint_t;
+
+typedef sc2BaseFramePoint_t sc2BaseFramePoints_t[FPP_COUNT];
+
+typedef struct sc2BaseFrame_s {
+    uint32_t number;
+    FRAMETYPE type;
+    uint32_t sc2_type;
+    cstring_t name;
+    void *parent;
+    uint32_t parent_index;
+    struct { sc2BaseFramePoints_t x, y; } points;
+    rect_t screen_rect;
+    color32_t color;
+    float alpha;
+    struct { float width, height; } size;
+    uint32_t image;
+    rect_t texcoord;
+    cstring_t text;
+    uint32_t stat;
+    cstring_t onclick, tooltip;
+    uint8_t hotkey;
+    uiLabel_t label;
+    color32_t text_color;
+    struct {
+        uint32_t bg;
+        uint32_t edge;
+        uint32_t flags;
+        float insets[4];
+    } backdrop;
+    uint32_t ui_flags;
+    uiModel_t model;
+    uint32_t model_flags;
+    void (*on_event)(struct sc2BaseFrame_s *frame, float x, float y, int button, bool down);
+} sc2BaseFrame_t;
+
+
+
+
+/* -------------------------------------------------------------------------- */
+/* Parsed frame types (before flattening)                                      */
+/* -------------------------------------------------------------------------- */
+typedef struct {
+    SC2Side side;
+    SC2Pos pos;
+    int16_t offset;
+    UINAME relative;
+    uint32_t flags;
+} sc2ParsedAnchor_t;
+
+typedef struct {
+    UINAME resource;
+    UINAME texture_type;
+    int layer;
+    uint32_t state_count;
+    rect_t coords;
+    bool has_coords;
+    uint32_t flags;
+} sc2ParsedTexture_t;
+
+typedef struct {
+    UINAME name;
+    char val[64];
+} sc2Constant_t;
+
+typedef struct sc2Frame_s {
+    UINAME name;
+    sc2FrameType type;
+    UINAME template_path;
+    UINAME image_ref;
+    float width, height;
+    uint32_t flags;
+    color32_t color;
+    float alpha;
+    sc2ParsedAnchor_t anchors[SC2_MAX_ANCHORS];
+    int num_anchors;
+    sc2ParsedTexture_t textures[SC2_MAX_TEXTURES];
+    int num_textures;
+    struct sc2Frame_s *children[SC2_MAX_CHILDREN];
+    int num_children;
+    struct sc2Frame_s *parent;
+    sc2BaseFrame_t *resolved_frame;
+    PATHSTR source_file;
+    uiModel_t model;
+    uint32_t model_flags;
+} sc2Frame_t;
+
+typedef struct {
+    sc2Frame_t templates[SC2_MAX_TEMPLATES];
+    int num_templates;
+    sc2Constant_t constants[SC2_MAX_CONSTANTS];
+    int num_constants;
+    sc2BaseFrame_t frames[SC2_MAX_FRAMES];
+    int num_frames;
+    sc2Frame_t *root;
+    PATHSTR included_files[SC2_MAX_INCLUDES];
+    int num_includes;
+} sc2Layout_t;
+
+typedef struct {
+    int (*FS_ReadFile)(cstring_t filename, void **buf);
+    void (*FS_FreeFile)(void *buf);
+    int (*ImageIndex)(cstring_t imageName);
+    int (*ModelIndex)(cstring_t modelName);
+    int (*FontIndex)(cstring_t fontName, uint32_t fontSize);
+} sc2LayoutImport_t;
+
+/* -------------------------------------------------------------------------- */
+/* Bind macros                                                                 */
+/* -------------------------------------------------------------------------- */
+#ifndef BZ_SC2_REPORT_MISSING
+#define BZ_SC2_REPORT_MISSING(NAME) \
+    fprintf(stderr, "SC2_Layout: missing frame '%s' in %s\n", (NAME), __FUNCTION__)
+#endif
+
+/* -------------------------------------------------------------------------- */
+/* API declarations                                                           */
+/* -------------------------------------------------------------------------- */
+void         SC2_LayoutInit(void);
+void         SC2_LayoutShutdown(void);
+bool         SC2_LayoutParseFile(cstring_t filename);
+bool         SC2_LayoutFlatten(cstring_t root_name);
+bool         SC2_LayoutBuildMainMenu(void);
+bool         SC2_LayoutBuildGameUI(void);
+sc2BaseFrame_t *SC2_LayoutGetFrames(uint32_t *count);
+sc2Frame_t   *SC2_LayoutFindTemplate(cstring_t name);
+sc2BaseFrame_t *SC2_LayoutFindFrameByType(sc2FrameType type);
+sc2BaseFrame_t *SC2_LayoutFindFrameByName(cstring_t name);
+sc2BaseFrame_t *SC2_LayoutFindChildFrame(sc2BaseFrame_t *parent, cstring_t name);
+int           SC2_LayoutNumTemplates(void);
+sc2Frame_t   *SC2_LayoutGetTemplate(int index);
+cstring_t        SC2_LayoutResolveConstant(cstring_t name);
+FRAMETYPE     SC2_MapFrameType(sc2FrameType sc2_type);
+
+void SC2_InitFrame(sc2Frame_t *frame, sc2FrameType type);
+void SC2_SetSize(sc2Frame_t *frame, float width, float height);
+void SC2_SetHidden(sc2Frame_t *frame, bool value);
+void SC2_SetEnabled(sc2Frame_t *frame, bool enabled);
+
+#endif /* stb_sc2layout_h */
+
+/* ========================================================================== */
+/* IMPLEMENTATION                                                             */
+/* ========================================================================== */
+#ifdef STB_SC2LAYOUT_IMPLEMENTATION
+#ifndef stb_sc2layout_impl
+#define stb_sc2layout_impl
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stddef.h>
+#include "common/ui_constants.h"
+#include <ctype.h>
+#include "common/tinyxml.h"
+
+extern sc2LayoutImport_t sc2_layout_import;
+
+#ifndef CLAMP
+#define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
+#endif
+
+#ifndef STB_SC2LAYOUT_GLOBALS
+extern sc2Layout_t sc2_layout;
+#else
+sc2Layout_t sc2_layout = { 0 };
+#endif
+
+static void SC2_Strncpyz(char *dst, cstring_t src, size_t dst_size) {
+    if (!dst || dst_size == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    strncpy(dst, src, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
+static cstring_t SC2_XmlGetProp(void *node, cstring_t name) {
+    xmlChar *val = xmlGetProp((xmlNode *)node, (xmlChar const *)name);
+    return (char const *)val;
+}
+
+static void SC2_XmlFree(cstring_t s) {
+    if (s) xmlFree((xmlChar *)s);
+}
+
+static struct { cstring_t name; sc2FrameType type; } sc2_frame_types[] = {
+    { "Frame",                  SC2_FRAMETYPE_FRAME },
+    { "Button",                 SC2_FRAMETYPE_BUTTON },
+    { "Image",                  SC2_FRAMETYPE_IMAGE },
+    { "Label",                  SC2_FRAMETYPE_LABEL },
+    { "EditBox",                SC2_FRAMETYPE_EDITBOX },
+    { "Tooltip",                SC2_FRAMETYPE_TOOLTIP },
+    { "Model",                  SC2_FRAMETYPE_MODEL },
+    { "ConsolePanel",           SC2_FRAMETYPE_CONSOLE_PANEL },
+    { "CommandPanel",           SC2_FRAMETYPE_COMMAND_PANEL },
+    { "CommandButton",          SC2_FRAMETYPE_COMMAND_BUTTON },
+    { "CommandTooltip",         SC2_FRAMETYPE_COMMAND_TOOLTIP },
+    { "InfoPanel",              SC2_FRAMETYPE_INFO_PANEL },
+    { "MinimapPanel",           SC2_FRAMETYPE_MINIMAP_PANEL },
+    { "Minimap",                SC2_FRAMETYPE_MINIMAP },
+    { "ResourcePanel",          SC2_FRAMETYPE_RESOURCE_PANEL },
+    { "PortraitPanel",          SC2_FRAMETYPE_PORTRAIT_PANEL },
+    { "Portrait",               SC2_FRAMETYPE_PORTRAIT },
+    { "GameUI",                 SC2_FRAMETYPE_GAME_UI },
+    { "WorldPanel",             SC2_FRAMETYPE_WORLD_PANEL },
+    { "CountdownLabel",         SC2_FRAMETYPE_COUNTDOWN_LABEL },
+    { "HeroPanel",              SC2_FRAMETYPE_HERO_PANEL },
+    { "InventoryPanel",         SC2_FRAMETYPE_INVENTORY_PANEL },
+    { "IdleButton",             SC2_FRAMETYPE_IDLE_BUTTON },
+    { "AIButton",               SC2_FRAMETYPE_AI_BUTTON },
+    { "PylonButton",            SC2_FRAMETYPE_PYLON_BUTTON },
+    { "MessageDisplay",         SC2_FRAMETYPE_MESSAGE_DISPLAY },
+    { "AlertPanel",             SC2_FRAMETYPE_ALERT_PANEL },
+    { "AlertDisplay",           SC2_FRAMETYPE_ALERT_DISPLAY },
+    { "ChatBar",                SC2_FRAMETYPE_CHAT_BAR },
+    { "MenuBar",                SC2_FRAMETYPE_MENU_BAR },
+    { "SubtitlePanel",          SC2_FRAMETYPE_SUBTITLE_PANEL },
+    { "TimePanel",              SC2_FRAMETYPE_TIME_PANEL },
+    { "CreditsPanel",           SC2_FRAMETYPE_CREDITS_PANEL },
+    { "ControlGroupPanel",      SC2_FRAMETYPE_CONTROL_GROUP_PANEL },
+    { "MinimapPanelTooltip",    SC2_FRAMETYPE_MINIMAP_PANEL_TOOLTIP },
+    { "RevealPanel",            SC2_FRAMETYPE_REVEAL_PANEL },
+    { "AlliancePanel",          SC2_FRAMETYPE_ALLIANCE_PANEL },
+    { "TeamResourcePanel",      SC2_FRAMETYPE_TEAM_RESOURCE_PANEL },
+    { "LeaderPanel",            SC2_FRAMETYPE_LEADER_PANEL },
+    { "ObserverPanelContainer", SC2_FRAMETYPE_OBSERVER_PANEL },
+    { "ReplayPanelContainer",   SC2_FRAMETYPE_REPLAY_PANEL },
+    { "TalkerPanel",            SC2_FRAMETYPE_TALKER_PANEL },
+    { "PurchasePanel",          SC2_FRAMETYPE_PURCHASE_PANEL },
+    { "ResearchPanel",          SC2_FRAMETYPE_RESEARCH_PANEL },
+    { "PlanetPanelContainer",   SC2_FRAMETYPE_PLANET_PANEL },
+    { "CashPanel",              SC2_FRAMETYPE_CASH_PANEL },
+    { "ResourceRequestAlertPanel", SC2_FRAMETYPE_RESOURCE_REQUEST_ALERT },
+    { "PausePanel",             SC2_FRAMETYPE_PAUSE_PANEL },
+    { "ConversationPanel",      SC2_FRAMETYPE_CONVERSATION_PANEL },
+    { "ObjectivePanel",         SC2_FRAMETYPE_OBJECTIVE_PANEL },
+    { "TriggerDialogFrame",     SC2_FRAMETYPE_TRIGGER_DIALOG },
+    { "TriggerWindowPanel",     SC2_FRAMETYPE_TRIGGER_WINDOW },
+    { "SystemAlertPanel",       SC2_FRAMETYPE_SYSTEM_ALERT_PANEL },
+    { "TipAlertPanel",          SC2_FRAMETYPE_TIP_ALERT },
+    { "TipAlertMovingFrame",    SC2_FRAMETYPE_TIP_ALERT_MOVING },
+    { "CinematicTextPanel",     SC2_FRAMETYPE_CINEMATIC_TEXT },
+    { "TextCrawlPanel",         SC2_FRAMETYPE_TEXT_CRAWL },
+    { "FlashFrame",             SC2_FRAMETYPE_FLASH_FRAME },
+    { "LeroyButton",            SC2_FRAMETYPE_LEROY_BUTTON },
+    { "MapInfoPanel",           SC2_FRAMETYPE_MAP_INFO_PANEL },
+    { "PerfOverlay",            SC2_FRAMETYPE_PERF_OVERLAY },
+    { "ProfilerOptions",        SC2_FRAMETYPE_PROFILER },
+    { "AchievementPanel",       SC2_FRAMETYPE_ACHIEVEMENT_PANEL },
+    { "ScreenCredits",          SC2_FRAMETYPE_SCREEN_CREDITS },
+    { NULL, SC2_FRAMETYPE_UNKNOWN },
+};
+
+static struct { cstring_t name; SC2Side side; } sc2_sides[] = {
+    { "Top",    SC2_SIDE_TOP },
+    { "Bottom", SC2_SIDE_BOTTOM },
+    { "Left",   SC2_SIDE_LEFT },
+    { "Right",  SC2_SIDE_RIGHT },
+    { NULL, -1 },
+};
+
+static struct { cstring_t name; SC2Pos pos; } sc2_positions[] = {
+    { "Min", SC2_POS_MIN },
+    { "Mid", SC2_POS_MID },
+    { "Max", SC2_POS_MAX },
+    { NULL, -1 },
+};
+
+static sc2FrameType SC2_LookupFrameType(cstring_t name) {
+    for (int i = 0; sc2_frame_types[i].name; i++)
+        if (!strcasecmp(sc2_frame_types[i].name, name))
+            return sc2_frame_types[i].type;
+    return SC2_FRAMETYPE_UNKNOWN;
+}
+
+static SC2Side SC2_LookupSide(cstring_t name) {
+    for (int i = 0; sc2_sides[i].name; i++)
+        if (!strcasecmp(sc2_sides[i].name, name))
+            return sc2_sides[i].side;
+    return -1;
+}
+
+static SC2Pos SC2_LookupPos(cstring_t name) {
+    for (int i = 0; sc2_positions[i].name; i++)
+        if (!strcasecmp(sc2_positions[i].name, name))
+            return sc2_positions[i].pos;
+    return -1;
+}
+
+static bool xmlGetAttrBool(void *node, cstring_t name, bool *out) {
+    cstring_t val = SC2_XmlGetProp(node, name);
+    if (!val) return false;
+    *out = (!strcasecmp(val, "true") || !strcasecmp(val, "1") || !strcasecmp(val, "True"));
+    SC2_XmlFree(val);
+    return true;
+}
+
+static bool xmlGetAttrFloat(void *node, cstring_t name, float *out) {
+    cstring_t val = SC2_XmlGetProp(node, name);
+    if (!val) return false;
+    *out = (float)atof(val);
+    SC2_XmlFree(val);
+    return true;
+}
+
+static bool xmlGetAttrInt(void *node, cstring_t name, int *out) {
+    cstring_t val = SC2_XmlGetProp(node, name);
+    if (!val) return false;
+    *out = atoi(val);
+    SC2_XmlFree(val);
+    return true;
+}
+
+static color32_t SC2_ParseColor(cstring_t str) {
+    color32_t c = { 255, 255, 255, 255 };
+    if (!str) return c;
+    int r = 0, g = 0, b = 0, a = 255;
+    sscanf(str, "%d,%d,%d,%d", &r, &g, &b, &a);
+    c.r = (uint8_t)CLAMP(r, 0, 255);
+    c.g = (uint8_t)CLAMP(g, 0, 255);
+    c.b = (uint8_t)CLAMP(b, 0, 255);
+    c.a = (uint8_t)CLAMP(a, 0, 255);
+    return c;
+}
+
+static sc2Frame_t *SC2_FindTemplate(cstring_t name) {
+    if (!name) return NULL;
+    for (int i = 0; i < sc2_layout.num_templates; i++)
+        if (!strcasecmp(sc2_layout.templates[i].name, name))
+            return &sc2_layout.templates[i];
+    return NULL;
+}
+
+static sc2Frame_t *SC2_AddTemplate(void) {
+    if (sc2_layout.num_templates >= SC2_MAX_TEMPLATES) {
+        fprintf(stderr, "SC2_Layout: template overflow\n");
+        return NULL;
+    }
+    return &sc2_layout.templates[sc2_layout.num_templates++];
+}
+
+static void SC2_AddConstant(cstring_t name, cstring_t val) {
+    if (sc2_layout.num_constants >= SC2_MAX_CONSTANTS) return;
+    sc2Constant_t *c = &sc2_layout.constants[sc2_layout.num_constants++];
+    SC2_Strncpyz(c->name, name, sizeof(c->name));
+    SC2_Strncpyz(c->val, val, sizeof(c->val));
+}
+
+cstring_t SC2_LayoutResolveConstant(cstring_t name) {
+    if (!name || name[0] != '#') return name;
+    while (*name == '#') name++;
+    for (int i = 0; i < sc2_layout.num_constants; i++)
+        if (!strcasecmp(sc2_layout.constants[i].name, name))
+            return sc2_layout.constants[i].val;
+    return NULL;
+}
+
+static void SC2_ParseFrameAttrs(void *node, sc2Frame_t *frame);
+static void SC2_ParseFrameChildren(void *node, sc2Frame_t *frame);
+
+static sc2Frame_t *SC2_CloneFrameTree(sc2Frame_t const *source, sc2Frame_t *parent) {
+    sc2Frame_t *clone=SC2_AddTemplate();
+    if (!clone) return NULL;
+    *clone=*source; clone->parent=parent; clone->resolved_frame=NULL;
+    clone->template_path[0]=0; clone->num_children=0;
+    for (int i=0;i<source->num_children;i++) {
+        sc2Frame_t *child=SC2_CloneFrameTree(source->children[i],clone);
+        if (child) clone->children[clone->num_children++]=child;
+    }
+    return clone;
+}
+
+static void SC2_ResolveTemplate(sc2Frame_t *frame, sc2Frame_t *tmpl) {
+    if (!tmpl) return;
+
+    static const struct {
+        size_t offset;
+        size_t size;
+        uint32_t present;
+    } copy_props[] = {
+        { offsetof(sc2Frame_t, width),  sizeof(float),   SC2_FRAME_HAS_WIDTH },
+        { offsetof(sc2Frame_t, height), sizeof(float),   SC2_FRAME_HAS_HEIGHT },
+        { offsetof(sc2Frame_t, color),  sizeof(color32_t), SC2_FRAME_HAS_COLOR },
+        { offsetof(sc2Frame_t, alpha),  sizeof(float),   SC2_FRAME_HAS_ALPHA },
+    };
+    FOR_LOOP(i, sizeof(copy_props) / sizeof(*copy_props)) {
+        if (!(frame->flags & copy_props[i].present) && (tmpl->flags & copy_props[i].present)) {
+            memcpy((char *)frame + copy_props[i].offset, (char const *)tmpl + copy_props[i].offset, copy_props[i].size);
+            frame->flags |= copy_props[i].present;
+        }
+    }
+    static const struct {
+        uint32_t flag;
+        uint32_t present;
+    } bool_flags[] = {
+        { SC2_FRAME_VISIBLE,            SC2_FRAME_HAS_VISIBLE },
+        { SC2_FRAME_ACCEPTS_MOUSE,      0 },
+        { SC2_FRAME_COLLAPSE_LAYOUT,    0 },
+        { SC2_FRAME_HIGHLIGHT_ON_HOVER, 0 },
+        { SC2_FRAME_HIGHLIGHT_ON_FOCUS, 0 },
+    };
+    FOR_LOOP(i, sizeof(bool_flags) / sizeof(*bool_flags)) {
+        if (bool_flags[i].present) {
+            if (!(frame->flags & bool_flags[i].present) && (tmpl->flags & bool_flags[i].present)) {
+                if (tmpl->flags & bool_flags[i].flag) frame->flags |= bool_flags[i].flag;
+                else frame->flags &= ~bool_flags[i].flag;
+                frame->flags |= bool_flags[i].present;
+            }
+        } else {
+            if (!(frame->flags & bool_flags[i].flag) && (tmpl->flags & bool_flags[i].flag)) {
+                frame->flags |= bool_flags[i].flag;
+            }
+        }
+    }
+
+    static const struct { size_t offset, size; } fields[] = {
+        { offsetof(uiModel_t, pos), sizeof(vec3_t) }, { offsetof(uiModel_t, scale), sizeof(vec3_t) },
+        { offsetof(uiModel_t, eye), sizeof(vec3_t) }, { offsetof(uiModel_t, target), sizeof(vec3_t) },
+        { offsetof(uiModel_t, fov), sizeof(float) }, { offsetof(uiModel_t, znear), sizeof(float) },
+        { offsetof(uiModel_t, zfar), sizeof(float) }, { offsetof(uiModel_t, projection), sizeof(UIMODELPROJECTION) },
+    };
+    FOR_LOOP(i, sizeof(fields) / sizeof(*fields)) {
+        if ((frame->model_flags & (1u << i)) || !(tmpl->model_flags & (1u << i))) continue;
+        memcpy((char *)&frame->model + fields[i].offset, (char const *)&tmpl->model + fields[i].offset, fields[i].size);
+        frame->model_flags |= 1u << i;
+    }
+
+    if (tmpl->num_anchors > 0) {
+        int num = 0;
+        sc2ParsedAnchor_t merged[SC2_MAX_ANCHORS];
+        for (int i = 0; i < tmpl->num_anchors && num < SC2_MAX_ANCHORS; i++)
+            merged[num++] = tmpl->anchors[i];
+        for (int i = 0; i < frame->num_anchors && num < SC2_MAX_ANCHORS; i++) {
+            bool found = false;
+            for (int j = 0; j < num; j++) {
+                if (merged[j].side == frame->anchors[i].side) {
+                    merged[j] = frame->anchors[i];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) merged[num++] = frame->anchors[i];
+        }
+        memcpy(frame->anchors, merged, sizeof(merged));
+        frame->num_anchors = num;
+    }
+
+    if (frame->num_textures == 0 && tmpl->num_textures > 0) {
+        for (int i = 0; i < tmpl->num_textures; i++) {
+            frame->textures[i] = tmpl->textures[i];
+            frame->num_textures++;
+        }
+    }
+
+    /* Preserve template draw order while merging named overrides. In particular,
+     * MinimapButton's Icon must draw after NormalImage, even when authored first
+     * in the instance. Independent deep trees prevent shared runtime state. */
+    sc2Frame_t *children[SC2_MAX_CHILDREN];
+    int child_count=0;
+    for (int i=0;i<tmpl->num_children;i++) {
+        sc2Frame_t *override=NULL;
+        for (int j=0;j<frame->num_children;j++)
+            if (!strcasecmp(frame->children[j]->name,tmpl->children[i]->name)) { override=frame->children[j]; break; }
+        if (child_count==SC2_MAX_CHILDREN) { fprintf(stderr,"SC2_Layout: child overflow on '%s'\n",frame->name); break; }
+        if (override) { SC2_ResolveTemplate(override,tmpl->children[i]); children[child_count++]=override; }
+        else {
+            sc2Frame_t *clone=SC2_CloneFrameTree(tmpl->children[i],frame);
+            if (clone) children[child_count++]=clone;
+        }
+    }
+    for (int i=0;i<frame->num_children;i++) {
+        bool inherited=false;
+        for (int j=0;j<child_count;j++) if (children[j]==frame->children[i]) inherited=true;
+        if (inherited) continue;
+        if (child_count==SC2_MAX_CHILDREN) { fprintf(stderr,"SC2_Layout: child overflow on '%s'\n",frame->name); break; }
+        children[child_count++]=frame->children[i];
+    }
+    memcpy(frame->children,children,(size_t)child_count*sizeof(*children));
+    frame->num_children=child_count;
+}
+
+static sc2Frame_t *SC2_ResolveTemplatePath(cstring_t path) {
+    if (!path) return NULL;
+    sc2Frame_t *t = SC2_FindTemplate(path);
+    if (t) return t;
+    cstring_t slash = strrchr(path, '/');
+    if (slash) {
+        t = SC2_FindTemplate(slash + 1);
+        if (t) return t;
+    }
+    return NULL;
+}
+
+/* Resolve definitions before copying them: XML parents are indexed before
+ * their children, and stock same-file templates reference later siblings. */
+static void SC2_ResolveDefinition(sc2Frame_t *frame, int depth) {
+    if (depth>32) { fprintf(stderr,"SC2_Layout: cyclic template on '%s'\n",frame->name); return; }
+    for (int i=0;i<frame->num_children;i++) SC2_ResolveDefinition(frame->children[i],depth+1);
+    if (!frame->template_path[0]) return;
+    sc2Frame_t *tmpl=SC2_ResolveTemplatePath(frame->template_path);
+    if (!tmpl || tmpl==frame) return;
+    SC2_ResolveDefinition(tmpl,depth+1);
+    SC2_ResolveTemplate(frame,tmpl);
+    frame->template_path[0]=0;
+}
+
+static void SC2_ParseInclude(void *node) {
+    cstring_t path = SC2_XmlGetProp(node, "path");
+    if (!path) return;
+    for (int i = 0; i < sc2_layout.num_includes; i++) {
+        if (!strcasecmp(sc2_layout.included_files[i], path)) {
+            SC2_XmlFree(path);
+            return;
+        }
+    }
+    if (sc2_layout.num_includes < SC2_MAX_INCLUDES)
+        SC2_Strncpyz(sc2_layout.included_files[sc2_layout.num_includes++], path, MAX_PATHLEN);
+    SC2_LayoutParseFile(path);
+    SC2_XmlFree(path);
+}
+
+static void SC2_ResolveIncludes(void *node) {
+    for (xmlNode *cur = (xmlNode *)node; cur; cur = cur->next) {
+        if (cur->type != XML_ELEMENT_NODE) continue;
+        if (!strcasecmp((char const *)cur->name, "Include"))
+            SC2_ParseInclude(cur);
+    }
+}
+
+static void SC2_ParseConstant(void *node) {
+    cstring_t name = SC2_XmlGetProp(node, "name");
+    cstring_t val = SC2_XmlGetProp(node, "val");
+    if (name && val) SC2_AddConstant(name, val);
+    if (name) SC2_XmlFree(name);
+    if (val) SC2_XmlFree(val);
+}
+
+static int SC2_ResolveAttrInt(void *node, cstring_t attr, int default_val) {
+    cstring_t raw = SC2_XmlGetProp(node, attr);
+    if (!raw) return default_val;
+    cstring_t resolved = SC2_LayoutResolveConstant(raw);
+    int result = atoi(resolved ? resolved : raw);
+    SC2_XmlFree(raw);
+    return result;
+}
+
+static float SC2_ResolveAttrFloat(void *node, cstring_t attr, float default_val) {
+    cstring_t raw = SC2_XmlGetProp(node, attr);
+    if (!raw) return default_val;
+    cstring_t resolved = SC2_LayoutResolveConstant(raw);
+    float result = (float)atof(resolved ? resolved : raw);
+    SC2_XmlFree(raw);
+    return result;
+}
+
+static void SC2_ParseAnchor(void *node, sc2Frame_t *frame) {
+    if (frame->num_anchors >= SC2_MAX_ANCHORS) return;
+
+    cstring_t side_str = SC2_XmlGetProp(node, "side");
+    cstring_t pos_str = SC2_XmlGetProp(node, "pos");
+    cstring_t relative = SC2_XmlGetProp(node, "relative");
+
+    if ((!side_str || !pos_str) && relative) {
+        static struct { cstring_t side; cstring_t pos; } const sides[] = {
+            { "Top", "Min" }, { "Bottom", "Max" }, { "Left", "Min" }, { "Right", "Max" },
+        };
+        for (int i = 0; i < 4 && frame->num_anchors < SC2_MAX_ANCHORS; i++) {
+            sc2ParsedAnchor_t *a = &frame->anchors[frame->num_anchors];
+            a->side = SC2_LookupSide(sides[i].side);
+            a->pos = SC2_LookupPos(sides[i].pos);
+            a->offset = (int16_t)SC2_ResolveAttrInt(node, "offset", 0);
+            SC2_Strncpyz(a->relative, relative, sizeof(a->relative));
+            a->flags |= SC2_ANCHOR_HAS;
+            frame->num_anchors++;
+        }
+        if (side_str) SC2_XmlFree(side_str);
+        if (pos_str) SC2_XmlFree(pos_str);
+        SC2_XmlFree(relative);
+        return;
+    }
+
+    if (!side_str || !pos_str) {
+        if (side_str) SC2_XmlFree(side_str);
+        if (pos_str) SC2_XmlFree(pos_str);
+        if (relative) SC2_XmlFree(relative);
+        return;
+    }
+
+    sc2ParsedAnchor_t *a = &frame->anchors[frame->num_anchors];
+    a->side = SC2_LookupSide(side_str);
+    a->pos = SC2_LookupPos(pos_str);
+    a->offset = (int16_t)SC2_ResolveAttrInt(node, "offset", 0);
+    if (relative) {
+        SC2_Strncpyz(a->relative, relative, sizeof(a->relative));
+        SC2_XmlFree(relative);
+    } else {
+        SC2_Strncpyz(a->relative, "$parent", sizeof(a->relative));
+    }
+    a->flags |= SC2_ANCHOR_HAS;
+    frame->num_anchors++;
+
+    SC2_XmlFree(side_str);
+    SC2_XmlFree(pos_str);
+}
+
+static void SC2_ParseTexture(void *node, sc2Frame_t *frame, int layer_override) {
+    int layer = layer_override;
+    xmlGetAttrInt(node, "layer", &layer);
+    if (layer < 0 || layer >= SC2_MAX_TEXTURES) layer = 0;
+
+    sc2ParsedTexture_t *tex = &frame->textures[layer];
+    cstring_t val = SC2_XmlGetProp(node, "val");
+    if (val) {
+        SC2_Strncpyz(tex->resource, val, sizeof(tex->resource));
+        SC2_XmlFree(val);
+        tex->flags |= SC2_TEX_HAS_TEXTURE;
+    }
+    tex->layer = layer;
+
+    cstring_t tiled = SC2_XmlGetProp(node, "tiled");
+    if (tiled) {
+        if (!strcasecmp(tiled, "true") || !strcasecmp(tiled, "1"))
+            tex->flags |= SC2_TEX_TILED;
+        else
+            tex->flags &= ~SC2_TEX_TILED;
+        SC2_XmlFree(tiled);
+    }
+
+    if (frame->num_textures <= layer)
+        frame->num_textures = layer + 1;
+}
+
+static void SC2_ParseStateCount(void *node, sc2Frame_t *frame) {
+    int layer=0, count=1;
+    xmlGetAttrInt(node,"layer",&layer); xmlGetAttrInt(node,"val",&count);
+    if (layer<0 || layer>=SC2_MAX_TEXTURES || count<=0) return;
+    frame->textures[layer].state_count=count;
+    if (frame->num_textures<=layer) frame->num_textures=layer+1;
+}
+static void SC2_ParseTextureCoords(void *node, sc2Frame_t *frame) {
+    int layer=0; xmlGetAttrInt(node,"layer",&layer);
+    if (layer<0 || layer>=SC2_MAX_TEXTURES) return;
+    static const struct { cstring_t name; size_t offset; } fields[]={
+        {"left",offsetof(rect_t,x)}, {"top",offsetof(rect_t,y)}, {"right",offsetof(rect_t,w)}, {"bottom",offsetof(rect_t,h)},
+    };
+    rect_t coords={0,0,1,1};
+    FOR_LOOP(i,sizeof(fields)/sizeof(*fields)) {
+        cstring_t value=SC2_XmlGetProp(node,fields[i].name);
+        if (value) *(float *)((char *)&coords+fields[i].offset)=strtof(value,NULL);
+        SC2_XmlFree(value);
+    }
+    coords.w-=coords.x; coords.h-=coords.y;
+    frame->textures[layer].coords=coords; frame->textures[layer].has_coords=true;
+    if (frame->num_textures<=layer) frame->num_textures=layer+1;
+}
+
+static void SC2_ParseModel(void *node, sc2Frame_t *frame) {
+    cstring_t val = SC2_XmlGetProp(node, "val");
+    if (val) {
+        sc2ParsedTexture_t *tex = &frame->textures[0];
+        SC2_Strncpyz(tex->resource, val, sizeof(tex->resource));
+        tex->flags |= SC2_TEX_HAS_TEXTURE;
+        frame->num_textures = 1;
+        SC2_XmlFree(val);
+    }
+    static const struct { cstring_t name; size_t offset; } fields[] = {
+        { "Position", offsetof(uiModel_t, pos) }, { "Scale", offsetof(uiModel_t, scale) },
+    };
+    for (xmlNode *child = ((xmlNode *)node)->children; child; child = child->next) {
+        FOR_LOOP(i, sizeof(fields) / sizeof(*fields)) {
+            if (strcasecmp((cstring_t)child->name, fields[i].name)) continue;
+            cstring_t text = SC2_XmlGetProp(child, "val");
+            vec3_t *v = (vec3_t *)((char *)&frame->model + fields[i].offset);
+            if (text && sscanf(text, "%f,%f,%f", &v->x, &v->y, &v->z) == 3)
+                frame->model_flags |= 1u << i;
+            else fprintf(stderr, "SC2_Layout: invalid Model %s on %s\n", fields[i].name, frame->name);
+            SC2_XmlFree(text);
+        }
+    }
+}
+
+/* Camera attributes stay together in the model payload, including the authored clip planes. */
+static void SC2_ParseCamera(void *node, sc2Frame_t *frame) {
+    static const struct { cstring_t name; size_t offset; int count; } fields[] = {
+        { "position", offsetof(uiModel_t, eye), 3 }, { "target", offsetof(uiModel_t, target), 3 },
+        { "fov", offsetof(uiModel_t, fov), 1 }, { "minz", offsetof(uiModel_t, znear), 1 },
+        { "maxz", offsetof(uiModel_t, zfar), 1 },
+    };
+    FOR_LOOP(i, sizeof(fields) / sizeof(*fields)) {
+        cstring_t text = SC2_XmlGetProp(node, fields[i].name);
+        if (!text) continue;
+        float *v = (float *)((char *)&frame->model + fields[i].offset);
+        if (text && (fields[i].count == 3 ? sscanf(text, "%f,%f,%f", v, v + 1, v + 2) : sscanf(text, "%f", v)) == fields[i].count)
+            frame->model_flags |= 1u << (i + 2);
+        else fprintf(stderr, "SC2_Layout: invalid Camera %s on %s\n", fields[i].name, frame->name);
+        SC2_XmlFree(text);
+    }
+}
+
+static const struct {
+    cstring_t name;
+    size_t offset;
+    size_t size;
+} sc2_frame_attrs[] = {
+    { "name",     offsetof(sc2Frame_t, name),          sizeof(((sc2Frame_t *)0)->name) },
+    { "template", offsetof(sc2Frame_t, template_path), sizeof(((sc2Frame_t *)0)->template_path) },
+    { "Image",    offsetof(sc2Frame_t, image_ref),     sizeof(((sc2Frame_t *)0)->image_ref) },
+};
+
+static void SC2_ParseFrameAttrs(void *node, sc2Frame_t *frame) {
+    cstring_t type_str = SC2_XmlGetProp(node, "type");
+    if (type_str) {
+        frame->type = SC2_LookupFrameType(type_str);
+        SC2_XmlFree(type_str);
+    } else {
+        frame->type = SC2_FRAMETYPE_FRAME;
+    }
+    FOR_LOOP(i, sizeof(sc2_frame_attrs) / sizeof(*sc2_frame_attrs)) {
+        cstring_t text = SC2_XmlGetProp(node, sc2_frame_attrs[i].name);
+        if (!text) continue;
+        SC2_Strncpyz((char *)frame + sc2_frame_attrs[i].offset, text, sc2_frame_attrs[i].size);
+        SC2_XmlFree(text);
+    }
+    frame->resolved_frame = NULL;
+}
+
+typedef enum {
+    SC2_FIELD_FLOAT,
+    SC2_FIELD_RESOLVED_FLOAT,
+    SC2_FIELD_BOOL,
+    SC2_FIELD_COLOR,
+    SC2_FIELD_DESC_FLAGS,
+    SC2_FIELD_PROJECTION,
+    SC2_FIELD_LAYER_COUNT,
+    SC2_FIELD_LAYER_VISIBLE,
+    SC2_FIELD_TEXTURE_TYPE,
+    SC2_FIELD_STATE_COUNT,
+} sc2FrameFieldType_t;
+
+typedef struct {
+    cstring_t              name;
+    size_t              offset;
+    sc2FrameFieldType_t type;
+    uint32_t               flag;
+    uint32_t               present;
+} sc2FrameField_t;
+
+static const sc2FrameField_t sc2_frame_fields[] = {
+    { "Width",            offsetof(sc2Frame_t, width),            SC2_FIELD_RESOLVED_FLOAT, 0,                            SC2_FRAME_HAS_WIDTH },
+    { "Height",           offsetof(sc2Frame_t, height),           SC2_FIELD_RESOLVED_FLOAT, 0,                            SC2_FRAME_HAS_HEIGHT },
+    { "Alpha",            offsetof(sc2Frame_t, alpha),            SC2_FIELD_FLOAT,          0,                            SC2_FRAME_HAS_ALPHA },
+    { "Visible",          0,                                      SC2_FIELD_BOOL,           SC2_FRAME_VISIBLE,            SC2_FRAME_HAS_VISIBLE },
+    { "AcceptsMouse",     0,                                      SC2_FIELD_BOOL,           SC2_FRAME_ACCEPTS_MOUSE,      0 },
+    { "CollapseLayout",   0,                                      SC2_FIELD_BOOL,           SC2_FRAME_COLLAPSE_LAYOUT,    0 },
+    { "HighlightOnHover", 0,                                      SC2_FIELD_BOOL,           SC2_FRAME_HIGHLIGHT_ON_HOVER, 0 },
+    { "HighlightOnFocus", 0,                                      SC2_FIELD_BOOL,           SC2_FRAME_HIGHLIGHT_ON_FOCUS, 0 },
+    { "BatchImages",      0,                                      SC2_FIELD_BOOL,           SC2_FRAME_BATCH_IMAGES,       0 },
+    { "BatchText",        0,                                      SC2_FIELD_BOOL,           SC2_FRAME_BATCH_TEXT,         0 },
+    { "Color",            offsetof(sc2Frame_t, color),            SC2_FIELD_COLOR,          0,                            SC2_FRAME_HAS_COLOR },
+    { "DescFlags",        0,                                      SC2_FIELD_DESC_FLAGS,     SC2_FRAME_DESC_FLAGS_INTERNAL,SC2_FRAME_HAS_DESC_FLAGS },
+    { "Projection",       offsetof(sc2Frame_t, model.projection), SC2_FIELD_PROJECTION,     0,                            0 },
+    { "LayerCount",       0,                                      SC2_FIELD_LAYER_COUNT,    0,                            0 },
+    { "LayerVisible",     0,                                      SC2_FIELD_LAYER_VISIBLE,  0,                            0 },
+    { "TextureType",      0,                                      SC2_FIELD_TEXTURE_TYPE,   0,                            0 },
+    { "StateCount",       0,                                      SC2_FIELD_STATE_COUNT,    0,                            0 },
+};
+
+static bool SC2_ParseFrameField(void *node, sc2Frame_t *frame) {
+    cstring_t tag = (cstring_t)((xmlNode *)node)->name;
+
+    FOR_LOOP(i, sizeof(sc2_frame_fields) / sizeof(*sc2_frame_fields)) {
+        sc2FrameField_t const *f = &sc2_frame_fields[i];
+        if (strcasecmp(tag, f->name)) continue;
+
+        switch (f->type) {
+            case SC2_FIELD_RESOLVED_FLOAT: {
+                float *value = (float *)((char *)frame + f->offset);
+                *value = SC2_ResolveAttrFloat(node, "val", 0.0f);
+                break;
+            }
+            case SC2_FIELD_FLOAT: {
+                float *value = (float *)((char *)frame + f->offset);
+                if (!xmlGetAttrFloat(node, "val", value)) return true;
+                break;
+            }
+            case SC2_FIELD_BOOL: {
+                cstring_t text = SC2_XmlGetProp(node, "val");
+                if (!text) return true;
+                if (!strcasecmp(text, "true") || !strcasecmp(text, "1")) frame->flags |= f->flag;
+                else frame->flags &= ~f->flag;
+                SC2_XmlFree(text);
+                break;
+            }
+            case SC2_FIELD_COLOR: {
+                cstring_t val = SC2_XmlGetProp(node, "val");
+                if (val) {
+                    cstring_t resolved = SC2_LayoutResolveConstant(val);
+                    frame->color = SC2_ParseColor(resolved ? resolved : val);
+                    SC2_XmlFree(val);
+                }
+                break;
+            }
+            case SC2_FIELD_DESC_FLAGS: {
+                cstring_t val = SC2_XmlGetProp(node, "val");
+                if (val) {
+                    if (!strcasecmp(val, "Internal")) frame->flags |= SC2_FRAME_DESC_FLAGS_INTERNAL;
+                    else frame->flags &= ~SC2_FRAME_DESC_FLAGS_INTERNAL;
+                    SC2_XmlFree(val);
+                }
+                break;
+            }
+            case SC2_FIELD_PROJECTION: {
+                cstring_t val = SC2_XmlGetProp(node, "val");
+                static const struct { cstring_t name; UIMODELPROJECTION value; } modes[] = {
+                    { "Orthographic", UI_MODEL_ORTHOGRAPHIC }, { "Perspective", UI_MODEL_PERSPECTIVE },
+                };
+                bool found = false;
+                FOR_LOOP(m, sizeof(modes) / sizeof(*modes)) {
+                    if (!val || strcasecmp(val, modes[m].name)) continue;
+                    frame->model.projection = modes[m].value;
+                    frame->model_flags |= 1u << 7;
+                    found = true;
+                }
+                if (!found) fprintf(stderr, "SC2_Layout: invalid Projection on %s\n", frame->name);
+                SC2_XmlFree(val);
+                break;
+            }
+            case SC2_FIELD_LAYER_COUNT: {
+                int val = 0;
+                if (xmlGetAttrInt(node, "val", &val)) {
+                    if (val > frame->num_textures) frame->num_textures = val;
+                }
+                break;
+            }
+            case SC2_FIELD_LAYER_VISIBLE: {
+                cstring_t val = SC2_XmlGetProp(node, "val");
+                int layer = 0;
+                xmlGetAttrInt(node, "layer", &layer);
+                if (val && layer >= 0 && layer < SC2_MAX_TEXTURES) {
+                    if (layer >= frame->num_textures) frame->num_textures = layer + 1;
+                    if (!strcasecmp(val, "false") || !strcasecmp(val, "0"))
+                        frame->textures[layer].flags |= SC2_TEX_LAYER_HIDDEN;
+                    else
+                        frame->textures[layer].flags &= ~SC2_TEX_LAYER_HIDDEN;
+                }
+                if (val) SC2_XmlFree(val);
+                break;
+            }
+            case SC2_FIELD_TEXTURE_TYPE: {
+                int layer = 0;
+                xmlGetAttrInt(node, "layer", &layer);
+                if (layer >= 0 && layer < SC2_MAX_TEXTURES) {
+                    cstring_t val = SC2_XmlGetProp(node, "val");
+                    if (val) {
+                        SC2_Strncpyz(frame->textures[layer].texture_type, val, sizeof(frame->textures[0].texture_type));
+                        SC2_XmlFree(val);
+                    }
+                }
+                break;
+            }
+            case SC2_FIELD_STATE_COUNT:
+                SC2_ParseStateCount(node,frame);
+                break;
+        }
+        frame->flags |= f->present;
+        return true;
+    }
+    return false;
+}
+
+static void SC2_ParseTextureTag(void *node, sc2Frame_t *frame) {
+    SC2_ParseTexture(node, frame, -1);
+}
+
+static void SC2_ParseChildFrame(void *node, sc2Frame_t *frame) {
+    if (frame->num_children < SC2_MAX_CHILDREN) {
+        sc2Frame_t *child = SC2_AddTemplate();
+        if (child) {
+            SC2_ParseFrameAttrs(node, child);
+            SC2_ParseFrameChildren(node, child);
+            child->parent = frame;
+            frame->children[frame->num_children++] = child;
+        }
+    }
+}
+
+typedef struct {
+    cstring_t name;
+    void (*handler)(void *node, sc2Frame_t *frame);
+} sc2ChildTag_t;
+
+static const sc2ChildTag_t sc2_child_tags[] = {
+    { "Anchor",  SC2_ParseAnchor },
+    { "Texture", SC2_ParseTextureTag },
+    { "StateCount", SC2_ParseStateCount },
+    { "TextureCoords", SC2_ParseTextureCoords },
+    { "Model",   SC2_ParseModel },
+    { "Camera",  SC2_ParseCamera },
+    { "Frame",   SC2_ParseChildFrame },
+    { NULL, NULL }
+};
+
+static void SC2_ParseFrameChildren(void *node, sc2Frame_t *frame) {
+    for (xmlNode *cur = ((xmlNode *)node)->children; cur; cur = cur->next) {
+        if (cur->type != XML_ELEMENT_NODE) continue;
+        cstring_t tag = (char const *)cur->name;
+
+        if (SC2_ParseFrameField(cur, frame)) continue;
+        for (sc2ChildTag_t const *ct = sc2_child_tags; ct->name; ct++) {
+            if (!strcasecmp(tag, ct->name)) {
+                ct->handler(cur, frame);
+                break;
+            }
+        }
+    }
+}
+
+static void SC2_ParseTopLevelFrame(void *node) {
+    sc2Frame_t *frame = SC2_AddTemplate();
+    if (!frame) return;
+    SC2_ParseFrameAttrs(node, frame);
+    SC2_ParseFrameChildren(node, frame);
+}
+
+static void SC2_ParseDescNode(void *node) {
+    SC2_ResolveIncludes(node);
+
+    for (xmlNode *cur = (xmlNode *)node; cur; cur = cur->next) {
+        if (cur->type != XML_ELEMENT_NODE) continue;
+        if (!strcasecmp((char const *)cur->name, "Constant"))
+            SC2_ParseConstant(cur);
+    }
+
+    int templates_before = sc2_layout.num_templates;
+    for (xmlNode *cur = (xmlNode *)node; cur; cur = cur->next) {
+        if (cur->type != XML_ELEMENT_NODE) continue;
+        if (!strcasecmp((char const *)cur->name, "Frame"))
+            SC2_ParseTopLevelFrame(cur);
+    }
+
+    /* Per-file resolution: resolve templates whose definitions were already
+     * parsed (same-file or earlier-included files).  Clear template_path on
+     * success so the global post-pass in SC2_LayoutBuildGameUI won't re-resolve
+     * them and double the child list.  Leave template_path set on NOT FOUND so
+     * the global pass can retry after all files are loaded (handles forward refs). */
+    int templates_end = sc2_layout.num_templates;
+    for (int i=templates_before;i<templates_end;i++) SC2_ResolveDefinition(&sc2_layout.templates[i],0);
+
+}
+
+FRAMETYPE SC2_MapFrameType(sc2FrameType sc2_type) {
+    switch (sc2_type) {
+    case SC2_FRAMETYPE_FRAME:
+    case SC2_FRAMETYPE_CONSOLE_PANEL:
+    case SC2_FRAMETYPE_COMMAND_PANEL:
+    case SC2_FRAMETYPE_INFO_PANEL:
+    case SC2_FRAMETYPE_MINIMAP_PANEL:
+    case SC2_FRAMETYPE_RESOURCE_PANEL:
+    case SC2_FRAMETYPE_PORTRAIT_PANEL:
+    case SC2_FRAMETYPE_GAME_UI:
+    case SC2_FRAMETYPE_WORLD_PANEL:
+    case SC2_FRAMETYPE_HERO_PANEL:
+    case SC2_FRAMETYPE_INVENTORY_PANEL:
+    case SC2_FRAMETYPE_CONTROL_GROUP_PANEL:
+    case SC2_FRAMETYPE_ALLIANCE_PANEL:
+    case SC2_FRAMETYPE_TEAM_RESOURCE_PANEL:
+    case SC2_FRAMETYPE_LEADER_PANEL:
+    case SC2_FRAMETYPE_OBSERVER_PANEL:
+    case SC2_FRAMETYPE_REPLAY_PANEL:
+    case SC2_FRAMETYPE_TALKER_PANEL:
+    case SC2_FRAMETYPE_PURCHASE_PANEL:
+    case SC2_FRAMETYPE_RESEARCH_PANEL:
+    case SC2_FRAMETYPE_PLANET_PANEL:
+    case SC2_FRAMETYPE_SYSTEM_ALERT_PANEL:
+    case SC2_FRAMETYPE_TRIGGER_DIALOG:
+    case SC2_FRAMETYPE_TRIGGER_WINDOW:
+    case SC2_FRAMETYPE_CREDITS_PANEL:
+    case SC2_FRAMETYPE_PAUSE_PANEL:
+    case SC2_FRAMETYPE_CONVERSATION_PANEL:
+    case SC2_FRAMETYPE_OBJECTIVE_PANEL:
+    case SC2_FRAMETYPE_SUBTITLE_PANEL:
+    case SC2_FRAMETYPE_TIME_PANEL:
+    case SC2_FRAMETYPE_MENU_BAR:
+    case SC2_FRAMETYPE_ALERT_PANEL:
+    case SC2_FRAMETYPE_ALERT_DISPLAY:
+    case SC2_FRAMETYPE_CHAT_BAR:
+    case SC2_FRAMETYPE_RESOURCE_REQUEST_ALERT:
+        return FT_FRAME;
+    case SC2_FRAMETYPE_BUTTON:
+    case SC2_FRAMETYPE_COMMAND_BUTTON:
+    case SC2_FRAMETYPE_IDLE_BUTTON:
+    case SC2_FRAMETYPE_AI_BUTTON:
+    case SC2_FRAMETYPE_PYLON_BUTTON:
+    case SC2_FRAMETYPE_LEROY_BUTTON:
+        return FT_FRAME;
+    case SC2_FRAMETYPE_IMAGE:
+        return FT_TEXTURE;
+    case SC2_FRAMETYPE_MINIMAP:
+        return FT_MINIMAP;
+    case SC2_FRAMETYPE_PORTRAIT:
+    case SC2_FRAMETYPE_MODEL:
+        return FT_PORTRAIT;
+    case SC2_FRAMETYPE_LABEL:
+    case SC2_FRAMETYPE_COUNTDOWN_LABEL:
+        return FT_TEXT;
+    case SC2_FRAMETYPE_EDITBOX:
+        return FT_EDITBOX;
+    case SC2_FRAMETYPE_TOOLTIP:
+    case SC2_FRAMETYPE_COMMAND_TOOLTIP:
+    case SC2_FRAMETYPE_MINIMAP_PANEL_TOOLTIP:
+        return FT_SIMPLEFRAME;
+    case SC2_FRAMETYPE_MESSAGE_DISPLAY:
+        return FT_TEXTAREA;
+    default:
+        return FT_FRAME;
+    }
+}
+
+static void SC2_ResolveAnchors(sc2Frame_t *src, sc2BaseFrame_t *dst) {
+    if (src->flags & SC2_FRAME_HAS_WIDTH) dst->size.width = src->width;
+    if (src->flags & SC2_FRAME_HAS_HEIGHT) dst->size.height = src->height;
+
+
+    for (int i = 0; i < src->num_anchors; i++) {
+        sc2ParsedAnchor_t *a = &src->anchors[i];
+        if (!(a->flags & SC2_ANCHOR_HAS)) continue;
+
+        int point_idx;
+        bool is_x;
+        switch (a->side) {
+            case SC2_SIDE_LEFT:   is_x = true;  point_idx = FPP_MIN; break;
+            case SC2_SIDE_RIGHT:  is_x = true;  point_idx = FPP_MAX; break;
+            case SC2_SIDE_TOP:    is_x = false; point_idx = FPP_MIN; break;
+            case SC2_SIDE_BOTTOM: is_x = false; point_idx = FPP_MAX; break;
+            default: continue;
+        }
+
+        int target_idx = (a->pos == SC2_POS_MIN) ? FPP_MIN :
+                         (a->pos == SC2_POS_MID) ? FPP_MID : FPP_MAX;
+
+        sc2BaseFramePoint_t *p = is_x ? &dst->points.x[point_idx] : &dst->points.y[point_idx];
+        p->used = true;
+        p->targetPos = (uiFramePointPos_t)target_idx;
+        p->offset = is_x ? (float)a->offset : -(float)a->offset;
+
+        p->relative_index = (uint32_t)-1;
+        if (!a->relative[0] || !strcasecmp(a->relative, "$parent"))
+            p->relative_index = dst->parent_index;
+        else if (!strcasecmp(a->relative, "$root"))
+            p->relative_index = 0;
+        else
+            p->relative_name = a->relative;
+
+    }
+    /* Stock images pin both edges to the same center while declaring a size.
+     * Encode this as a center constraint, rather than a zero-width stretch. */
+    sc2BaseFramePoint_t *axes[]={dst->points.x,dst->points.y};
+    for (int axis=0;axis<2;axis++) {
+        sc2BaseFramePoint_t *p=axes[axis];
+        if (!p[FPP_MIN].used || !p[FPP_MAX].used) continue;
+        if (p[FPP_MIN].targetPos!=FPP_MID || p[FPP_MAX].targetPos!=FPP_MID ||
+            p[FPP_MIN].relative_index!=p[FPP_MAX].relative_index || p[FPP_MIN].offset!=p[FPP_MAX].offset) continue;
+        p[FPP_MID]=p[FPP_MIN]; p[FPP_MIN].used=p[FPP_MAX].used=false;
+    }
+}
+
+/* Native paths are relative to the instance, not global template names.
+ * Repeated names (Icon, NormalImage, NameLabel) are common in GameUI. */
+static uint32_t SC2_ResolveFramePath(uint32_t source, cstring_t path) {
+    uint32_t cursor = source;
+    char part[128];
+    if (strncasecmp(path, "$parent", 7) && strncasecmp(path, "$root", 5)) {
+        cursor = sc2_layout.frames[source].parent_index;
+        if (cursor == UINT32_MAX) cursor = 0;
+    }
+    while (*path) {
+        cstring_t slash = strpbrk(path,"/\\");
+        size_t len = slash ? (size_t)(slash-path) : strlen(path);
+        if (!len || len >= sizeof(part)) return UINT32_MAX;
+        memcpy(part, path, len); part[len] = 0;
+        if (!strcasecmp(part, "$parent")) {
+            if (cursor == UINT32_MAX) return UINT32_MAX;
+            cursor = sc2_layout.frames[cursor].parent_index;
+        } else if (!strcasecmp(part, "$root")) cursor = 0;
+        else {
+            uint32_t found = UINT32_MAX;
+            for (uint32_t i=0; i<(uint32_t)sc2_layout.num_frames; i++)
+                if (sc2_layout.frames[i].parent_index == cursor &&
+                    !strcasecmp(sc2_layout.frames[i].name, part)) { found=i; break; }
+            /* An absolute path may include its root name. */
+            if (found == UINT32_MAX && cursor == 0 && !strcasecmp(sc2_layout.frames[0].name, part)) found=0;
+            if (found == UINT32_MAX) return UINT32_MAX;
+            cursor = found;
+        }
+        if (!slash) break;
+        path = slash+1;
+    }
+    return cursor;
+}
+
+static void SC2_ResolveNamedRelatives(void) {
+    for (uint32_t i=0; i<(uint32_t)sc2_layout.num_frames; i++) {
+        sc2BaseFrame_t *dst=&sc2_layout.frames[i];
+        for (int axis=0; axis<2; axis++) {
+            sc2BaseFramePoint_t *pts=axis ? dst->points.y : dst->points.x;
+            for (int j=0; j<FPP_COUNT; j++) {
+                if (!pts[j].relative_name) continue;
+                pts[j].relative_index=SC2_ResolveFramePath(i, pts[j].relative_name);
+                if (pts[j].relative_index == UINT32_MAX)
+                    fprintf(stderr, "SC2_Layout: unresolved anchor '%s' on '%s'\n", pts[j].relative_name, dst->name);
+                pts[j].relative_name=NULL;
+            }
+        }
+    }
+}
+
+static void SC2_FlattenFrame(sc2Frame_t *frame, int parent_index) {
+    if (sc2_layout.num_frames >= SC2_MAX_FRAMES) return;
+
+    int index = sc2_layout.num_frames++;
+    sc2BaseFrame_t *dst = &sc2_layout.frames[index];
+    memset(dst, 0, sizeof(*dst));
+
+    dst->number = (uint32_t)index;
+    dst->type = SC2_MapFrameType(frame->type);
+    dst->sc2_type = frame->type;
+    dst->name = frame->name;
+    dst->parent_index = (parent_index >= 0) ? (uint32_t)parent_index : (uint32_t)-1;
+
+    if (dst->type == FT_TEXT) {
+        if (sc2_layout_import.FontIndex)
+            dst->label.font = (RESOURCE)sc2_layout_import.FontIndex("UI/Fonts/EurostileExt-Med.otf", 16);
+        dst->label.textaligny = FONT_JUSTIFYMIDDLE;
+    }
+    dst->color = (frame->flags & SC2_FRAME_HAS_COLOR) ? frame->color : (color32_t){255, 255, 255, 255};
+    dst->alpha = (frame->flags & SC2_FRAME_HAS_ALPHA) ? frame->alpha : 1.0f;
+    dst->model = frame->model;
+    dst->model.aspect = UI_MIN_ASPECT;
+    dst->model_flags = frame->model_flags;
+    dst->ui_flags = 0;
+    if (frame->flags & SC2_FRAME_HAS_VISIBLE) {
+        if (!(frame->flags & SC2_FRAME_VISIBLE))
+            dst->ui_flags |= SC2_UIFLAG_HIDDEN | SC2_UIFLAG_HIDDEN_IN_HIERARCHY;
+    }
+    /* If the frame has at least one texture layer and ALL layers are marked
+     * LayerVisible=false, the frame is invisible at startup (e.g. AutoCastImage,
+     * cooldown overlays).  Hide it so it doesn't render on top of the icon. */
+    if (frame->num_textures > 0 && !(dst->ui_flags & SC2_UIFLAG_HIDDEN)) {
+        int all_hidden = 1;
+        for (int i = 0; i < frame->num_textures; i++) {
+            if (!(frame->textures[i].flags & SC2_TEX_LAYER_HIDDEN)) {
+                all_hidden = 0; break;
+            }
+        }
+        if (all_hidden)
+            dst->ui_flags |= SC2_UIFLAG_HIDDEN | SC2_UIFLAG_HIDDEN_IN_HIERARCHY;
+    }
+
+    SC2_ResolveAnchors(frame, dst);
+    dst->texcoord=(rect_t){0,0,1,1};
+    if (frame->num_textures) {
+        sc2ParsedTexture_t const *tex=&frame->textures[0];
+        if (tex->has_coords) dst->texcoord=tex->coords;
+        if (tex->state_count>1) dst->texcoord.h/=tex->state_count;
+    }
+
+    if (frame->type == SC2_FRAMETYPE_MODEL && frame->num_textures > 0 && frame->textures[0].flags & SC2_TEX_HAS_TEXTURE)
+        dst->image = sc2_layout_import.ModelIndex ? (uint32_t)sc2_layout_import.ModelIndex(frame->textures[0].resource) : 0;
+    else if (frame->type != SC2_FRAMETYPE_MODEL && frame->num_textures > 0 && frame->textures[0].flags & SC2_TEX_HAS_TEXTURE)
+        dst->image = sc2_layout_import.ImageIndex ? (uint32_t)sc2_layout_import.ImageIndex(frame->textures[0].resource) : 0;
+
+    for (int i = 0; i < frame->num_textures; i++) {
+        sc2ParsedTexture_t *tex = &frame->textures[i];
+        if (!(tex->flags & SC2_TEX_HAS_TEXTURE)) continue;
+        if ((tex->flags & SC2_TEX_TILED) && dst->backdrop.bg == 0) {
+            dst->backdrop.bg = 0;
+            dst->backdrop.flags |= SC2_BACKDROP_TILE;
+        }
+        if (!strcasecmp(tex->texture_type, "Border") && dst->backdrop.edge == 0) {
+            dst->backdrop.edge = 0;
+        }
+    }
+
+    frame->resolved_frame = dst;
+
+    for (int i = 0; i < frame->num_children; i++)
+        SC2_FlattenFrame(frame->children[i], index);
+}
+
+void SC2_LayoutInit(void) {
+    memset(&sc2_layout, 0, sizeof(sc2_layout));
+    for (int i = 0; i < SC2_MAX_TEMPLATES; i++)
+        sc2_layout.templates[i].resolved_frame = NULL;
+}
+
+void SC2_LayoutShutdown(void) {
+    memset(&sc2_layout, 0, sizeof(sc2_layout));
+}
+
+bool SC2_LayoutParseFile(cstring_t filename) {
+    void *buf = NULL;
+    int len = sc2_layout_import.FS_ReadFile(filename, &buf);
+    if (len < 0 || !buf) {
+        fprintf(stderr, "SC2_Layout: failed to load '%s'\n", filename);
+        return false;
+    }
+
+    xmlDoc *doc = xmlParseMemory(buf, len);
+    sc2_layout_import.FS_FreeFile(buf);
+    if (!doc) {
+        fprintf(stderr, "SC2_Layout: failed to parse '%s'\n", filename);
+        return false;
+    }
+
+    xmlNode *root = xmlDocGetRootElement(doc);
+    if (!root || strcasecmp((char const *)root->name, "Desc")) {
+        fprintf(stderr, "SC2_Layout: root element is not <Desc> in '%s'\n", filename);
+        xmlFreeDoc(doc);
+        return false;
+    }
+
+    SC2_ParseDescNode(root->children);
+    xmlFreeDoc(doc);
+    return true;
+}
+
+bool SC2_LayoutBuildMainMenu(void) {
+    SC2_LayoutInit();
+    static cstring_t glue_files[] = {
+        "UI/Layout/Common/StandardConstants.SC2Layout",
+        "UI/Layout/Common/StandardTemplates.SC2Layout",
+        "UI/Layout/Glue/GlueMainMenu.SC2Layout",
+        NULL,
+    };
+    for (int i = 0; glue_files[i]; i++)
+        if (!SC2_LayoutParseFile(glue_files[i]))
+            fprintf(stderr, "SC2_Layout: failed to load glue file '%s'\n", glue_files[i]);
+    return SC2_LayoutFlatten("GlueMainMenu");
+}
+
+bool SC2_LayoutBuildGameUI(void) {
+    SC2_LayoutInit();
+    /* Files must be ordered leaf-to-root: templates must be parsed (and thus
+     * indexed lower in sc2_layout.templates[]) before any file that instantiates
+     * them.  The global resolution pass iterates in index order, so a template
+     * must be fully expanded before the consumer template is processed.
+     *
+     * Key constraints:
+     *   CommandButton.SC2Layout  < CommandPanel.SC2Layout
+     *   PortraitPanel.SC2Layout  < ConsolePanel.SC2Layout
+     *   GameButton.SC2Layout     < CommandButton.SC2Layout  (already satisfied)
+     *   GameUI.SC2Layout         last (instantiates all top-level panels) */
+    static cstring_t core_files[] = {
+        "UI/Layout/Common/StandardConstants.SC2Layout",
+        "UI/Layout/UI/GameButton.SC2Layout",
+        "UI/Layout/Common/StandardTemplates.SC2Layout",
+        "UI/Layout/Common/StandardTooltip.SC2Layout",
+        "UI/Layout/Common/StandardDialog.SC2Layout",
+        "UI/Layout/UI/CommandButton.SC2Layout",    /* leaf: needs GameButton only */
+        "UI/Layout/UI/PortraitPanel.SC2Layout",    /* leaf: no game-file deps */
+        "UI/Layout/UI/MinimapPanel.SC2Layout",     /* leaf: self-contained */
+        "UI/Layout/UI/ResourcePanel.SC2Layout",    /* leaf: self-contained */
+        "UI/Layout/UI/BehaviorBar.SC2Layout",      /* InfoPanel child template */
+        "UI/Layout/UI/UnitButton.SC2Layout",       /* UnitWireframe base template */
+        "UI/Layout/UI/UnitWireframe.SC2Layout",    /* InfoPanel child template */
+        "UI/Layout/UI/AIFrames.SC2Layout",         /* InfoPanelAI* + CommandPanelAI */
+        "UI/Layout/UI/InfoPaneUnit.SC2Layout",     /* InfoPanel subpane */
+        "UI/Layout/UI/InfoPaneHero.SC2Layout",     /* InfoPanel subpane */
+        "UI/Layout/UI/InfoPaneQueue.SC2Layout",    /* InfoPanel subpane */
+        "UI/Layout/UI/InfoPaneProgress.SC2Layout", /* InfoPanel subpane */
+        "UI/Layout/UI/InfoPaneCargo.SC2Layout",    /* InfoPanel subpane */
+        "UI/Layout/UI/InfoPaneGroup.SC2Layout",    /* InfoPanel subpane */
+        "UI/Layout/UI/CommandPanel.SC2Layout",     /* needs CommandButton */
+        "UI/Layout/UI/ConsolePanel.SC2Layout",     /* needs PortraitPanel */
+        "UI/Layout/UI/InfoPanel.SC2Layout",
+        "UI/Layout/UI/PausePanel.SC2Layout",
+        "UI/Layout/UI/ResourceRequestAlertPanel.SC2Layout",
+        "UI/Layout/UI/HeroPanel.SC2Layout",
+        "UI/Layout/UI/InventoryPanel.SC2Layout",
+        "UI/Layout/UI/TipAlertPanel.SC2Layout",
+        "UI/Layout/UI/RevealPanel.SC2Layout",
+        "UI/Layout/UI/AlliancePanel.SC2Layout",
+        "UI/Layout/UI/TeamResourcePanel.SC2Layout",
+        "UI/Layout/UI/LeaderPanel.SC2Layout",
+        "UI/Layout/UI/ChatBar.SC2Layout",
+        "UI/Layout/UI/SystemAlertPanel.SC2Layout",
+        "UI/Layout/Glue/TalkerPanel.SC2Layout",    /* GameUI references Glue template */
+        "UI/Layout/Glue/CreditsPanel.SC2Layout",   /* GameUI references Glue template */
+        "UI/Layout/UI/MenuBar.SC2Layout",
+        "UI/Layout/UI/ControlGroupPanel.SC2Layout",
+        "UI/Layout/UI/AlertPanel.SC2Layout",
+        "UI/Layout/UI/ObjectivePanel.SC2Layout",
+        "UI/Layout/UI/TimePanel.SC2Layout",
+        "UI/Layout/UI/ConversationPanel.SC2Layout",
+        "UI/Layout/UI/SubtitlePanel.SC2Layout",
+        "UI/Layout/UI/CashPanel.SC2Layout",
+        "UI/Layout/UI/GameUI.SC2Layout",           /* root: instantiates everything */
+        NULL,
+    };
+    for (int i = 0; core_files[i]; i++)
+        if (!SC2_LayoutParseFile(core_files[i]))
+            fprintf(stderr, "SC2_Layout: failed to load core file '%s'\n", core_files[i]);
+    int resolve_end = sc2_layout.num_templates;
+    for (int i = 0; i < resolve_end; i++) {
+        sc2Frame_t *frame = &sc2_layout.templates[i];
+        if (frame->template_path[0]) {
+            sc2Frame_t *tmpl = SC2_ResolveTemplatePath(frame->template_path);
+            if (tmpl) {
+                SC2_ResolveTemplate(frame, tmpl);
+                frame->template_path[0] = '\0';
+            } else {
+                fprintf(stderr, "SC2_Layout: unresolved template '%s' for frame '%s'\n",
+                        frame->template_path, frame->name);
+            }
+        }
+    }
+    return SC2_LayoutFlatten("GameUI");
+}
+
+
+bool SC2_LayoutFlatten(cstring_t root_name) {
+    sc2Frame_t *root = SC2_FindTemplate(root_name);
+    if (!root) {
+        fprintf(stderr, "SC2_Layout: '%s' template not found\n", root_name);
+        return false;
+    }
+    sc2_layout.num_frames = 0;
+    SC2_FlattenFrame(root, -1);
+    SC2_ResolveNamedRelatives();
+    fprintf(stderr, "SC2_Layout: built %d frames from %d templates, %d constants\n",
+            sc2_layout.num_frames, sc2_layout.num_templates, sc2_layout.num_constants);
+    return true;
+}
+
+sc2BaseFrame_t *SC2_LayoutGetFrames(uint32_t *count) {
+    if (count) *count = (uint32_t)sc2_layout.num_frames;
+    return sc2_layout.frames;
+}
+
+sc2Frame_t *SC2_LayoutFindTemplate(cstring_t name) {
+    return SC2_FindTemplate(name);
+}
+
+sc2BaseFrame_t *SC2_LayoutFindFrameByType(sc2FrameType type) {
+    for (int i=0;i<sc2_layout.num_frames;i++)
+        if (sc2_layout.frames[i].sc2_type==type) return &sc2_layout.frames[i];
+    return NULL;
+}
+
+sc2BaseFrame_t *SC2_LayoutFindFrameByName(cstring_t name) {
+    for (int i = 0; i < sc2_layout.num_frames; i++)
+        if (sc2_layout.frames[i].name && !strcasecmp(sc2_layout.frames[i].name, name))
+            return &sc2_layout.frames[i];
+    return NULL;
+}
+
+sc2BaseFrame_t *SC2_LayoutFindChildFrame(sc2BaseFrame_t *parent, cstring_t name) {
+    if (!parent || !name) return NULL;
+    for (uint32_t i = 0; i < (uint32_t)sc2_layout.num_frames; i++) {
+        if (sc2_layout.frames[i].parent_index == parent->number &&
+            sc2_layout.frames[i].name && !strcasecmp(sc2_layout.frames[i].name, name))
+            return &sc2_layout.frames[i];
+    }
+    return NULL;
+}
+
+int SC2_LayoutNumTemplates(void) {
+    return sc2_layout.num_templates;
+}
+
+sc2Frame_t *SC2_LayoutGetTemplate(int index) {
+    if (index < 0 || index >= sc2_layout.num_templates) return NULL;
+    return &sc2_layout.templates[index];
+}
+
+void SC2_InitFrame(sc2Frame_t *frame, sc2FrameType type) {
+    memset(frame, 0, sizeof(*frame));
+    frame->type = type;
+    frame->alpha = 1.0f;
+    frame->color = (color32_t){255, 255, 255, 255};
+}
+
+void SC2_SetSize(sc2Frame_t *frame, float width, float height) {
+    frame->width = width;
+    frame->height = height;
+    frame->flags |= SC2_FRAME_HAS_WIDTH | SC2_FRAME_HAS_HEIGHT;
+}
+
+void SC2_SetHidden(sc2Frame_t *frame, bool value) {
+    frame->flags |= SC2_FRAME_HAS_VISIBLE;
+    if (value) frame->flags &= ~SC2_FRAME_VISIBLE;
+    else frame->flags |= SC2_FRAME_VISIBLE;
+}
+
+void SC2_SetEnabled(sc2Frame_t *frame, bool enabled) {
+    if (enabled) frame->flags |= SC2_FRAME_ACCEPTS_MOUSE;
+    else frame->flags &= ~SC2_FRAME_ACCEPTS_MOUSE;
+}
+
+#endif /* stb_sc2layout_impl */
+#endif /* STB_SC2LAYOUT_IMPLEMENTATION */

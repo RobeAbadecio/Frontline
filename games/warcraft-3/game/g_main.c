@@ -1,0 +1,3366 @@
+/*
+ * g_main.c — Game library entry point and main simulation loop.
+ *
+ * This file implements the game_export interface consumed by the server
+ * (sv_game.c).  GetGameAPI() is called once at startup and returns a
+ * vtable of function pointers used by the server to drive the game.
+ *
+ * Key callbacks:
+ *   Init        — allocates entity pool, loads config/unit data tables.
+ *   LoadMap     — loads a map and spawns all its entities.
+ *   RunFrame    — called once per server frame; runs events, client camera
+ *                 interpolation, entity physics/AI, and collision resolution.
+ *   ClientBegin — called when a client finishes connecting; sends the initial
+ *                 UI layout (svc_layout) and tallies food counts.
+ *   ClientCommand — routes player commands to the skills system.
+ *
+ * G_RunFrame() is the inner loop:
+ *   1. Sync level.time and advance the Warcraft time-of-day clock.
+ *   2. G_RunTimers()      — publish expired timer events.
+ *   3. G_RunEvents()      — dispatch queued game events to triggers.
+ *   4. G_RunClients()     — interpolate camera positions for smooth panning.
+ *   5. G_RunEntities()    — call G_RunEntity() on every live entity.
+ *   6. G_SolveCollisions() — resolve entity overlaps (g_phys.c).
+ *   7. G_RunDeferredFrees() — retire JASS RemoveUnit handles after the frame.
+ */
+#include "common/common.h"
+#include "g_local.h"
+#ifdef WC3_SC2API
+#include "sc2api/sc2api_server.h"
+#endif
+
+#define WC3_PATH_WORK_BUDGET 65536
+#include "common/ui_constants.h"
+#include "games/warcraft-3/common/minimap.h"
+#include "common/map_load_debug.h"
+#include "jass/jass.h"
+#include "hud/score_screen_table.h"
+#include <stdarg.h>
+
+struct game_export globals;
+struct game_import gi;
+struct game_locals game;
+struct level_locals level;
+struct edict_s *g_edicts;
+static bool entity_is_pathing_ignored(edict_t const *ent);
+
+extern jassModule_t jass_funcs[];
+
+static void G_StartScripts(void);
+static void G_RefreshPauseState(void);
+static void G_CheckTimeOfDayEvents(float before, float after);
+static void InitConstants(void);
+static void G_ApplyMapGameDataSet(mapInfo_t const *mapinfo);
+
+#define WC3_CHEAT_STARTING_RESOURCE_BONUS 5000 /* gold/lumber units added once when map gameplay becomes controllable */
+/* Pending scripted save and dependent map change are transient and deliberately
+ * excluded from the full-game snapshot. A restored zone must not execute its
+ * old outgoing ChangeLevel a second time. */
+typedef struct {
+    bool pending;
+    bool change_level;
+    bool load_game;
+    bool score_screen;
+    char name[MAX_PATHLEN];
+    char path[MAX_PATHLEN];
+    char map[MAX_PATHLEN];
+    char load_name[MAX_PATHLEN];
+} wc3ScriptSaveRequest_t;
+static wc3ScriptSaveRequest_t script_save_request;
+/* Standalone scripted LoadGame also waits until the simulation/JASS frame ends.
+ * Never serialize an outgoing request into the saved zone. */
+static char script_standalone_load[MAX_PATHLEN];
+static bool script_save_rejected;
+
+/* One deferred destination owns the outgoing score flow. Its first request
+ * wins; only the finalization boundary captures the finished match data.
+ * This state is transient and is never part of a game save. */
+typedef struct {
+    bool pending, shown, snapshot_frozen;
+    bool terminal; /* completed single-player match; outlives the OK ticket */
+    bool destination_submitted; /* fail-open and Continue remain one-shot */
+    char action[16], argument[MAX_PATHLEN];
+    bool awaiting[MAX_CLIENTS];
+    uint8_t tab[MAX_CLIENTS];
+    uint8_t scroll[MAX_CLIENTS]; /* starting row; capped by MAX_PLAYERS */
+    wc3ScoreView_t view[MAX_CLIENTS]; /* transient, per-viewer controls */
+    wc3ScoreSnapshot_t frozen;
+} wc3ScoreTransition_t;
+static wc3ScoreTransition_t score_transition;
+
+/* The first accepted score exit owns both its destination and any staged
+ * difficulty override. Neither a second JASS exit nor a late result-button
+ * command may replace it, including after Continue has consumed the ticket
+ * while the old world is waiting to be unloaded. */
+static bool G_ScoreTransitionOwnsExit(void) {
+    return score_transition.pending || score_transition.destination_submitted ||
+           score_transition.terminal;
+}
+
+static void G_ResetScoreTransition(void) {
+    memset(&score_transition, 0, sizeof(score_transition));
+}
+
+static void G_CaptureScoreSnapshot(wc3ScoreSnapshot_t *snapshot) {
+    if (!snapshot) return;
+    memset(snapshot, 0, sizeof(*snapshot));
+    /* World simulation ticks, not time spent on the paused score modal.
+     * Saturate before narrowing to the outgoing wire snapshot. */
+    snapshot->elapsed_ms = (uint32_t)MIN((uint64_t)level.framenum * FRAMETIME,
+                                         (uint64_t)UINT32_MAX);
+    /* Only the first MAX_PLAYERS client slots are initialized with WC3
+     * player handles. The remaining reserved client slots have zeroed IDs
+     * and must never masquerade as a second copy of Player(0). */
+    /* Each map player may explicitly disable its own row. Never infer that
+     * false means disabled unless SetPlayerOnScoreScreen was actually called. */
+    FOR_LOOP(i, MIN((uint32_t)game.max_clients, (uint32_t)MAX_PLAYERS)) {
+        gameClient_t const *client = game.clients + i;
+        wc3ScorePlayerSnapshot_t *entry;
+        uint32_t number = client->ps.number;
+        if (snapshot->count >= MAX_PLAYERS || number >= MAX_PLAYERS ||
+            !G_ScorePlayerEligible(client)) continue;
+        /* RemovePlayer may precede EndGame; elimination does not clear a
+         * player's authored score-screen eligibility. */
+        entry = &snapshot->players[snapshot->count++];
+        entry->number = number;
+        entry->race = client->ps.race;
+        entry->team = client->ps.team;
+        entry->color = client->ps.color;
+        G_PlayerScoreSnapshotHeroes(entry);
+        entry->experience_gained = (uint32_t)MIN((uint64_t)client->score.experience_gained +
+            G_PlayerScoreScriptedXP(number), (uint64_t)INT32_MAX);
+        strlcpy(entry->name,
+                client->jass.name[0] ? client->jass.name :
+                (client->ps.name && *client->ps.name ? client->ps.name : "Player"),
+                sizeof(entry->name));
+        FOR_LOOP(s, WC3_PLAYER_SCORE_COUNT) {
+            int32_t value = 0;
+            if (G_GetPlayerScoreValue(client, s, &value)) entry->values[s] = value;
+        }
+    }
+}
+
+static void G_QueueScoreTransition(cstring_t action, cstring_t argument) {
+    if (G_ScoreTransitionOwnsExit()) return; /* first exit owns destination */
+    G_ResetScoreTransition();
+    score_transition.pending = true;
+    strlcpy(score_transition.action, action, sizeof(score_transition.action));
+    strlcpy(score_transition.argument, argument ? argument : "", sizeof(score_transition.argument));
+    /* Not yet frozen: JASS, queued removals and scripted saves can still
+     * update the final score before the safe frame/command boundary. */
+}
+
+static void G_FreezePendingScoreSnapshot(void) {
+    if (!score_transition.pending || score_transition.snapshot_frozen) return;
+    G_CaptureScoreSnapshot(&score_transition.frozen);
+    score_transition.snapshot_frozen = true;
+}
+
+static void G_CompleteScoreTransition(void) {
+    char action[sizeof(score_transition.action)], argument[sizeof(score_transition.argument)];
+    bool terminal;
+    if (!score_transition.pending) return;
+    strlcpy(action, score_transition.action, sizeof(action));
+    strlcpy(argument, score_transition.argument, sizeof(argument));
+    /* MenuAction queues the destination; keep the outgoing simulation stopped
+     * until SV_Map starts a new world or game shutdown completes. */
+    terminal = score_transition.terminal;
+    G_ResetScoreTransition(); /* exactly once, even if MenuAction reenters */
+    score_transition.terminal = terminal;
+    score_transition.destination_submitted = true;
+    gi.MenuAction(action, argument);
+}
+
+bool G_ScoreTransitionTerminal(void) { return score_transition.terminal; }
+
+void G_ScoreTransitionContinue(edict_t *player) {
+    uint32_t slot;
+    if (!score_transition.pending || !score_transition.shown || !player || !player->client) return;
+    slot = (uint32_t)(player->client - game.clients);
+    if (slot >= MAX_CLIENTS || !score_transition.awaiting[slot]) return;
+    G_CompleteScoreTransition();
+}
+
+void G_ScoreTransitionSelectTab(edict_t *player, uint32_t tab) {
+    uint32_t slot;
+    if (!score_transition.pending || !score_transition.shown || !player ||
+        !player->client || tab >= 4) return;
+    slot = (uint32_t)(player->client - game.clients);
+    if (slot >= MAX_CLIENTS || !score_transition.awaiting[slot]) return;
+    score_transition.tab[slot] = (uint8_t)tab;
+    score_transition.view[slot].column = WC3_SCORE_NO_SORT;
+    /* Retain the viewport position when changing tabs. */
+    UI_ShowScoreScreen(player, &score_transition.frozen, tab, score_transition.scroll[slot],
+                       &score_transition.view[slot]);
+}
+
+/* All score controls validate the same recipient ownership as Continue.
+ * An untrusted client cannot change another player's view or navigation. */
+static wc3ScoreView_t *G_ScoreViewer(edict_t *player, uint32_t *slot) {
+    uint32_t index;
+    if (!score_transition.pending || !score_transition.shown ||
+        !player || !player->client) return NULL;
+    index = (uint32_t)(player->client - game.clients);
+    if (index >= MAX_CLIENTS || !score_transition.awaiting[index]) return NULL;
+    if (slot) *slot = index;
+    return &score_transition.view[index];
+}
+
+void G_ScoreTransitionSort(edict_t *player, uint32_t column) {
+    uint32_t slot;
+    wc3ScoreView_t *view = G_ScoreViewer(player, &slot);
+    if (!view || column >= WC3_ScoreColumns(score_transition.tab[slot])) return;
+    WC3_ScoreSortColumn(view, score_transition.tab[slot], column);
+    score_transition.scroll[slot] = 0;
+    UI_ShowScoreScreen(player, &score_transition.frozen, score_transition.tab[slot], 0, view);
+}
+
+void G_ScoreTransitionToggleTeams(edict_t *player) {
+    uint32_t slot;
+    wc3ScoreView_t *view = G_ScoreViewer(player, &slot);
+    if (!view) return;
+    view->teams = !view->teams;
+    score_transition.scroll[slot] = 0;
+    UI_ShowScoreScreen(player, &score_transition.frozen, score_transition.tab[slot], 0, view);
+}
+
+void G_ScoreTransitionToggleAllyColors(edict_t *player) {
+    uint32_t slot;
+    wc3ScoreView_t *view = G_ScoreViewer(player, &slot);
+    if (!view) return;
+    view->ally_colors = !view->ally_colors;
+    UI_ShowScoreScreen(player, &score_transition.frozen, score_transition.tab[slot],
+                       score_transition.scroll[slot], view);
+}
+
+void G_ScoreTransitionScroll(edict_t *player, float position) {
+    uint32_t slot, max_start;
+    if (!score_transition.pending || !score_transition.shown || !player ||
+        !player->client || !isfinite(position) || position < 0.0f || position > 1.0f) return;
+    slot = (uint32_t)(player->client - game.clients);
+    if (slot >= MAX_CLIENTS || !score_transition.awaiting[slot]) return;
+    max_start = score_transition.frozen.count > WC3_SCORE_VISIBLE_ROWS
+        ? score_transition.frozen.count - WC3_SCORE_VISIBLE_ROWS : 0;
+    score_transition.scroll[slot] = (uint8_t)(position >= 1.0f ? max_start :
+        MIN((uint32_t)lroundf(position * (float)max_start), max_start));
+    UI_ShowScoreScreen(player, &score_transition.frozen, score_transition.tab[slot],
+                       score_transition.scroll[slot], &score_transition.view[slot]);
+}
+
+/* A single local viewer may finish the outgoing match without keeping its
+ * simulation alive. Preserve the game module, map media and server transport
+ * until Continue so the existing score FDF and commands still work. Two or
+ * more connected clients keep the previous multiplayer behavior unchanged. */
+static void G_EnterScorePresentation(void) {
+    uint32_t connected = 0;
+    if (!score_transition.shown || !G_IsSinglePlayer()) return;
+    FOR_LOOP(i, game.max_clients) connected += game.clients[i].connected ? 1u : 0u;
+    if (connected != 1) return;
+    score_transition.terminal = true;
+    G_RefreshPauseState();
+}
+
+#ifdef BZ_TESTS
+bool G_ScoreTransitionPending(void) { return score_transition.pending; }
+/* Test harness resets transient state between independent test cases. */
+void G_TestResetScoreTransition(void) { G_ResetScoreTransition(); }
+#endif
+
+void G_FlushScoreTransition(void) {
+    bool presented = false;
+    if (!score_transition.pending) return;
+    if (score_transition.shown) {
+        /* If every recipient disconnects, no Continue can arrive. The
+         * disconnect path releases the client's modal pause ownership. */
+        FOR_LOOP(i, game.max_clients)
+            if (score_transition.awaiting[i] && game.clients[i].connected) return;
+        G_CompleteScoreTransition();
+        return;
+    }
+    /* Called only after the originating frame or paused client command has
+     * finished its JASS callbacks, removals and scripted save. Never snapshot
+     * at the original EndGame/ChangeLevel request site. */
+    G_FreezePendingScoreSnapshot();
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        edict_t *ent;
+        if (!client->connected) continue;
+        ent = G_GetPlayerEntityByNumber(client->ps.number);
+        if (!ent) continue;
+        score_transition.view[i].column = WC3_SCORE_NO_SORT;
+        if (UI_ShowScoreScreen(ent, &score_transition.frozen, 0, 0, &score_transition.view[i])) {
+            score_transition.awaiting[i] = true;
+            presented = true;
+        }
+    }
+    if (presented) {
+        score_transition.shown = true;
+        G_EnterScorePresentation();
+    } else {
+        /* No retail FDF, no recipient, or no root: never strand the level. */
+        G_CompleteScoreTransition();
+    }
+}
+
+
+/* SV_Map keeps game.dll alive across ordinary map replacements, while
+ * G_SpawnEntities clears the old level. Capture only the two difficulty
+ * scalars; never retain pointers into a destroyed level or JASS VM. */
+typedef struct {
+    bool pending;
+    char target[MAX_PATHLEN];
+    uint32_t current;
+    uint32_t original_default;
+} wc3DifficultyTransition_t;
+static wc3DifficultyTransition_t difficulty_transition;
+
+static void G_ResetDifficultyTransition(void) {
+    memset(&difficulty_transition, 0, sizeof(difficulty_transition));
+}
+
+/* The shared resolver is the same one MenuAction("level") uses. An
+ * unresolved or overlong destination cannot be staged for a later map. */
+static bool G_StageDifficultyTransition(cstring_t map) {
+    char resolved[MAX_PATHLEN];
+    uint32_t current = level.setup.difficulty;
+    uint32_t original_default = level.setup.default_difficulty;
+
+    if (G_ScoreTransitionOwnsExit()) return false;
+    G_ResetDifficultyTransition();
+    if (!map || !*map || strlen(map) >= sizeof(resolved) ||
+        current > 3 || original_default > 3) return false;
+    if (gi.ResolveMap) {
+        if (!gi.ResolveMap(map, resolved, sizeof(resolved))) return false;
+    } else {
+        /* Headless game-module tests can supply an already resolved path. */
+        strlcpy(resolved, map, sizeof(resolved));
+    }
+    if (!resolved[0] || strlen(resolved) >= sizeof(difficulty_transition.target)) return false;
+    strlcpy(difficulty_transition.target, resolved, sizeof(difficulty_transition.target));
+    difficulty_transition.current = current;
+    difficulty_transition.original_default = original_default;
+    difficulty_transition.pending = true;
+    return true;
+}
+
+static bool G_SameMapPath(cstring_t a, cstring_t b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        unsigned char ac = (unsigned char)*a++, bc = (unsigned char)*b++;
+        if (ac == '\\') ac = '/';
+        if (bc == '\\') bc = '/';
+        if (tolower(ac) != tolower(bc)) return false;
+    }
+    return !*a && !*b;
+}
+
+bool G_HasPendingDifficultyTransition(void) {
+    return difficulty_transition.pending;
+}
+
+bool G_TakeDifficultyTransition(cstring_t map, uint32_t *current, uint32_t *original_default) {
+    wc3DifficultyTransition_t const staged = difficulty_transition;
+    /* Consume even a mismatched destination. A cancelled/replaced level
+     * action must never leak its override into some later map. */
+    G_ResetDifficultyTransition();
+    if (!staged.pending || !current || !original_default ||
+        !G_SameMapPath(staged.target, map) || staged.current > 3 || staged.original_default > 3)
+        return false;
+    *current = staged.current;
+    *original_default = staged.original_default;
+    return true;
+}
+
+void G_ResetScriptSave(void) {
+    memset(&script_save_request, 0, sizeof(script_save_request));
+    script_standalone_load[0] = '\0';
+    script_save_rejected = false;
+}
+
+typedef struct {
+    gameClient_t *client;
+    uint32_t ui_state;
+    uint32_t ui_flags;
+    uint32_t rdflags;
+    bool no_control;
+    bool presentation_dirty;
+} wc3TransitionUIState_t;
+
+/* A map transition interrupts the current cutscene. Do not persist its
+ * cinematic HUD/input/fog state in a zone snapshot that will later resume. */
+static uint32_t G_EndCinematicForZoneTransition(wc3TransitionUIState_t *saved, uint32_t capacity) {
+    uint32_t count = 0;
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        edict_t *ent;
+        if (!client->connected || client->ps.client_ui_state != CLIENT_UI_CINEMATIC || count >= capacity) continue;
+        saved[count++] = (wc3TransitionUIState_t){
+            client, client->ps.client_ui_state, client->ps.uiflags, client->ps.rdflags,
+            client->no_control, client->presentation_dirty
+        };
+        ent = G_GetPlayerEntityByNumber(client->ps.number);
+        if (ent) UI_ShowInterface(ent, true, 0.0f);
+        else {
+            client->ps.client_ui_state = CLIENT_UI_GAME;
+            client->ps.uiflags = 1u << LAYER_CINEMATIC;
+            client->presentation_dirty = true;
+        }
+        client->no_control = false;
+        SET_FLAG(client->ps.rdflags, RDF_NOFOG, false);
+        SET_FLAG(client->ps.rdflags, RDF_NOFOGMASK, false);
+    }
+    return count;
+}
+
+static void G_RestoreTransitionUIState(wc3TransitionUIState_t const *saved, uint32_t count) {
+    FOR_LOOP(i, count) {
+        gameClient_t *client = saved[i].client;
+        client->ps.client_ui_state = saved[i].ui_state;
+        client->ps.uiflags = saved[i].ui_flags;
+        client->ps.rdflags = saved[i].rdflags;
+        client->no_control = saved[i].no_control;
+        client->presentation_dirty = saved[i].presentation_dirty;
+    }
+}
+
+bool G_ScriptSavePending(void) { return script_save_request.pending; }
+
+bool G_RequestScriptSaveGame(cstring_t name) {
+    PATHSTR path;
+    /* The accepted score exit must not be superseded or poisoned by a later
+     * scripted save request in the same callback. */
+    if (G_ScoreTransitionOwnsExit()) return false;
+    if (script_save_rejected || script_save_request.pending || script_standalone_load[0] || !gi.ScriptSavePath ||
+        !gi.ScriptSavePath(name, path, sizeof(path))) {
+        /* A failed SaveGame must never allow the BJ wrapper's following
+         * ChangeLevel to bypass its failed source-save prerequisite. */
+        script_save_rejected = true;
+        return false;
+    }
+    /* Keep logical name as well as the already-authorized concrete filename.
+     * The name is not reinterpreted as a map path or menu save slot. */
+    G_ResetScriptSave();
+    script_save_request.pending = true;
+    strlcpy(script_save_request.name, name, sizeof(script_save_request.name));
+    strlcpy(script_save_request.path, path, sizeof(script_save_request.path));
+    return true;
+}
+
+/* LoadGame is a session operation: it may load a different map and can never
+ * call ReadGame from an active JASS stack. A SaveAndLoadGameBJ pair remains one
+ * pending transaction, so a failed source save cannot load the destination. */
+bool G_RequestScriptLoadGame(cstring_t name) {
+    if (G_ScoreTransitionOwnsExit()) return false;
+    if (script_save_rejected || script_standalone_load[0] || script_save_request.change_level ||
+        script_save_request.load_game || !name || !*name || !gi.ScriptSaveExists ||
+        !gi.ScriptSaveExists(name) || strlen(name) >= MAX_PATHLEN) {
+        if (script_save_request.pending || script_standalone_load[0]) script_save_rejected = true;
+        return false;
+    }
+    G_ResetDifficultyTransition();
+    if (script_save_request.pending) {
+        script_save_request.load_game = true;
+        strlcpy(script_save_request.load_name, name, sizeof(script_save_request.load_name));
+    } else {
+        strlcpy(script_standalone_load, name, sizeof(script_standalone_load));
+    }
+    return true;
+}
+
+void G_FlushScriptSave(void) {
+    wc3ScriptSaveRequest_t request;
+    wc3TransitionUIState_t saved_ui[MAX_CLIENTS];
+    uint32_t saved_ui_count = 0;
+    if (script_save_rejected) {
+        fprintf(stderr, "WC3 SaveGame: rejecting script transition after invalid save request\n");
+        G_ResetScriptSave();
+        G_ResetDifficultyTransition();
+        return;
+    }
+    if (!script_save_request.pending) {
+        if (script_standalone_load[0]) {
+            char name[MAX_PATHLEN];
+            strlcpy(name, script_standalone_load, sizeof(name));
+            G_ResetScriptSave();
+            /* The server will revalidate scope, existence and snapshot map
+             * identity before it replaces the active game. */
+            gi.MenuAction("scriptload", name);
+        }
+        return;
+    }
+    request = script_save_request;
+    G_ResetScriptSave();
+    /* All current synchronous JASS callbacks have finished at this boundary.
+     * No map replacement is submitted until the source snapshot is committed. */
+    if (request.change_level || request.load_game)
+        saved_ui_count = G_EndCinematicForZoneTransition(saved_ui, MAX_CLIENTS);
+    if (!WriteGame(request.path)) {
+        G_RestoreTransitionUIState(saved_ui, saved_ui_count);
+        G_ResetDifficultyTransition();
+        fprintf(stderr, "WC3 SaveGame: failed to save %s; transition cancelled\n", request.name);
+        return;
+    }
+    if (request.change_level) {
+        BZ_WC3_SCORE_LOG("scripted save complete; request ChangeLevel map=%s score_screen=%u",
+                          request.map, (unsigned)request.score_screen);
+        /* SaveAndChangeLevel commits the source snapshot before the destination
+         * transition is published. Stage difficulty before the deferred score flow. */
+        if (G_StageDifficultyTransition(request.map)) {
+            if (request.score_screen) G_QueueScoreTransition("level", request.map);
+            else gi.MenuAction("level", request.map);
+        }
+    } else if (request.load_game) {
+        /* Retain the current script scope, unlike a manual user load. */
+        gi.MenuAction("scriptload", request.load_name);
+    }
+}
+
+/* An authored result button may run a synchronous JASS continuation while
+ * SV_Frame is paused. The ordinary G_RunFrame tail will then never execute.
+ * This is called only after G_ClientCommand has returned from its handler:
+ * no handler/JASS C stack may be active when deferred handles or saves drain.
+ * Do not run this for ordinary unpaused commands: those keep frame-end order. */
+void G_FlushPausedScoreTransition(void) {
+    /* Once shown, tab/sort/Continue commands do not re-finalize the world. */
+    if (score_transition.shown ||
+        (!score_transition.pending &&
+         !(script_save_request.pending && script_save_request.change_level &&
+           script_save_request.score_screen))) return;
+
+    G_DrainPausedResultEvents();
+    G_RunDeferredFrees();
+    G_RunConsumedItemFrees();
+    G_FlushScriptSave();
+    G_FlushScoreTransition();
+}
+
+static cstring_t wc3_campaign_paths[] = {
+    "Maps\\Campaign\\", "Maps/Campaign/", "Maps\\FrozenThrone\\Campaign\\", "Maps/FrozenThrone/Campaign/"
+};
+
+/* Sheet/object data follows the map's W3I gameDataSet overlay while ordinary
+ * engine file lookup remains unchanged.  Missing versioned files fall back to
+ * the already-selected ROC/TFT archive view. */
+static handle_t G_ReadGameDataFile(cstring_t filename, uint32_t *size) {
+    char path[MAX_PATHLEN * 2];
+    uint32_t ignored_size = 0;
+    handle_t data;
+
+    if (!filename || !*filename) return NULL;
+    if (!size) size = &ignored_size;
+    if (game.data_prefix[0]) {
+        snprintf(path, sizeof(path), "%s\\%s", game.data_prefix, filename);
+        data = gi.ReadFile(path, size);
+        if (data) return data;
+        fprintf(stderr, "WC3: map data overlay missing %s; using base %s\n", path, filename);
+    }
+    data = gi.ReadFile(filename, size);
+    return data;
+}
+
+static bool starting_resource_cheat_armed;
+static uint32_t starting_resource_cheat_applied_mask;
+static uint32_t starting_resource_cheat_deferred_mask;
+
+void G_ResetStartingResourceCheat(void) {
+    cstring_t value = gi.CvarString("wc3_cheat_starting_resources", "0");
+
+    starting_resource_cheat_armed = value && atoi(value) != 0;
+    /* Pre-map configuration must obey the same server permission as client cheat commands. */
+    if (starting_resource_cheat_armed && !G_CheatsEnabled()) {
+        fprintf(stderr, "WC3: starting resource cheat requires sv_cheats 1 before map load\n");
+        starting_resource_cheat_armed = false;
+    }
+    starting_resource_cheat_applied_mask = 0;
+    starting_resource_cheat_deferred_mask = 0;
+}
+
+void G_DisableStartingResourceCheatForLoadedGame(void) {
+    starting_resource_cheat_armed = false;
+    starting_resource_cheat_applied_mask = ~0u;
+    starting_resource_cheat_deferred_mask = 0;
+}
+
+void G_ApplyStartingResourceCheat(void) {
+    if (!starting_resource_cheat_armed) return;
+    if (!G_CheatsEnabled()) {
+        fprintf(stderr, "WC3: starting resource cheat canceled because sv_cheats is disabled\n");
+        starting_resource_cheat_armed = false;
+        return;
+    }
+
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        uint32_t const bit = 1u << i;
+        int32_t gold, lumber;
+        uint16_t old_gold, old_lumber;
+
+        if (starting_resource_cheat_applied_mask & bit) continue;
+        if (!client->mapplayer || !client->mapplayer->used || client->mapplayer->playerType != kPlayerTypeHuman) {
+            starting_resource_cheat_applied_mask |= bit;
+            continue;
+        }
+        if (!client->connected || client->no_control || client->ps.client_ui_state == CLIENT_UI_CINEMATIC) continue;
+
+        old_gold = client->ps.stats[PLAYERSTATE_RESOURCE_GOLD];
+        old_lumber = client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER];
+        gold = (int32_t)old_gold + WC3_CHEAT_STARTING_RESOURCE_BONUS;
+        lumber = (int32_t)old_lumber + WC3_CHEAT_STARTING_RESOURCE_BONUS;
+        client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = (uint16_t)MIN(gold, USHRT_MAX);
+        client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = (uint16_t)MIN(lumber, USHRT_MAX);
+        starting_resource_cheat_applied_mask |= bit;
+    }
+}
+
+static float G_GetCanonicalTimeOfDay(void) {
+    float const day_hours = game.constants.gameDayHours;
+    float const day_length = game.constants.gameDayLength;
+
+    if (day_hours <= 0.0f || day_length <= 0.0f)
+        return 0.0f;
+    return (level.timeofday.elapsed / day_length) * day_hours;
+}
+
+float G_GetTimeOfDay(void) {
+    falseTimeofday_t const *false_time = &level.timeofday.false_time;
+
+    if (false_time->active && false_time->initialized)
+        return (float)false_time->hour + (float)false_time->minute / 60.0f;
+    return G_GetCanonicalTimeOfDay();
+}
+
+void G_SetTimeOfDay(float value) {
+    level.timeofday.pending = value;
+    level.timeofday.pending_valid = true;
+}
+
+void G_SuspendTimeOfDay(bool suspended) {
+    level.timeofday.suspended = suspended;
+}
+
+static void G_SetFalseTimeOfDayValue(float value) {
+    falseTimeofday_t *false_time = &level.timeofday.false_time;
+    int32_t const hour = (int32_t)value;
+
+    false_time->hour = hour;
+    false_time->minute = (int32_t)((value - (float)hour) * 60.0f);
+}
+
+void G_SetFalseTimeOfDay(int32_t hour, int32_t minute, float duration) {
+    float const before = G_GetTimeOfDay();
+    falseTimeofday_t *false_time = &level.timeofday.false_time;
+    float const step = (float)FRAMETIME / 1000.0f;
+
+    *false_time = (falseTimeofday_t){
+        .hour = hour,
+        .minute = minute,
+        .ticks_remaining = step > 0.0f ? (int32_t)(duration / step) : 0,
+        .active = true,
+        .initialized = false,
+    };
+
+    /* Warsmash exposes an existing false clock as the "before" value, then
+     * replaces it with an uninitialized false clock.  The new clock becomes
+     * effective on the next simulation tick, just like its Java state object. */
+    G_CheckTimeOfDayEvents(before, G_GetTimeOfDay());
+}
+
+bool G_IsFalseTimeOfDay(void) {
+    falseTimeofday_t const *false_time = &level.timeofday.false_time;
+    return false_time->active && false_time->initialized;
+}
+
+/* Publish one normalized cycle value through an already-replicated player stat.
+ * Static svc_layout sprite frames can bind to this value without resending the
+ * ConsoleUI layer every simulation tick. */
+static void G_PublishTimeOfDayPhase(void) {
+    float const day_hours = game.constants.gameDayHours;
+    float phase = day_hours > 0.0f ? G_GetTimeOfDay() / day_hours : 0.0f;
+    uint16_t packed;
+
+    if (!isfinite(phase)) phase = 0.0f;
+    phase = MAX(0.0f, MIN(phase, 1.0f));
+    packed = (uint16_t)lroundf(phase * (float)USHRT_MAX);
+    FOR_LOOP(i, game.max_clients) {
+        game.clients[i].ps.stats[UI_PLAYERSTAT_ENV_PHASE] = packed;
+        game.clients[i].ps.stats[UI_PLAYERSTAT_ENV_VARIANT] = G_IsFalseTimeOfDay() ? 1 : 0;
+    }
+}
+
+static void G_CheckTimeOfDayEvents(float before, float after) {
+    FOR_EACH_EVENT(evt) {
+        if (evt->type != EVENT_GAME_STATE_LIMIT || evt->state != WC3_GAME_STATE_TIME_OF_DAY)
+            continue;
+        if (!G_LimitMatches(evt->limitop, before, evt->limitval) &&
+            G_LimitMatches(evt->limitop, after, evt->limitval))
+        {
+            G_PublishEventResponse(NULL, EVENT_GAME_STATE_LIMIT, evt);
+        }
+    }
+}
+
+/* Warcraft owns one simulation clock for gameplay time of day. Misc.Dawn,
+ * Dusk, DayHours and DayLength define its scale; presentation systems should
+ * consume G_GetTimeOfDay() rather than maintain an independent timer. */
+void G_UpdateTimeOfDay(void) {
+    float const day_hours = game.constants.gameDayHours;
+    float const day_length = game.constants.gameDayLength;
+    float before, after;
+
+    if (day_hours <= 0.0f || day_length <= 0.0f) {
+        G_PublishTimeOfDayPhase();
+        return;
+    }
+
+    before = G_GetTimeOfDay();
+    if (level.timeofday.false_time.active) {
+        falseTimeofday_t *false_time = &level.timeofday.false_time;
+
+        if (level.timeofday.pending_valid) {
+            G_SetFalseTimeOfDayValue(level.timeofday.pending);
+            level.timeofday.pending_valid = false;
+        }
+        false_time->initialized = true;
+        false_time->ticks_remaining--;
+        if (false_time->ticks_remaining <= 0)
+            memset(false_time, 0, sizeof(*false_time));
+    } else {
+        if (level.timeofday.pending_valid) {
+            level.timeofday.elapsed =
+                (level.timeofday.pending / day_hours) * day_length;
+            level.timeofday.pending_valid = false;
+        } else if (!level.timeofday.suspended) {
+            level.timeofday.elapsed = fmodf(
+                level.timeofday.elapsed + (float)FRAMETIME / 1000.0f,
+                day_length);
+        }
+    }
+    after = G_GetTimeOfDay();
+    G_CheckTimeOfDayEvents(before, after);
+    G_PublishTimeOfDayPhase();
+}
+
+/* TerrainArt\Water.slk "<tileset>Sha" height places the simulated water surface; the renderer reads the
+ * same row, so floating and flying units rest on the drawn surface (Outland's Abyss sits 1.5 tiles down). */
+void G_ApplyTilesetWaterHeight(mapInfo_t const *info) {
+    char const tileset = info ? info->mainGroundType : 0;
+    WaterData_t const *row = G_WaterData(MAKEFOURCC(tileset, 'S', 'h', 'a'));
+
+    if (!row->id)
+        fprintf(stderr, "G_LoadMap: no TerrainArt\\Water.slk row %cSha; water surface uses the raw W3E level\n",
+                tileset ? tileset : '?');
+    CM_W3SetWaterHeight(row->height);
+}
+
+static bool G_LoadMap(cstring_t mapFilename) {
+    double const map_start = GAME_MAP_LOAD_NOW();
+    double stage_start = map_start;
+    if (!CM_LoadMap(mapFilename, gi.LoadingFrame)) {
+        GAME_MAP_LOAD_REPORT(mapFilename, "CM_LoadMap-failed", stage_start);
+        G_SetMapUnitOverrides(NULL);
+        G_SetMapAbilityOverrides(NULL);
+        return false;
+    }
+    GAME_MAP_LOAD_REPORT(mapFilename, "CM_LoadMap", stage_start);
+    stage_start = GAME_MAP_LOAD_NOW();
+    gi.LoadingFrame();
+    /* CS_MODELS is rebuilt from index 1 for every SV_Map.  The server-side
+     * animation metadata cache uses those indices too, so retaining it across
+     * levels can make a new index resolve to the previous map's filename. */
+    G_FreeModels();
+    G_ResetScoreTransition();
+    G_ResetDeferredFrees();
+    gi.ApplyLobbySettings((mapInfo_t *)CM_GetMapInfo());
+    gi.ClearWorld();
+    /* Old edicts can retain pointers into typed rows, so clear the world and
+     * HUD before swapping the map-selected object-data overlay. */
+    UI_ResetHud();
+    G_ApplyMapGameDataSet(CM_GetMapInfo());
+    G_ApplyTilesetWaterHeight(CM_GetMapInfo());
+    GAME_MAP_LOAD_REPORT(mapFilename, "map-data-set", stage_start);
+    stage_start = GAME_MAP_LOAD_NOW();
+    /* Resolve presentation from the active map data set before publishing the
+     * gameplay media contract. */
+    cstring_t marker = Stb_IniCacheFind(&game.config.theme, "Default", "TargetPointConfirm");
+    if (!marker || !*marker) fprintf(stderr, "G_LoadMap: missing skin field TargetPointConfirm\n");
+    gi.configstring(CS_ORDER_MARKER, marker ? marker : "");
+    gi.LoadingFrame();
+    G_MusicResetState();
+    G_ResetAttackAlerts();
+    G_SetMapUnitOverrides(CM_GetMapInfo());
+    G_SetMapAbilityOverrides(CM_GetMapInfo());
+    /* SV_Map already wiped CS_IMAGES/CS_FONTS. Bind every panel once so write
+     * paths do not parse FDF on first use. */
+    UI_LoadHud();
+    GAME_MAP_LOAD_REPORT(mapFilename, "hud-bind", stage_start);
+    stage_start = GAME_MAP_LOAD_NOW();
+    gi.LoadingFrame();
+    G_SpawnEntities(mapFilename);
+    GAME_MAP_LOAD_REPORT(mapFilename, "spawn-entities", stage_start);
+    stage_start = GAME_MAP_LOAD_NOW();
+    gi.LoadingFrame();
+    strlcpy(level.map_path, mapFilename, sizeof(level.map_path));
+    G_StartScripts();
+    GAME_MAP_LOAD_REPORT(mapFilename, "start-scripts", stage_start);
+    gi.LoadingFrame();
+    level.started = true;
+    MAP_LOAD_LOG("map=%s phase=G_LoadMap total-ms=%.3f\n", mapFilename,
+                     GAME_MAP_LOAD_NOW() - map_start);
+    return true;
+}
+
+/* war3mapMisc.txt is first so FS_FindSheetCell (first-match) prefers map/base
+ * war3mapMisc keys over stock MiscGame — matching the documented override rule. */
+cstring_t miscdata_files[] = {
+    "war3mapMisc.txt",
+    "UI\\MiscData.txt",
+    "Units\\MiscData.txt",
+    "Units\\MiscGame.txt",
+    "UI\\MiscUI.txt",
+    "UI\\SoundInfo\\MiscData.txt",
+    NULL
+};
+
+static void InitMiscValue(cstring_t name, float *dest) {
+    cstring_t strvalue = Stb_IniCacheFind(&game.config.misc, "Misc", name);
+    *dest = strvalue ? atof(strvalue) : 0;
+}
+
+static void InitMiscValueDefault(cstring_t name, float *dest, float fallback) {
+    cstring_t strvalue = Stb_IniCacheFind(&game.config.misc, "Misc", name);
+    /* BZ_HARDCODED_DATA_FALLBACK: stock WC3 1.29 defaults are used only when
+     * the authoritative MiscGame field is absent from the active data set. */
+    *dest = strvalue && *strvalue ? (float)atof(strvalue) : fallback;
+}
+
+static uint32_t InitMiscList(cstring_t name, float *dest, uint32_t capacity) {
+    cstring_t value = Stb_IniCacheFind(&game.config.misc, "Misc", name);
+    uint32_t count = 0;
+
+    if (!value || !*value) return 0;
+    while (*value && count < capacity) {
+        char *end = NULL;
+        while (*value == ' ' || *value == '\t') value++;
+        dest[count] = strtof(value, &end);
+        if (!end || end == value) {
+            fprintf(stderr, "Invalid Misc.%s list near '%s'\n", name, value);
+            break;
+        }
+        count++;
+        value = end;
+        while (*value == ' ' || *value == '\t') value++;
+        if (*value == ',') {
+            value++;
+        } else if (*value) {
+            fprintf(stderr, "Invalid Misc.%s separator near '%s'\n", name, value);
+            break;
+        }
+    }
+    return count;
+}
+
+static void InitConstants(void) {
+    static float const default_damage_bonus[8][8] = {
+        /* BZ_HARDCODED_DATA_FALLBACK: WC3 1.29 MiscGame defaults. */
+        { 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f }, /* unknown */
+        { 1.00f, 1.50f, 1.00f, 0.70f, 1.00f, 1.00f, 0.05f, 1.00f }, /* normal  */
+        { 2.00f, 0.75f, 1.00f, 0.35f, 1.00f, 0.50f, 0.05f, 1.50f }, /* pierce  */
+        { 1.00f, 0.50f, 1.00f, 1.50f, 1.00f, 0.50f, 0.05f, 1.50f }, /* siege   */
+        { 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 0.70f, 0.05f, 1.00f }, /* spells  */
+        { 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f }, /* chaos   */
+        { 1.25f, 0.75f, 2.00f, 0.35f, 1.00f, 0.50f, 0.05f, 1.00f }, /* magic   */
+        { 1.00f, 1.00f, 1.00f, 0.50f, 1.00f, 1.00f, 0.05f, 1.00f }, /* hero    */
+    };
+    static struct { uint32_t type; cstring_t key; } const damage_rows[] = {
+        { ATK_NORMAL, "DamageBonusNormal" },
+        { ATK_PIERCE, "DamageBonusPierce" },
+        { ATK_SIEGE,  "DamageBonusSiege"  },
+        { ATK_CHAOS,  "DamageBonusChaos"  },
+        { ATK_MAGIC,  "DamageBonusMagic"  },
+        { ATK_HERO,   "DamageBonusHero"   },
+    };
+    float food_ceiling, defend_deflection, guard_return_seconds;
+    Stb_IniCacheLoadFiles(&game.config.misc, miscdata_files);
+    InitMiscValue("AttackHalfAngle", &game.constants.attackHalfAngle);
+    InitMiscValue("MaxCollisionRadius", &game.constants.maxCollisionRadius);
+    /* BZ_HARDCODED_DATA_FALLBACK: stock WC3 maximum movement speed. */
+    InitMiscValueDefault("MaxUnitSpeed", &game.constants.maxUnitSpeed, 400.0f);
+    InitMiscValue("DecayTime", &game.constants.decayTime);
+    InitMiscValue("BoneDecayTime", &game.constants.boneDecayTime);
+    InitMiscValue("DissipateTime", &game.constants.dissipateTime);
+    InitMiscValue("StructureDecayTime", &game.constants.structureDecayTime);
+    InitMiscValue("BulletDeathTime", &game.constants.bulletDeathTime);
+    InitMiscValue("CloseEnoughRange", &game.constants.closeEnoughRange);
+    InitMiscValue("Dawn", &game.constants.dawnTimeGameHours);
+    InitMiscValue("Dusk", &game.constants.duskTimeGameHours);
+    InitMiscValue("DayHours", &game.constants.gameDayHours);
+    InitMiscValue("DayLength", &game.constants.gameDayLength);
+    InitMiscValue("BuildingAngle", &game.constants.buildingAngle);
+    InitMiscValue("RootAngle", &game.constants.rootAngle);
+    /* BZ_HARDCODED_DATA_FALLBACK: stock WC3 follow distances. These are
+     * distinct from AcquireRange; map Misc overrides remain authoritative. */
+    InitMiscValueDefault("FollowRange", &game.constants.followRange, 300.0f);
+    InitMiscValueDefault("StructureFollowRange", &game.constants.structureFollowRange, 100.0f);
+    /* Stock WC3 Units\MiscData.txt values. war3mapMisc.txt remains authoritative. */
+    InitMiscValueDefault("AttackNotifyDelay", &game.constants.attackNotifyDelay, 30.0f);
+    InitMiscValueDefault("AttackNotifyRange", &game.constants.attackNotifyRange, 1250.0f);
+    /* BZ_HARDCODED_DATA_FALLBACK: stock WC3 creep leash. Seconds become the
+     * uint32 simulation clock, so clamp malformed or extreme map values first. */
+    InitMiscValueDefault("GuardDistance", &game.constants.guardDistance, 600.0f);
+    InitMiscValueDefault("MaxGuardDistance", &game.constants.maxGuardDistance, 1000.0f);
+    InitMiscValueDefault("GuardReturnTime", &guard_return_seconds, 5.0f);
+    game.constants.guardDistance = MAX(0.0f, game.constants.guardDistance);
+    game.constants.maxGuardDistance = MAX(game.constants.guardDistance, game.constants.maxGuardDistance);
+    game.constants.guardReturnMs = (uint32_t)(MIN(MAX(guard_return_seconds, 0.0f), (float)(UINT32_MAX / 1000u)) * 1000.0f);
+
+    memcpy(game.constants.damageBonus, default_damage_bonus, sizeof(default_damage_bonus));
+    FOR_LOOP(i, sizeof(damage_rows) / sizeof(damage_rows[0])) {
+        uint32_t const row = damage_rows[i].type;
+        InitMiscList(damage_rows[i].key, game.constants.damageBonus[row], 8);
+    }
+    /* Warsmash falls SPELLS back to the active Magic row when a dedicated
+     * DamageBonusSpells field is absent. */
+    if (!InitMiscList("DamageBonusSpells", game.constants.damageBonus[ATK_SPELLS], 8)) {
+        memcpy(game.constants.damageBonus[ATK_SPELLS], game.constants.damageBonus[ATK_MAGIC],
+               sizeof(game.constants.damageBonus[ATK_SPELLS]));
+    }
+    InitMiscValueDefault("DefenseArmor", &game.constants.defenseArmor, 0.06f);
+    InitMiscValueDefault("StrAttackBonus", &game.constants.strAttackBonus, 1.0f);
+    InitMiscValueDefault("AgiDefenseBonus", &game.constants.agiDefenseBonus, 0.3f);
+    InitMiscValueDefault("AgiAttackSpeedBonus", &game.constants.agiAttackSpeedBonus, 0.02f);
+    InitMiscValueDefault("DefendDeflection", &defend_deflection, 1.0f);
+    game.constants.defendDeflection = defend_deflection != 0.0f;
+    game.constants.combatConstantsLoaded = true;
+
+    InitMiscValue("FoodCeiling", &food_ceiling);
+    game.constants.foodCeiling = MAX(0, (int32_t)food_ceiling);
+    game.constants.upkeepUsageCount = InitMiscList("UpkeepUsage", game.constants.upkeepUsage, MAX_UPKEEP_TIERS);
+    game.constants.upkeepGoldTaxCount = InitMiscList("UpkeepGoldTax", game.constants.upkeepGoldTax, MAX_UPKEEP_TIERS);
+    game.constants.upkeepLumberTaxCount = InitMiscList("UpkeepLumberTax", game.constants.upkeepLumberTax, MAX_UPKEEP_TIERS);
+}
+
+/* -------------------------------------------------------------------------
+ * In-game JASS test runner.
+ *
+ * Activated by passing +set jass_test <script.j> on the command line.
+ * Optionally specify the entrypoint with +set jass_test_entry <function>.
+ * The game binary exits 0 on success, 1 on any assertion failure.
+ *
+ * Example:
+ *   openwarcraft3 -data <dir> +set jass_test games/warcraft-3/tests/fixtures/test_jass_assertions.j
+ * ------------------------------------------------------------------------- */
+static void G_ApplyMapGameDataSet(mapInfo_t const *mapinfo) {
+    char prefix[sizeof(game.data_prefix)];
+    uint32_t game_version = atoi(gi.CvarString("fs_expansion", "0")) != 0 ? 1u : 0u;
+    wc3MapGameDataPrefixParams_t params = {
+        .info = mapinfo, .version = game_version, .out = prefix, .size = sizeof(prefix)
+    };
+
+    G_MapGameDataPrefix(&params);
+    /* Always reload at the map boundary: even when the W3I data-set prefix is
+     * unchanged, the mounted map archive may supply Units\*.txt / war3mapMisc.txt
+     * that the previous InitUnitData never saw. */
+    ShutdownUnitData();
+    Stb_IniCacheFree(&game.config.theme);
+    Stb_IniCacheFree(&game.config.map_skin);
+    Stb_IniCacheFree(&game.config.misc);
+    strlcpy(game.data_prefix, prefix, sizeof(game.data_prefix));
+    Stb_IniCacheLoad(&game.config.theme, "UI\\war3skins.txt");
+    /* The mounted map may override Game Interface skin fields.  Keep this
+     * separate from war3skins.txt because the map file stores overrides in
+     * [CustomSkin] rather than the race/Default sections used by the stock
+     * skin table. */
+    Stb_IniCacheLoad(&game.config.map_skin, "war3mapSkin.txt");
+    InitConstants();
+    double init_unit_data_start = GAME_MAP_LOAD_NOW();
+    InitUnitData();
+    MAP_LOAD_LOG("phase=map-unit-data ms=%.3f\n",
+                     GAME_MAP_LOAD_NOW() - init_unit_data_start);
+    init_unit_data_start = GAME_MAP_LOAD_NOW();
+    InitAbilities();
+    MAP_LOAD_LOG("phase=map-abilities ms=%.3f\n",
+                     GAME_MAP_LOAD_NOW() - init_unit_data_start);
+#ifndef DEBUG_MAP_LOAD
+    (void)init_unit_data_start;
+#endif
+}
+
+static void G_RunJassTests(cstring_t script, cstring_t entry) {
+    if (!entry || !*entry) {
+        entry = "run_tests";
+    }
+    fprintf(stderr, "JASS test mode: script=%s entry=%s\n", script, entry);
+
+    jass_sethost(&MAKE(jassHost_t,
+        .MemAlloc           = gi.MemAlloc,
+        .MemFree            = gi.MemFree,
+        .GetTime            = gi.GetTime,
+        .ReadFile = gi.ReadFile,
+        .natives            = jass_funcs,
+        .GetPlayerByNumber  = G_GetPlayerByNumber,
+        .TimerCoroutineValid = G_TimerCoroutineValid,
+    ));
+
+    jass_t *j = jass_newstate();
+    if (!jass_dofile(j, script)) {
+        fprintf(stderr, "JASS test error: could not load '%s'\n", script);
+        jass_close(j);
+        exit(1);
+    }
+
+    jass_callbyname(j, entry, true);
+    /* Pump coroutines until all finish (no timer advancement needed for immediate tests). */
+    jass_runevents(j);
+
+    bool failed = jass_rterror_pending(j);
+    if (failed) {
+        fprintf(stderr, "JASS test FAILED: %s\n", jass_rterror_message(j));
+    } else {
+        fprintf(stderr, "JASS test PASSED\n");
+    }
+    jass_close(j);
+    exit(failed ? 1 : 0);
+}
+
+static void G_InitGame(void) {
+    cstring_t jass_test = gi.CvarString("jass_test", "");
+    if (jass_test && *jass_test) {
+        cstring_t jass_entry = gi.CvarString("jass_test_entry", "");
+        G_RunJassTests(jass_test, jass_entry);
+        /* G_RunJassTests always calls exit() */
+    }
+
+    G_ResetScriptSave();
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+    G_CampaignProgressResetRuntime();
+    fprintf(stderr, "Game initialization.\n");
+    fprintf(stderr, "Game is starting up.\n");
+    fprintf(stderr, "Game is openwarcraft3 built on %s.\n", __DATE__);
+
+    g_edicts = gi.MemAlloc(sizeof(edict_t) * MAX_ENTITIES);
+    memset(g_edicts, 0, sizeof(edict_t) * MAX_ENTITIES);
+    
+    globals.edicts = g_edicts;
+    globals.max_edicts = MAX_ENTITIES;
+    G_PoolsReset();
+    globals.max_clients = MAX_CLIENTS;
+    globals.num_edicts = globals.max_clients;
+    FOR_LOOP(i, globals.max_clients) {
+        g_edicts[i].s.number = i;
+    }
+
+    game.max_clients = globals.max_clients;
+    game.clients = gi.MemAlloc(game.max_clients * sizeof(gameClient_t));
+    memset(game.clients, 0, game.max_clients * sizeof(gameClient_t));
+    game.data_prefix[0] = '\0';
+    Stb_IniCacheLoad(&game.config.theme, "UI\\war3skins.txt");
+    InitConstants();
+    double init_unit_data_start = GAME_MAP_LOAD_NOW();
+    InitUnitData();
+    MAP_LOAD_LOG("phase=process-unit-data ms=%.3f\n",
+                     GAME_MAP_LOAD_NOW() - init_unit_data_start);
+    init_unit_data_start = GAME_MAP_LOAD_NOW();
+    InitAbilities();
+    MAP_LOAD_LOG("phase=process-abilities ms=%.3f\n",
+                     GAME_MAP_LOAD_NOW() - init_unit_data_start);
+    G_ResetSelectionSoundState();
+    G_ResetSoundPresentationState();
+    G_CommandErrorReset();
+    G_RegisterGlobalSounds();
+    UI_ResetHud();
+    fprintf(stderr, "Game initialized.\n\n");
+#ifndef DEBUG_MAP_LOAD
+    (void)init_unit_data_start;
+#endif
+}
+
+static void G_ShutdownGame(void) {
+    G_ResetScriptSave();
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+    if (g_edicts == NULL) {
+        return;
+    }
+    G_PoolsReportPeaks();
+    G_ResetSelectionSoundState();
+    G_CommandErrorReset();
+    UI_ResetHud();
+    gi.SetPaused(false);
+    G_BotShutdown();
+    if (level.vm) { jass_close(level.vm); level.vm = NULL; }
+    G_ClearJassGroupRegistry();
+    G_ClearRegionRegistry();
+    G_FowShutdown();
+    G_BlightShutdown();
+    G_FreeModels();
+    G_FreeAnimationNames();
+    if (game.clients) FOR_LOOP(i, game.max_clients) G_ClearPlayerAbilityAvailability(game.clients + i);
+    gi.MemFree(g_edicts);
+    g_edicts = NULL;
+    globals.edicts = NULL;
+    globals.num_edicts = 0;
+
+    ShutdownUnitData();
+    Stb_IniCacheFree(&game.config.theme);
+    Stb_IniCacheFree(&game.config.map_skin);
+    Stb_IniCacheFree(&game.config.misc);
+    game.data_prefix[0] = '\0';
+    SAFE_DELETE(game.clients, gi.MemFree);
+}
+
+/* Every JASS fade and filter is a textured cinefilter. Plain fade masks keep
+ * the authored alpha so CinematicFadeBJ reaches opaque; masks with their own
+ * alpha (DreamFilter's vignette) draw at half the authored alpha, which
+ * matches retail footage. Alpha 0 hides the filter. */
+static float G_CineFilterProgress(void) {
+    uint32_t const duration = level.cinefilter.end.time - level.cinefilter.start.time;
+    uint32_t const now = G_Time();
+    if (!duration || now >= level.cinefilter.end.time) return 1.0f;
+    if (now <= level.cinefilter.start.time) return 0.0f;
+    return (now - level.cinefilter.start.time) / (float)duration;
+}
+
+static color32_t G_CineFilterColor(void) {
+    float const k = G_CineFilterProgress();
+    if (!level.cinefilter.displayed || G_SkipCutscene()) return MAKE(color32_t, 0, 0, 0, 0);
+    return MAKE(color32_t,
+                (uint8_t)LerpNumber(level.cinefilter.start.color.r, level.cinefilter.end.color.r, k),
+                (uint8_t)LerpNumber(level.cinefilter.start.color.g, level.cinefilter.end.color.g, k),
+                (uint8_t)LerpNumber(level.cinefilter.start.color.b, level.cinefilter.end.color.b, k),
+                (uint8_t)(LerpNumber(level.cinefilter.start.color.a, level.cinefilter.end.color.a, k) *
+                          (level.cinefilter.masked ? 0.5f : 1.0f)));
+}
+
+/* Natives that never set UVs leave an empty box; draw those with full UVs. */
+static box2_t G_CineFilterUVBox(box2_t uv) {
+    if (uv.min.x == uv.max.x && uv.min.y == uv.max.y)
+        return MAKE(box2_t, .min = { 0, 0 }, .max = { 1, 1 });
+    return uv;
+}
+
+static box2_t G_CineFilterUV(void) {
+    box2_t const a = G_CineFilterUVBox(level.cinefilter.start.uv);
+    box2_t const b = G_CineFilterUVBox(level.cinefilter.end.uv);
+    float const k = G_CineFilterProgress();
+    return MAKE(box2_t,
+                .min = { LerpNumber(a.min.x, b.min.x, k), LerpNumber(a.min.y, b.min.y, k) },
+                .max = { LerpNumber(a.max.x, b.max.x, k), LerpNumber(a.max.y, b.max.y, k) });
+}
+
+bool G_SkipCutscene(void) {
+    cstring_t value;
+
+    value = gi.CvarString("skip_cutscene", "0");
+    return value && *value && strcmp(value, "0");
+}
+
+vec3_t G_MakeServerOrigin(float x, float y, float z_offset) {
+    return (vec3_t){ x, y, CM_GetHeightAtPoint(x, y) + CM_GetCameraHeightOffset() + z_offset };
+}
+
+/* Compose an exact server camera sample; the client replaces only its terrain base with the blurred render sample. */
+static vec3_t G_MakeCameraOrigin(gameClient_t *client, float x, float y, float z_offset) {
+    float const base = CM_GetHeightAtPoint(x, y) + CM_GetCameraHeightOffset();
+    client->camera.target_height = base;
+    return (vec3_t){ x, y, base + z_offset };
+}
+
+vec2_t G_ClampCameraPosition(gameClient_t *client, vec2_t const *position) {
+    vec2_t clamped = position ? *position : (vec2_t){ 0, 0 };
+    box2_t bounds = level.camera_bounds;
+
+    (void)client;
+    if (!position) return clamped;
+    if (bounds.max.x > bounds.min.x)
+        clamped.x = MAX(bounds.min.x, MIN(bounds.max.x, clamped.x));
+    if (bounds.max.y > bounds.min.y)
+        clamped.y = MAX(bounds.min.y, MIN(bounds.max.y, clamped.y));
+    return clamped;
+}
+
+static void G_ReclampClientCamera(gameClient_t *client) {
+    vec2_t position;
+
+    if (!client) return;
+    position = (vec2_t){ client->ps.vieworigin.x, client->ps.vieworigin.y };
+    position = G_ClampCameraPosition(client, &position);
+    client->ps.vieworigin = G_MakeCameraOrigin(client, position.x, position.y, client->camera.state.z_offset);
+    position = G_ClampCameraPosition(client, &client->camera.old_state.position);
+    client->camera.old_state.position = position;
+    position = G_ClampCameraPosition(client, &client->camera.state.position);
+    client->camera.state.position = position;
+    if (client->camera.pan.active) {
+        position = G_CameraPanPositionAtTime(client, G_Time(), NULL);
+        client->camera.pan.start = G_ClampCameraPosition(client, &position);
+        client->camera.pan.time = G_Time();
+        position = G_ClampCameraPosition(client, &client->camera.pan.destination);
+        client->camera.pan.destination = position;
+    }
+}
+
+void G_SetCameraBounds(float const bounds[8]) {
+    if (!bounds) return;
+    level.camera_bounds = MAKE(box2_t,
+        .min = {
+            MIN(MIN(bounds[0], bounds[2]), MIN(bounds[4], bounds[6])),
+            MIN(MIN(bounds[1], bounds[3]), MIN(bounds[5], bounds[7])),
+        },
+        .max = {
+            MAX(MAX(bounds[0], bounds[2]), MAX(bounds[4], bounds[6])),
+            MAX(MAX(bounds[1], bounds[3]), MAX(bounds[5], bounds[7])),
+        });
+    FOR_LOOP(i, game.max_clients)
+        G_ReclampClientCamera(game.clients + i);
+}
+
+
+void G_ClearCameraPan(gameClient_t *client) {
+    if (!client) return;
+    client->camera.pan.active = false;
+    client->camera.pan.time = 0;
+    client->camera.pan.start = (vec2_t){ 0, 0 };
+    client->camera.pan.destination = (vec2_t){ 0, 0 };
+    client->camera.pan.rate = (vec2_t){ 0, 0 };
+}
+
+static float G_CameraPanAxisAtTime(float start, float destination, float rate, float elapsed) {
+    float distance = destination - start;
+    float step;
+
+    if (distance == 0.0f || rate <= 0.0f || elapsed <= 0.0f) return start;
+    step = rate * elapsed;
+    if (step >= fabsf(distance)) return destination;
+    return start + copysignf(step, distance);
+}
+
+vec2_t G_CameraPanPositionAtTime(gameClient_t *client, uint32_t now, bool *complete) {
+    vec2_t position;
+    float elapsed;
+
+    if (complete) *complete = true;
+    if (!client || !client->camera.pan.active)
+        return client ? client->camera.state.position : (vec2_t){ 0, 0 };
+    elapsed = now > client->camera.pan.time ?
+        (now - client->camera.pan.time) / 1000.0f : 0.0f;
+    position.x = G_CameraPanAxisAtTime(client->camera.pan.start.x, client->camera.pan.destination.x,
+                                       client->camera.pan.rate.x, elapsed);
+    position.y = G_CameraPanAxisAtTime(client->camera.pan.start.y, client->camera.pan.destination.y,
+                                       client->camera.pan.rate.y, elapsed);
+    if (complete)
+        *complete = position.x == client->camera.pan.destination.x &&
+                    position.y == client->camera.pan.destination.y;
+    return position;
+}
+
+void G_ClearCameraTarget(gameClient_t *client, cstring_t func) {
+    (void)func;
+    if (!client || !client->camera.target_controller) {
+        return;
+    }
+    client->camera.target_controller = NULL;
+    client->camera.target_offset = (vec2_t){ 0, 0 };
+    client->camera.target_mode = CAMERA_TARGET_FOLLOW;
+    client->camera.orient_eye = (vec3_t){ 0, 0, 0 };
+}
+
+static float G_CameraOrientPitch(float attack) {
+    return attack < 90.0f ? 90.0f + attack : -90.0f - attack;
+}
+
+static float G_CameraOrientYaw(float rotation, float pitch) {
+    return pitch < 0.0f ? 450.0f - rotation : 270.0f - rotation;
+}
+
+static void G_UpdateCameraOrientTarget(gameClient_t *client, edict_t *target) {
+    vec3_t focus = {
+        target->s.origin2.x + client->camera.target_offset.x,
+        target->s.origin2.y + client->camera.target_offset.y,
+        target->s.origin.z,
+    };
+    vec3_t direction = Vector3_sub(&focus, &client->camera.orient_eye);
+    float horizontal = sqrtf(direction.x * direction.x + direction.y * direction.y);
+    float length = sqrtf(horizontal * horizontal + direction.z * direction.z);
+    float distance = client->camera.state.target_distance;
+    float attack, rotation, pitch;
+    vec3_t camera_target;
+    float base;
+
+    if (length <= 0.0001f) {
+        return;
+    }
+
+    attack = (float)RAD2DEG(atan2f(direction.z, horizontal));
+    rotation = (float)RAD2DEG(atan2f(direction.y, direction.x));
+    pitch = G_CameraOrientPitch(attack);
+
+    /* Preserve the authored target distance.  The orbit target is a virtual
+     * point on the look ray; moving that point instead of the source keeps the
+     * source fixed while the unit can travel arbitrarily far away. */
+    camera_target = Vector3_add(&client->camera.orient_eye,
+        &(vec3_t){ direction.x * distance / length, direction.y * distance / length,
+                   direction.z * distance / length });
+    base = CM_GetHeightAtPoint(camera_target.x, camera_target.y) + CM_GetCameraHeightOffset();
+
+    client->camera.state.position = (vec2_t){ camera_target.x, camera_target.y };
+    client->camera.state.z_offset = camera_target.z - base;
+    client->camera.state.viewangles.x = pitch;
+    client->camera.state.viewangles.z = G_CameraOrientYaw(rotation, pitch);
+    client->camera.old_state = client->camera.state;
+    client->camera.start_time = client->camera.end_time = G_Time();
+}
+
+static void G_UpdateCameraTarget(gameClient_t *client) {
+    edict_t *target = client->camera.target_controller;
+    vec2_t position;
+
+    if (!target) {
+        return;
+    }
+    if (!target->inuse) {
+        G_ClearCameraTarget(client, "G_UpdateCameraTarget");
+        return;
+    }
+    if (client->camera.target_mode == CAMERA_TARGET_ORIENT) {
+        G_UpdateCameraOrientTarget(client, target);
+        return;
+    }
+    position.x = target->s.origin2.x + client->camera.target_offset.x;
+    position.y = target->s.origin2.y + client->camera.target_offset.y;
+    position = G_ClampCameraPosition(client, &position);
+    client->camera.old_state.position = position;
+    client->camera.state.position = position;
+    if (client->camera.target_mode == CAMERA_TARGET_FOLLOW_FACING) {
+        /* Warsmash uses the target unit's facing as the camera horizontal
+         * angle. WC3 unit state stores facing in radians while camera rotation
+         * is in degrees and encoded as 90 - rotation. */
+        client->camera.old_state.viewangles.z = 90.0f - (float)RAD2DEG(target->s.angle);
+        client->camera.state.viewangles.z = 90.0f - (float)RAD2DEG(target->s.angle);
+    }
+    client->camera.start_time = G_Time();
+    client->camera.end_time = client->camera.start_time;
+}
+
+#ifdef WC3_DEBUG_CAMERA_TRACE
+/* Sample the realized local camera at 20 Hz only when fine tracing is enabled. */
+static void G_CameraTraceFrame(void) {
+    static uint32_t next;
+    cstring_t mode = gi.CvarString("camera_trace", "0");
+    uint32_t now = G_Time();
+
+    if (!mode || strcmp(mode, "2")) {
+        next = 0;
+        return;
+    }
+    if (next && now < next) return;
+    next = now + 50;
+    if (game.max_clients && game.clients[0].connected)
+        G_CameraTraceSnapshotForClient(game.clients, "periodic");
+}
+#else
+static void G_CameraTraceFrame(void) { }
+#endif
+
+/* The player controller has no model; its focus and orbit still belong to the game. */
+static void G_ClientInput(edict_t *ent, inputCmd_t const *cmd) {
+    gameClient_t *client;
+    if (score_transition.terminal || !ent || !ent->client || !cmd) return;
+    client = ent->client;
+    if (client->no_control) return;
+    if (cmd->action == BZ_INPUT_MOVE && (!cmd->move.buttons || !cmd->move.msec)) return;
+    if (cmd->action == BZ_INPUT_VIEW) {
+        client->camera.state.viewangles = cmd->view.angles;
+        client->camera.state.target_distance = cmd->view.distance;
+        client->camera.old_state = client->camera.state;
+        client->camera.start_time = client->camera.end_time = G_Time();
+    } else {
+        vec2_t pos = cmd->action == BZ_INPUT_FOCUS ? cmd->focus
+            : input_move_focus(cmd, &client->ps, atof(gi.CvarString("cl_camera_scroll_speed", "1400")));
+        G_ClientSetCameraPosition(ent, &pos);
+    }
+}
+
+/* TODO: retail's camera-noise waveform is undocumented. This deterministic oscillator keeps the native's
+ * magnitude/velocity/vertOnly inputs and source/target independence until a retail trace replaces it. */
+#define CAMERA_NOISE_RATE_Y 1.371 // ratio; detunes the Y oscillator from X so the shake does not trace a line
+#define CAMERA_NOISE_RATE_Z 0.733 // ratio; detunes Z from both X and Y for the same reason
+#define CAMERA_NOISE_PHASE_Y 1.7 // radians; starts Y away from the X zero crossing
+#define CAMERA_NOISE_PHASE_Z 3.1 // radians; starts Z away from the X and Y zero crossings
+#define CAMERA_NOISE_SOURCE_PHASE 2.2 // radians; keeps source noise out of lockstep with target noise
+
+/* Camera shake is game logic, as view kicks are in Quake 2's p_view.c: sample the oscillator once per
+ * server frame and hand the client a plain offset to interpolate. Either zero input clears the noise.
+ *
+ * Sampling limit: this runs at the 10 Hz server tick (FRAMETIME) and the client lerps linearly between
+ * samples, so the visible shake cannot contain motion faster than 5 Hz. Any velocity above ~31 rad/s
+ * aliases, and Blizzard.j's earthquake velocities (magnitude * 10^richter) are orders of magnitude above
+ * that, so they show up as a fresh pseudo-random offset each tick rather than a smooth wave. How that
+ * compares with retail's shake is unchecked. Do not move the evaluation into client/ to gain frequency;
+ * see docs/architecture/game-client-boundary.md. */
+static vec3_t G_CameraNoiseOffset(gameClient_t const *client, cameraNoiseSlot_t slot, double phase) {
+    float const magnitude = client->camera.noise[slot].magnitude;
+    float const velocity = client->camera.noise[slot].velocity;
+
+    if (magnitude == 0.0f || velocity == 0.0f) return (vec3_t){ 0 };
+    /* Blizzard.j earthquake velocities reach 1e5+; float phase loses whole cycles after a few minutes. */
+    phase += G_Time() * 0.001 * (double)velocity;
+    if (client->camera.noise[slot].vert_only) return (vec3_t){ 0, 0, (float)sin(phase) * magnitude };
+    return (vec3_t){
+        (float)sin(phase) * magnitude,
+        (float)sin(phase * CAMERA_NOISE_RATE_Y + CAMERA_NOISE_PHASE_Y) * magnitude,
+        (float)sin(phase * CAMERA_NOISE_RATE_Z + CAMERA_NOISE_PHASE_Z) * magnitude,
+    };
+}
+
+static void G_RunClients(void) {
+    color32_t const cinefilter_color = G_CineFilterColor();
+    uint32_t const cinefilter_image = cinefilter_color.a ? level.cinefilter.texture : 0;
+    box2_t const cinefilter_uv = G_CineFilterUV();
+    G_UpdateUnitResponsePresentation();
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients+i;
+        edict_t *client_ent = G_GetPlayerEntityByNumber(client->ps.number);
+        uint32_t duration;
+        bool pan_complete = false;
+        vec2_t pan_position = { 0, 0 };
+        G_UpdateCameraTarget(client);
+        if (client->camera.pan.active)
+            pan_position = G_CameraPanPositionAtTime(client, G_Time(), &pan_complete);
+        duration = client->camera.end_time - client->camera.start_time;
+        if (G_Time() < client->camera.end_time && duration > 0) {
+            float k = (G_Time() - client->camera.start_time) / (float)duration;
+            camerasetup_t const *a = &client->camera.old_state;
+            camerasetup_t const *b = &client->camera.state;
+            vec2_t p = client->camera.pan.active ? pan_position : Vector2_lerp(&a->position, &b->position, k);
+            client->ps.vieworigin = G_MakeCameraOrigin(client, p.x, p.y, LerpNumber(a->z_offset, b->z_offset, k));
+            /* JASS interpolates camera fields independently. Angle fields use
+             * the game's periodic-degree rule; WC3 takes the shortest arc. */
+            client->ps.viewangles = (vec3_t){
+                CL_GameLerpDegrees(a->viewangles.x, b->viewangles.x, k),
+                CL_GameLerpDegrees(a->viewangles.y, b->viewangles.y, k),
+                CL_GameLerpDegrees(a->viewangles.z, b->viewangles.z, k),
+            };
+            client->ps.distance = LerpNumber(a->target_distance, b->target_distance, k);
+            player_set_lens(&client->ps, &(gameCamera_t){
+                .fov = LerpNumber(a->fov, b->fov, k),
+                .znear = LerpNumber(a->near_z, b->near_z, k),
+                .zfar = LerpNumber(a->far_z, b->far_z, k) });
+        } else {
+            vec2_t p = client->camera.pan.active ? pan_position : client->camera.state.position;
+            client->ps.vieworigin = G_MakeCameraOrigin(client, p.x, p.y, client->camera.state.z_offset);
+            client->ps.viewangles = client->camera.state.viewangles;
+            client->ps.distance = client->camera.state.target_distance;
+            player_set_lens(&client->ps, &(gameCamera_t){
+                .fov = client->camera.state.fov,
+                .znear = client->camera.state.near_z,
+                .zfar = client->camera.state.far_z });
+        }
+        client->ps.viewoffset = G_CameraNoiseOffset(client, CAMERA_NOISE_TARGET, 0.0);
+        client->ps.eyeoffset = G_CameraNoiseOffset(client, CAMERA_NOISE_SOURCE, CAMERA_NOISE_SOURCE_PHASE);
+        if (client->camera.pan.active && pan_complete) {
+            client->camera.old_state.position = client->camera.pan.destination;
+            client->camera.state.position = client->camera.pan.destination;
+            G_ClearCameraPan(client);
+        }
+        if (client_ent) client_ent->s.origin = client->ps.vieworigin;
+        /* Transmission scene and voice lifetimes are independent. Blizzard.j
+         * keeps the portrait scene alive past the voice, so Portrait Talk must
+         * fall back to Portrait before the entire transmission disappears. */
+        if (client->cinematic_end_time && G_Time() >= client->cinematic_end_time) {
+            G_SetPlayerText(client, PLAYERTEXT_SPEAKER, "");
+            G_SetPlayerText(client, PLAYERTEXT_DIALOGUE, "");
+            client->ps.cinematic_portrait = 0;
+            client->ps.stats[UI_PLAYERSTAT_CINEMATIC_PORTRAIT_MODEL] = 0;
+            client->ps.stats[UI_PLAYERSTAT_CINEMATIC_PORTRAIT_COLOR] = 0;
+            client->cinematic_end_time = 0;
+            client->cinematic_voice_end_time = 0;
+            client->presentation_dirty = true;
+        } else if (client->cinematic_voice_end_time && G_Time() >= client->cinematic_voice_end_time) {
+            client->cinematic_voice_end_time = 0;
+            client->presentation_dirty = true;
+        }
+        if (client->message.end_time && G_Time() >= client->message.end_time) {
+            memset(&client->message, 0, sizeof(client->message));
+            client->presentation_dirty = true;
+        }
+        if (client_ent) G_UpdateCommandError(client_ent);
+        if (client->connected && client->presentation_dirty && client_ent) {
+            UI_WriteDialoguePresentation(client_ent);
+            client->presentation_dirty = false;
+        }
+        if (client->connected) UI_UpdateCursorPresentation(client);
+        client->ps.cinefilter_image = cinefilter_image;
+        client->ps.cinefilter_color = cinefilter_color;
+        client->ps.cinefilter_blendmode = level.cinefilter.blendmode;
+        client->ps.cinefilter_uv = cinefilter_uv;
+        client->ps.cinefilter_texmapflags = level.cinefilter.texmapflags;
+    }
+    G_CameraTraceFrame();
+}
+
+void G_InvalidateCommands(gameClient_t *client) {
+    if (!client) return;
+    client->commands_dirty = true;
+    /* Shared-control viewers render the owner's production state. Keep their
+     * cards live when the owner changes tech, queue, food, or resources. */
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *viewer = game.clients + i;
+        if (!viewer->connected || viewer == client) continue;
+        FOR_CONTROLLABLE_SELECTED_UNITS(viewer, ent) {
+            if (ent->s.player == client->ps.number) {
+                viewer->commands_dirty = true;
+                break;
+            }
+        }
+    }
+}
+
+/* Live per-unit button state (Stop's idle glow) changed; rebuild the cards of every viewer selecting it. */
+void G_InvalidateUnitCommands(edict_t *unit) {
+    if (!unit) return;
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        if (client->connected && G_IsEntitySelected(client, unit)) client->commands_dirty = true;
+    }
+}
+
+static void G_UpdateClientCommandCards(void) {
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        edict_t *clent;
+
+        if (!client->connected || !client->commands_dirty) continue;
+        if (client->menu.on_entity_selected || client->menu.on_location_selected) continue;
+        clent = G_GetPlayerEntityByNumber(client->ps.number);
+        if (!clent || clent->client != client) continue;
+        if (client->menu.refresh) {
+            client->commands_dirty = false;
+            client->menu.refresh(clent);
+        } else {
+            Get_Commands_f(clent);
+        }
+    }
+}
+
+static void G_StartScripts(void) {
+    if (level.scriptsStarted) {
+        return;
+    }
+
+    /*
+     * war3map.doo objects already exist in OpenRealm before generated
+     * war3map.j main() runs. During this initial execution only,
+     * CreateDestructable() may rebind generated gg_dest_* handles to those
+     * preplaced instances.
+     */
+    G_SetDestructableScriptBinding(true);
+    G_DeferObstacleBakes(true);
+
+    jass_callbyname(level.vm, "main", true);
+    level.scriptsStarted = true;
+    jass_runevents(level.vm);
+
+    G_DeferObstacleBakes(false);
+    G_SetDestructableScriptBinding(false);
+}
+
+bool G_IsSinglePlayer(void) {
+    uint32_t humans = 0;
+
+    if (!level.mapinfo) return true;
+    FOR_LOOP(i, MAX_PLAYERS) {
+        mapPlayer_t const *player = level.mapinfo->players + i;
+        if (player->used && player->playerType == kPlayerTypeHuman) humans++;
+    }
+    return humans <= 1;
+}
+
+/* All WC3_RESULT score/lifecycle diagnostics share this build-time gate.
+ * The cvar remains a separate run-time switch in instrumented builds. */
+bool G_GameResultDebugEnabled(void) {
+#ifdef BZ_WC3_DEBUG_SCORE
+    return gi.CvarString && atoi(gi.CvarString("wc3_game_result_debug", "0")) != 0;
+#else
+    return false;
+#endif
+}
+
+void G_GameResultDebug(cstring_t format, ...) {
+#ifdef BZ_WC3_DEBUG_SCORE
+    va_list args;
+
+    if (!G_GameResultDebugEnabled()) return;
+    fprintf(stderr, "WC3_RESULT ");
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fputc('\n', stderr);
+#else
+    (void)format;
+#endif
+}
+
+static bool G_IsCampaignMapPath(cstring_t path);
+
+/* SetCampaignMenuRace is the legacy map-selected destination after a campaign
+ * session. Resolve it in the game module and dispatch only generic menu names. */
+static cstring_t G_CampaignMenuTarget(void) {
+    static cstring_t const targets[] = {
+        "menu_single_player_campaign",
+        "menu_single_player_campaign_human",
+        "menu_single_player_campaign_orc",
+        "menu_single_player_campaign_undead",
+        "menu_single_player_campaign_night_elf"
+    };
+    int32_t race = level.campaign_menu_race;
+    if (race < 1 || race > 4) race = 0;
+    return targets[race];
+}
+
+void G_RequestEndGame(bool do_score_screen) {
+    if (G_ScoreTransitionOwnsExit()) return;
+    G_ResetDifficultyTransition();
+    cstring_t map = level.map_path[0] ? level.map_path : gi.CvarString("map", "");
+    bool campaign_select = level.campaign_select_on_end ||
+        (G_IsSinglePlayer() && G_IsCampaignMapPath(map));
+    BZ_WC3_SCORE_LOG("request EndGame score_screen=%u campaign_select=%u map=%s",
+        (unsigned)do_score_screen, (unsigned)campaign_select, map ? map : "(null)");
+    if (campaign_select) {
+        level.campaign_select_on_end = false;
+        if (do_score_screen) G_QueueScoreTransition("menu", G_CampaignMenuTarget());
+        else gi.MenuAction("menu", G_CampaignMenuTarget());
+        return;
+    }
+    if (do_score_screen) G_QueueScoreTransition("menu", "menu_main");
+    else gi.MenuAction("menu", "menu_main");
+}
+
+static bool G_IsCampaignMapPath(cstring_t path) {
+    if (!path) return false;
+    /* Campaign prefixes identify single-player maps that should return to the campaign selector. */
+    FOR_LOOP(i, sizeof(wc3_campaign_paths) / sizeof(wc3_campaign_paths[0]))
+        if (!strncasecmp(path, wc3_campaign_paths[i], strlen(wc3_campaign_paths[i]))) return true;
+    return false;
+}
+
+void G_RequestQuitGame(void) {
+    if (G_ScoreTransitionOwnsExit()) return;
+    G_ResetDifficultyTransition();
+    /* Quit returns campaign missions to the selector while other sessions use the main menu. */
+    cstring_t map = level.map_path[0] ? level.map_path : gi.CvarString("map", "");
+    bool single = G_IsSinglePlayer();
+    cstring_t target = single && G_IsCampaignMapPath(map)
+        ? G_CampaignMenuTarget()
+        : "menu_main";
+
+    BZ_WC3_SCORE_LOG("quit map=%s sp=%u target=%s", map ? map : "(null)", (unsigned)single, target);
+    /* Retail campaign Quit Mission presents the outgoing scores before
+     * returning to campaign selection. Do not bypass the deferred controller;
+     * a missing/invalid FDF still falls through to the destination safely.
+     * Exit Program and non-campaign quit are deliberately separate paths. */
+    if (single && G_IsCampaignMapPath(map))
+        G_QueueScoreTransition("menu", target);
+    else
+        gi.MenuAction("menu", target);
+}
+
+void G_RequestChangeLevel(cstring_t map, bool do_score_screen) {
+    if (G_ScoreTransitionOwnsExit()) return;
+    BZ_WC3_SCORE_LOG("request ChangeLevel map=%s score_screen=%u", map ? map : "(null)", (unsigned)do_score_screen);
+    if (!map || !*map || strlen(map) >= MAX_PATHLEN) return;
+    if (script_save_rejected || script_standalone_load[0] || script_save_request.load_game) {
+        fprintf(stderr, "WC3 ChangeLevel: conflicting scripted save/load request\n");
+        return;
+    }
+    if (script_save_request.pending) {
+        /* SaveAndChangeLevelBJ issues these calls in the same JASS callback.
+         * Do not queue a map change until the required save has committed. */
+        if (script_save_request.change_level) {
+            fprintf(stderr, "WC3 ChangeLevel: duplicate transition during pending scripted save\n");
+            return;
+        }
+        script_save_request.change_level = true;
+        script_save_request.score_screen = do_score_screen;
+        strlcpy(script_save_request.map, map, sizeof(script_save_request.map));
+        return;
+    }
+    if (G_StageDifficultyTransition(map)) {
+        if (do_score_screen) G_QueueScoreTransition("level", map);
+        else gi.MenuAction("level", map);
+    }
+}
+
+void G_RequestRestartGame(bool do_score_screen) {
+    cstring_t map;
+    if (G_ScoreTransitionOwnsExit()) return;
+    map = level.map_path[0] ? level.map_path :
+        (gi.CvarString ? gi.CvarString("map", "") : "");
+    BZ_WC3_SCORE_LOG("request RestartGame map=%s score_screen=%u", map ? map : "(null)", (unsigned)do_score_screen);
+    if (script_save_rejected || script_standalone_load[0] || script_save_request.pending) return;
+    if (map && *map && G_StageDifficultyTransition(map)) {
+        if (do_score_screen) G_QueueScoreTransition("level", map);
+        else gi.MenuAction("level", map);
+    }
+}
+
+void G_RequestLoadGameMenu(void) {
+    bool shown = false;
+    if (G_ScoreTransitionOwnsExit()) return;
+    BZ_WC3_SCORE_LOG("request LoadGameMenu");
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        edict_t *ent;
+        if (!client->connected) continue;
+        ent = G_GetPlayerEntityByNumber(client->ps.number);
+        if (ent) shown |= UI_ShowGameMenuLoad(ent);
+    }
+    /* Without the authored in-game panel, the front-end load screen beats a paused map with no UI. */
+    if (!shown) gi.MenuAction("menu", "menu_loadgame");
+}
+
+void G_RequestLoadGameNamed(cstring_t name) {
+    if (G_ScoreTransitionOwnsExit() || !name || !*name) return;
+    G_ResetDifficultyTransition();
+    BZ_WC3_SCORE_LOG("request LoadGame name=%s", name);
+    gi.MenuAction("load", name);
+}
+
+void G_RequestCampaignSelect(void) {
+    if (G_ScoreTransitionOwnsExit()) return;
+    G_ResetDifficultyTransition();
+    /* Warcraft's ForceCampaignSelectScreen is called by SetCampaignAvailableBJ
+     * while campaign ending cinematics are still running. It selects the
+     * frontend destination for the eventual EndGame; it must not tear down the
+     * active map immediately. */
+    BZ_WC3_SCORE_LOG("request CampaignSelect");
+    level.campaign_select_on_end = true;
+}
+
+/* One complete server-frame simulation step.
+ * Skipped until the first map has been started; on the very first frame after
+ * a map loads, the JASS "main" function is invoked to run map initialization
+ * triggers. */
+static void G_RunFrame(void) {
+    int path_work_budget = WC3_PATH_WORK_BUDGET;
+    cstring_t path_work_value;
+
+    /* A completed match can never resume gameplay, even if an external
+     * pause owner releases the server scheduler before the deferred menu
+     * action is consumed. Networking and score commands run separately. */
+    if (score_transition.terminal) {
+        /* If an unrelated engine owner clears pause, reassert our terminal
+         * reason before the scheduler can advance another gameplay frame. */
+        G_RefreshPauseState();
+        return;
+    }
+    if (!level.started) return;
+
+    level.framenum++;
+    level.time = gi.GetTime();
+
+    G_StartScripts();
+    G_UpdateTimeOfDay();
+    G_RunTimers();
+    G_RunEvents();
+    jass_runevents(level.vm);
+    G_UpdateTimerDialogs();
+    G_UpdateLeaderboards();
+
+    /* A result action may call RemovePlayer() and then PauseGame(true) from
+     * the JASS work above.  The pause takes effect immediately at the server
+     * boundary, so consume the newly published terminal result event before
+     * this becomes the last simulation frame. */
+    G_DrainPausedResultEvents();
+    G_BotRunFrame();
+
+    G_RunClients();
+
+    G_RunEntities();
+
+    /* Flow-field cache misses are resumable so arbitrary reachable move orders
+     * never depend on a lifetime quota of synchronous whole-map floods.  Keep
+     * the per-frame relaxation budget runtime-tunable for slower handhelds. */
+    path_work_value = gi.CvarString
+        ? gi.CvarString("wc3_path_work_budget", BZ_STRINGIFY(WC3_PATH_WORK_BUDGET)) : NULL;
+    if (path_work_value)
+        path_work_budget = atoi(path_work_value);
+    path_work_budget = MAX(256, MIN(path_work_budget, 65536));
+    CM_ProcessPathJobs((uint32_t)path_work_budget);
+
+    G_UpdateClientCommandCards();
+
+    G_UpdateClientInfoPanels();
+    G_UpdateClientResourceBars();
+    /* After the resource compare pass so Team Resources follows an owner's
+     * gold/lumber/food change in the same frame as that owner's console. */
+    G_UpdateMultiboards();
+    G_UpdateClientUnitShortcuts();
+
+    /* RemovePlayer queues its fallback result UI instead of writing it inline.
+     * This gives victory/defeat event handlers a chance to enter cinematic mode
+     * first; the overlay is emitted once that cinematic has returned to gameplay. */
+    UI_FlushPendingGameResults();
+
+    G_SolveCollisions();
+    G_RunDeferredFrees();
+    G_RunConsumedItemFrees();
+    G_FowUpdate();
+    G_UpdateClientSelections();
+    G_FowSendDeltas();
+    /* Optional live-map diagnostic: walk the player Hero, save, load, compare. */
+    G_HeroSaveLoadAuditFrame();
+    /* The VM callback stack is quiescent here. A restored snapshot must not
+     * contain any transient outgoing session request. */
+    G_FlushScriptSave();
+    G_FlushScoreTransition();
+}
+
+static cstring_t G_GetThemeValue(cstring_t filename) {
+    cstring_t skinned = NULL;
+    if (!strstr(filename, "\\")) {
+        skinned = Stb_IniCacheFind(&game.config.theme, "Default", filename);
+    }
+    return skinned ? skinned : filename;
+}
+
+edict_t *G_GetPlayerEntityByNumber(uint32_t number) {
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = g_edicts+i;
+        if (ent->client && ent->client->ps.number == number) {
+            return ent;
+        }
+    }
+    return NULL;
+}
+
+gameClient_t *G_GetPlayerClientByNumber(uint32_t number) {
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *cl = game.clients+i;
+        if (cl->ps.number == number) {
+            return cl;
+        }
+    }
+    return &game.clients[MAX_PLAYERS-1];
+//    return NULL;
+}
+
+player_t *G_GetPlayerByNumber(uint32_t number) {
+    FOR_LOOP(i, game.max_clients) {
+        if (game.clients[i].ps.number == number) {
+            return &game.clients[i].ps;
+        }
+    }
+    return &game.clients[MAX_PLAYERS-1].ps;
+//    return NULL;
+}
+
+gameEvent_t *G_PublishEventWithValue(edict_t *edict, EVENTTYPE type, edict_t *source, int32_t value) {
+    uint32_t index;
+    if (level.events.write - level.events.read >= MAX_EVENT_QUEUE) {
+        fprintf(stderr, "WC3 event queue overflow: dropping type=%u read=%u write=%u capacity=%u\n",
+                (unsigned)type, (unsigned)level.events.read, (unsigned)level.events.write,
+                (unsigned)MAX_EVENT_QUEUE);
+        return NULL;
+    }
+    index = level.events.write++;
+    gameEvent_t *evt = &level.events.queue[index % MAX_EVENT_QUEUE];
+
+    memset(evt, 0, sizeof(*evt));
+    evt->type = type;
+    evt->edict = edict;
+    evt->edict_spawn_time = edict ? edict->spawn_time : 0;
+    evt->edict_spawn_tracked = edict && edict->inuse;
+    evt->source = source;
+    evt->source_spawn_time = source ? source->spawn_time : 0;
+    evt->source_spawn_tracked = source && source->inuse;
+    evt->value = value;
+    if (type == EVENT_PLAYER_VICTORY || type == EVENT_PLAYER_DEFEAT) {
+        BZ_WC3_SCORE_LOG("publish event type=%s ordinal=%u subject_ent=%ld owner=%u read=%u write=%u",
+            type == EVENT_PLAYER_VICTORY ? "VICTORY" : "DEFEAT",
+            (unsigned)(index + 1),
+            edict ? (long)edict->s.number : -1L,
+            edict ? (unsigned)edict->s.player : 0u,
+            (unsigned)level.events.read, (unsigned)level.events.write);
+    }
+    return evt;
+}
+
+gameEvent_t *G_PublishEventWithPoint(gameEventPointParams_t const *params) {
+    gameEvent_t *evt;
+    if (!params) return NULL;
+    evt = G_PublishEventWithValue(params->edict, params->type, params->source, params->value);
+    if (evt && params->point) {
+        evt->point = *params->point;
+        evt->has_point = true;
+    }
+    return evt;
+}
+
+gameEvent_t *G_PublishEventWithSource(edict_t *edict, EVENTTYPE type, edict_t *source) {
+    return G_PublishEventWithValue(edict, type, source, 0);
+}
+
+gameEvent_t *G_PublishEvent(edict_t *edict, EVENTTYPE type) {
+    return G_PublishEventWithValue(edict, type, NULL, 0);
+}
+
+void G_PublishEventResponse(edict_t *edict, EVENTTYPE type, event_t *response_to) {
+    gameEvent_t *event = G_PublishEvent(edict, type);
+    if (event) event->responseTo = response_to;
+}
+
+void G_PublishSummonEvents(edict_t *summoner, edict_t *summoned) {
+    if (!summoner || !summoned) return;
+    if (WC3_MISHA_DEBUG_ENABLED() && summoner->class_id == MAKEFOURCC('O','r','e','x'))
+        fprintf(stderr, "WC3_MISHA publish-summon caster=%u id=%.4s summoned=%u id=%.4s owner=%u ability=%.4s\n",
+                (unsigned)summoner->s.number, (cstring_t)&summoner->class_id,
+                (unsigned)summoned->s.number, (cstring_t)&summoned->class_id,
+                (unsigned)summoned->s.player,
+                summoned->summon_ability ? (cstring_t)&summoned->summon_ability : "----");
+    G_PublishEventWithSource(summoner, EVENT_PLAYER_UNIT_SUMMON, summoned);
+    G_PublishEventWithSource(summoner, EVENT_UNIT_SUMMON, summoned);
+}
+
+/* Ownership changes publish both the player-unit and unit-scoped change-owner
+ * events. The value carries the previous owner + 1 so GetChangingUnitPrevOwner
+ * can resolve it from trigger context while zero keeps meaning "no change
+ * context" for callbacks (death, research, spell) that share the trigger. */
+void G_PublishChangeOwnerEvents(edict_t *unit, uint32_t old_player) {
+    int32_t value;
+    if (!unit || old_player > MAX_PLAYERS) return;
+    value = (int32_t)old_player + 1;
+    G_PublishEventWithValue(unit, EVENT_PLAYER_UNIT_CHANGE_OWNER, NULL, value);
+    G_PublishEventWithValue(unit, EVENT_UNIT_CHANGE_OWNER, NULL, value);
+}
+
+/* Gameplay messages expose state-machine transitions without turning internal
+ * engine flow into Warcraft/JASS events or retaining entity pointers. */
+bool G_SubscribeMessage(gameMsgFn fn, void *ctx) {
+    FOR_LOOP(i, MAX_MESSAGE_SUBSCRIBERS) {
+        gameMsgSub_t *sub = &level.messages.subs[i];
+        if (sub->fn == fn && sub->ctx == ctx)
+            return true;
+        if (!sub->fn) {
+            sub->fn = fn; sub->ctx = ctx;
+            return true;
+        }
+    }
+    fprintf(stderr, "G_SubscribeMessage: subscriber limit %d reached\n", MAX_MESSAGE_SUBSCRIBERS);
+    return false;
+}
+
+/* Tests and tools unsubscribe explicitly so later state transitions cannot
+ * call a callback whose capture storage has left scope. */
+void G_UnsubscribeMessage(gameMsgFn fn, void *ctx) {
+    FOR_LOOP(i, MAX_MESSAGE_SUBSCRIBERS) {
+        gameMsgSub_t *sub = &level.messages.subs[i];
+        if (sub->fn == fn && sub->ctx == ctx) {
+            memset(sub, 0, sizeof(*sub));
+            return;
+        }
+    }
+}
+
+/* Synchronous delivery preserves the exact transition order and copies stable
+ * entity numbers, so subscribers never depend on edict lifetime. */
+void G_PublishMessage(edict_t *actor, GAMEMSGTYPE type, edict_t *target) {
+    gameMsg_t msg = { type, actor->s.number, target->s.number };
+    FOR_LOOP(i, MAX_MESSAGE_SUBSCRIBERS) {
+        gameMsgSub_t const *sub = &level.messages.subs[i];
+        if (sub->fn)
+            sub->fn(&msg, sub->ctx);
+    }
+}
+
+/* Loading metadata resolves WTS before the gameplay level exists; gameplay uses the same lookup. */
+cstring_t G_MapString(mapInfo_t const *info, cstring_t name) {
+    unsigned int string_id;
+    char trailing;
+
+    if (!name || strncmp(name, "TRIGSTR_", 8) ||
+        sscanf(name, "TRIGSTR_%u%c", &string_id, &trailing) != 1 ||
+        !info) {
+        return name;
+    }
+    FOR_EACH_LIST(mapTrigStr_t, trigstr, info->strings) {
+        if (trigstr->id == (uint32_t)string_id) {
+            return trigstr->text;
+        }
+    }
+    return name;
+}
+
+cstring_t G_LevelString(cstring_t name) { return G_MapString(level.mapinfo, name); }
+
+/* UnitProfile names may be map overrides, so resolve their TRIGSTR token from the active WTS table before presentation. */
+cstring_t G_UnitName(uint32_t id) {
+    UnitProfile_t const *profile = G_UnitProfile(id);
+    cstring_t name = profile->name && *profile->name ? profile->name : GetClassName(id);
+    return G_LevelString(name);
+}
+
+static void G_RefreshPauseState(void) {
+    gi.SetPaused(level.script_paused || level.modal_paused || score_transition.terminal);
+}
+
+/* Quest presentation is local, so only a single connected client may promote
+ * that modal state into an authoritative simulation pause. */
+static void G_RefreshQuestPause(void) {
+    uint32_t connected = 0;
+    bool modal_open = false;
+
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        if (!client->connected) continue;
+        connected++;
+        if (client->modal_flags) modal_open = true;
+    }
+
+    /* A local/single-player modal may freeze the simulation. One player's
+     * quest screen must never globally pause a multi-client match. */
+    level.modal_paused = connected == 1 && modal_open;
+    level.quest_paused = level.modal_paused;
+    G_RefreshPauseState();
+}
+
+/* Script pause owns an independent reason so UI close cannot clear it. */
+void G_SetScriptPaused(bool paused) {
+    level.script_paused = !!paused;
+    G_RefreshPauseState();
+}
+
+void G_SetClientModal(edict_t *player, uint32_t modal, bool open) {
+    if (!player || !player->client || !modal) return;
+    if (open) player->client->modal_flags |= modal;
+    else player->client->modal_flags &= ~modal;
+    G_RefreshQuestPause();
+}
+
+/* Track Quest ownership per connected client before recomputing global policy. */
+void G_SetQuestDialogOpen(edict_t *player, bool open) {
+    if (!player || !player->client || !player->client->connected) return;
+    player->client->quest_dialog_open = !!open;
+    if (open) player->client->modal_flags |= WC3_MODAL_QUEST;
+    else player->client->modal_flags &= ~WC3_MODAL_QUEST;
+    G_RefreshQuestPause();
+}
+
+/* Disconnect clears modal ownership so an abandoned dialog cannot hold pause. */
+void G_SetClientConnected(edict_t *player, bool connected) {
+    if (!player || !player->client) return;
+    player->client->connected = connected;
+    if (!connected) player->client->quest_dialog_open = false, player->client->modal_flags = 0;
+    G_RefreshQuestPause();
+}
+
+/* Client slots and free edicts have zero-initialized player ownership but no
+ * unit row.  Only live, metadata-bound units contribute authored food values. */
+void G_AccumulatePlayerFood(gameClient_t *client) {
+    FILTER_EDICTS(ent, ent->inuse && ent->data.UnitBalance && client->ps.number == ent->s.player) {
+        if (ent->svflags & SVF_DEADMONSTER || G_UnitHasFlag(ent, UNIT_FLAG_TRAINING)) continue;
+        G_SetUnitFoodUsed(ent, ent->data.UnitBalance->foodUsed);
+        if (!ent->construction) G_SetUnitFoodMade(ent, ent->data.UnitBalance->foodMade);
+    }
+    G_RecomputePlayerUpkeep(client);
+}
+
+/* Preserve valid map/save-authored modes while keeping corrupt connection state out of the network contract. */
+void G_InitClientUIState(gameClient_t *client) {
+    if (client && client->ps.client_ui_state > CLIENT_UI_CINEMATIC)
+        client->ps.client_ui_state = CLIENT_UI_GAME;
+}
+
+/* The server dropped a spawned client. Its player slot, units and alliances stay authoritative; only the
+ * connection-scoped state goes, so an abandoned dialog cannot hold pause and no HUD is serialized to nobody. */
+static void G_ClientDisconnect(edict_t *edict) {
+    /* SV_Frame still dispatches network disconnects while a score-owned pause
+     * stops G_RunFrame. Detect the final viewer here, not by polling the
+     * simulation tail (which will never run again). */
+    bool const was_paused = level.script_paused || level.modal_paused;
+    if (edict->client && edict->client->connected) edict->client->departed = true;
+    G_SetClientConnected(edict, false);
+    if (score_transition.shown) {
+        G_FlushScoreTransition();
+    } else if (was_paused) {
+        /* A paused result command may have queued its destination, but no
+         * gameplay frame remains to finalize it. This helper checks that a
+         * score transition was actually requested before draining anything. */
+        G_FlushPausedScoreTransition();
+    }
+}
+
+/* Called when a client finishes the connection handshake and is ready to play.
+ * The in-game HUD is server-authored through svc_layout; this binds the game
+ * client and initializes gameplay state when a map is loaded. */
+static void G_ClientBegin(edict_t *edict) {
+    gameClient_t *client = edict->client ? edict->client : game.clients;
+    if (!edict->client) {
+        edict->client = client;
+    }
+
+    G_SetClientConnected(edict, true);
+    client->departed = false;
+    G_InitClientUIState(client);
+    G_MusicSyncClient(client);
+    UI_UpdateCursorPresentation(client);
+    if (!client->mapplayer) {
+        client->ps.vieworigin = (vec3_t){ 0, 0, 0 };
+    }
+    fprintf(stderr,
+            "G_ClientBegin: edict=%u player=%u team=%u race=%u color=%u start_location=%ld origin=(%.1f %.1f) name=\"%s\"\n",
+            (unsigned)(edict - globals.edicts),
+            (unsigned)client->ps.number,
+            (unsigned)client->ps.team,
+            (unsigned)client->ps.race,
+            (unsigned)client->ps.color,
+            (long)client->ps.start_location,
+            client->ps.vieworigin.x,
+            client->ps.vieworigin.y,
+            client->ps.name ? client->ps.name : "");
+    level.started = true;
+    G_StartScripts();
+
+    UI_ShowGameInterface(edict);
+    UI_WriteHoverLayout(edict);
+    UI_WriteTimerDialogs(edict);
+    UI_WriteLeaderboard(edict);
+    UI_WriteMultiboard(edict);
+    UI_JassDialogRestore(edict);
+
+    G_AccumulatePlayerFood(client);
+    /* Invalidate cache so the initial resource bar write always fires. */
+    client->resourcebar.gold = -1;
+    G_RefreshResourceBar(edict);
+    Get_Portrait_f(edict);
+    Get_Commands_f(edict);
+    client->shortcuts.last_idle_worker = 0;
+    client->shortcuts.dirty = false;
+    UI_WriteUnitShortcutLayer(edict);
+
+    G_FowConnectPlayer(client->ps.number);
+    G_FowUpdate();
+    G_FowSendFull(edict);
+    G_BlightMarkClientFull(edict);
+
+#ifdef BZ_TESTS
+    if (atoi(gi.CvarString("wc3_quest_layout_test", "0"))) {
+        quest_t *q = G_MakeQuest();
+        questItem_t *it;
+        q->title = strdup("Establish Base");
+        q->description = strdup(
+            "To ensure that the Orc threat is dealt with effectively, you must establish a base "
+            "camp and bolster your forces. Only when the camp is prepared can the area be "
+            "considered properly garrisoned. Scout the surrounding roads, secure the nearby "
+            "farms, and keep the footmen ready for the next attack. The enemy will not wait "
+            "for the camp to be complete, so reinforce the walls and patrol the forest edge. "
+            "When the base is secure, report back to the command tent for further orders.");
+        it = &q->items[q->num_items++]; memset(it, 0, sizeof(*it)); it->inuse = true; it->description = strdup("Construct a Barracks");
+        it = &q->items[q->num_items++]; memset(it, 0, sizeof(*it)); it->inuse = true; it->description = strdup("Construct 2 Farms");
+        it = &q->items[q->num_items++]; memset(it, 0, sizeof(*it)); it->inuse = true; it->description = strdup("Train 6 Footmen");
+        q->discovered = true;
+        q->required = true;
+        UI_ShowQuests(edict);
+    }
+#endif
+}
+
+/* Send this before begin; it presents server-authored map data while the client registers media. */
+/* Publish only loading media before synchronous world/entity loading can block presentation. */
+/* Map names reach the server resolved (quotes stripped, separators and case possibly
+ * changed), so compare file names only, case-insensitively. */
+static bool G_SameMapFile(cstring_t a, cstring_t b) {
+    cstring_t const base_a = MAX(strrchr(a, '/'), strrchr(a, '\\'));
+    cstring_t const base_b = MAX(strrchr(b, '/'), strrchr(b, '\\'));
+    a = base_a ? base_a + 1 : a; b = base_b ? base_b + 1 : b;
+    size_t len_a = strlen(a), len_b = strlen(b);
+    if (len_a && a[len_a - 1] == '"') len_a--;
+    if (len_b && b[len_b - 1] == '"') len_b--;
+    return len_a && len_a == len_b && !strncasecmp(a, b, len_a);
+}
+
+static bool G_PrepareMap(cstring_t filename) {
+    mapInfo_t info;
+    if (!CM_ReadMapInfo(filename, &info)) return false;
+    UI_ResetHud();
+    UI_LoadHudLoading();
+    /* Loading precedes LoadMap: resolve the same lobby roster before publishing its presentation. */
+    gi.ApplyLobbySettings(&info);
+    gi.configstring(CS_ASSET_SCOPE, filename);
+    /* The sandbox rule follows the map it was launched for; any other map clears it. */
+    game.command_all = G_SameMapFile(gi.CvarString("g_command_all", ""), filename);
+    S_BallisticReset(); /* fires, hits and crew experience belong to one match */
+    game.view_side = 0; /* Command Both starts on the human's own side */
+    S_FlakReset(); S_ShipConditionReset(); /* presentation side tables, likewise */
+    UI_WriteLoadingLayout(NULL, &info);
+    CM_FreeMapInfo(&info);
+    return true;
+}
+
+/* Look up or register a display name in the packed CS_GENERAL configstring pool.
+ * Each configstring stores ENT_NAMES_PER_CS names of ENT_NAME_SLOT_SIZE bytes each.
+ * Returns a 1-based packed index (0 = not found / pool full). */
+static uint16_t G_UnitNameConfigstring(cstring_t name) {
+    char buf[ENT_NAME_SLOT_SIZE * ENT_NAMES_PER_CS];
+    if (!name || !*name) return 0;
+    for (uint32_t slot = 0; slot < CS_MAX_NAMES / ENT_NAMES_PER_CS; slot++) {
+        uint32_t idx = CS_GENERAL + slot;
+        cstring_t cs = gi.GetConfigstring(idx);
+        for (uint32_t sub = 0; sub < ENT_NAMES_PER_CS; sub++) {
+            cstring_t entry = cs ? cs + sub * ENT_NAME_SLOT_SIZE : NULL;
+            if (entry && !entity_name_slot_empty(entry)) {
+                if (entity_name_slot_equals(entry, name))
+                    return (uint16_t)(slot * ENT_NAMES_PER_CS + sub + 1);
+                continue;
+            }
+            entity_name_pool_prepare(buf, cs);
+            entity_name_slot_store(buf, sub, name);
+            gi.configstring(idx, buf);
+            return (uint16_t)(slot * ENT_NAMES_PER_CS + sub + 1);
+        }
+    }
+    fprintf(stderr, "G_UnitNameConfigstring: pool full for \"%s\"\n", name);
+    return 0;
+}
+
+/* World-hover secondary values are recipient-filtered snapshot presentation.
+ * Zero means absent on the wire, so present resource values are offset by one.
+ * Ordinary Agld mines own the reservoir directly; racial mine overlays expose
+ * the live reservoir of their still-bound hidden parent. */
+static uint32_t G_HoverResourceValue(edict_t const *ent) {
+    edict_t const *parent;
+    uint32_t value;
+
+    if (!ent) return 0;
+    if (S_GoldMineIsOverlay(ent) && ent->mineoverlay && (parent = ent->mineoverlay->parent)) {
+        if (!parent->inuse || parent->spawn_time != ent->mineoverlay->parent_spawn_time ||
+            M_IsDead(parent) || !(parent->s.flags & EF_RESOURCE_SOURCE)) return 0;
+        value = parent->resources;
+    } else {
+        if (!(ent->s.flags & EF_RESOURCE_SOURCE)) return 0;
+        value = ent->resources;
+    }
+    return value == UINT_MAX ? UINT_MAX : value + 1;
+}
+
+/* Choose exactly one automatic minimap contact for this recipient. The
+ * renderer owns marker artwork; game state owns unit classification and the
+ * object-editor suppression flags. The distinct uhhm/uhom fields are kept
+ * independent: hiding only the Hero icon falls through to the ordinary path,
+ * while uhom can suppress that fallback. */
+wc3MinimapContact_t G_WC3_MinimapMarkerForEntity(edict_t const *ent, entityState_t const *state) {
+    UnitUI_t const *ui;
+
+    if (!ent || !state || !(ent->svflags & SVF_MONSTER) ||
+        (ent->svflags & SVF_DEADMONSTER) || ent->health.value <= 0.0f ||
+        (state->renderfx & RF_HIDDEN)) {
+        return WC3_MINIMAP_CONTACT_NONE;
+    }
+
+    ui = ent->data.UnitUI;
+    if (G_UnitIsHero(ent) && (!ui || !ui->hideHeroMinimap))
+        return WC3_MINIMAP_CONTACT_HERO;
+
+    if (ui && ui->hideOnMinimap)
+        return WC3_MINIMAP_CONTACT_NONE;
+
+    if (S_GoldMineIsOverlay(ent)) {
+        if (G_ActorHasSkill(ent, "Aegm")) return WC3_MINIMAP_CONTACT_GOLD_ENTANGLED;
+        if (G_ActorHasSkill(ent, "Abgm")) return WC3_MINIMAP_CONTACT_GOLD_HAUNTED;
+        return WC3_MINIMAP_CONTACT_GOLD_MINE;
+    }
+    /* Natural mines advertise the resource-source bit; avoid re-parsing every
+     * ordinary unit's ability list on every recipient snapshot. */
+    if ((state->flags & EF_RESOURCE_SOURCE) && S_GoldMineIsMine(ent))
+        return WC3_MINIMAP_CONTACT_GOLD_MINE;
+
+    if (ui && ui->neutralBuildingMinimapIcon)
+        return WC3_MINIMAP_CONTACT_NEUTRAL_BUILDING;
+
+    if (G_UnitIsStructure(ent) || (state->flags & EF_BUILDING))
+        return WC3_MINIMAP_CONTACT_BUILDING;
+    return WC3_MINIMAP_CONTACT_UNIT;
+}
+
+static bool G_IsSnapshotPriorityEntity(uint32_t player, edict_t const *ent) {
+    entityState_t state;
+    if (!ent) return false;
+    state = ent->s;
+    if ((state.renderfx & RF_HIDDEN) && S_UnitUsesInvisibilityRenderFlag(ent) &&
+        !S_UnitIsInvisibleToPlayer(ent, player))
+        state.renderfx &= ~RF_HIDDEN;
+    return G_WC3_MinimapMarkerForEntity(ent, &state) != WC3_MINIMAP_CONTACT_NONE;
+}
+
+/* Selection voices are local feedback; suppress them in snapshots for clients
+ * that did not select this entity while leaving world sounds unchanged. */
+static void G_CustomizeEntity(uint32_t player, edict_t const *ent, entityState_t *state) {
+    state->flags &= ~EF_SELECTION_CIRCLE_ON_WATER;
+    if (ent->data.UnitUI && ent->data.UnitUI->selectionCircleOnWater) {
+        float const ground_z = CM_GetHeightAtPoint(state->origin.x, state->origin.y);
+        float const water_z = CM_GetWaterHeightAtPoint(state->origin.x, state->origin.y);
+        float const support_z = water_z + state->ground_offset;
+
+        /* The UI field opts the unit into water-level rings. Publish the
+         * render hint only while the unit is actually supported by water;
+         * the client renderer stays independent of WC3 terrain data. */
+        if (water_z > ground_z + 0.01f && fabsf(state->origin.z - support_z) <= 1.0f)
+            state->flags |= EF_SELECTION_CIRCLE_ON_WATER;
+    }
+
+    /* RF_HIDDEN also represents cargo/mines/revival placeholders. Only known
+     * gameplay invisibility may be cleared in a client snapshot. Owners/shared
+     * viewers see their invisible units; hostile viewers need true sight. */
+    if ((state->renderfx & RF_HIDDEN) && S_UnitUsesInvisibilityRenderFlag(ent) &&
+        !S_UnitIsInvisibleToPlayer(ent, player)) {
+        state->renderfx &= ~RF_HIDDEN;
+    }
+    wc3MinimapContact_t const minimap_marker = G_WC3_MinimapMarkerForEntity(ent, state);
+    state->effect_flags = wc3_minimap_contact_set(state->effect_flags, minimap_marker);
+
+    bool const hoverable = (ent->svflags & SVF_MONSTER) &&
+        !(ent->svflags & SVF_DEADMONSTER) &&
+        ent->health.value > 0.0f &&
+        !(state->renderfx & RF_HIDDEN) &&
+        !(state->flags & EF_NOT_SELECTABLE) &&
+        G_FowPlayerCanHoverEntity(player, ent);
+
+    state->flags &= ~(EF_HOVER_HEALTH | EF_HOVER_MANA | EF_HOSTILE | EF_NEUTRAL | EF_ALLIED);
+    state->name = 0;
+    state->hover_value = 0;
+    state->stats[ENT_CARGO] = 0;
+    /* World items have no health/mana hover bars, but their authored display
+     * name should still appear when the pointer rests on a visible pickup. */
+    if (G_IsItem((edict_t *)ent)) {
+        if (ent->item && ent->item->in_world && !(state->renderfx & RF_HIDDEN) &&
+            !(state->flags & EF_NOT_SELECTABLE) && G_FowPlayerCanHoverEntity(player, ent)) {
+            state->name = G_UnitNameConfigstring(G_ObjectName(ent->class_id));
+            /* The client's shared world-hover gate requires a positive health
+             * snapshot even for name-only entities. Items have no health bar,
+             * so publish a minimal presence value and keep the neutral pickup
+             * cursor behavior used for crates. */
+            state->stats[ENT_HEALTH] = 1;
+            state->flags |= EF_NEUTRAL;
+        }
+        return;
+    }
+    /* Destructables are scenery, not units. Retail world-hover names are
+     * limited to debris targets such as gates; walls, bridges, and decorations
+     * do not publish a hover name, even when they carry health. */
+    if (G_IsDestructable(ent)) {
+        if (G_DestructableIsAttackable(ent) && ent->targtype == TARG_DEBRIS &&
+            !(state->flags & EF_NOT_SELECTABLE) &&
+            !(state->renderfx & RF_HIDDEN) && G_FowPlayerCanHoverEntity(player, ent)) {
+            char localized[MAX_PATHLEN];
+            cstring_t name = ent->data.DestructableData->displayName;
+            if (name && !strncmp(name, "WESTRING_", 9)) {
+                cstring_t resolved = FindConfigValue("WorldEditStrings", name);
+                if (resolved) name = resolved;
+                else fprintf(stderr, "WC3: unresolved destructable name %s\n", name);
+            }
+            /* INI cache values retain their authored surrounding quotes. */
+            size_t len = name ? strlen(name) : 0;
+            if (len >= 2 && name[0] == '"' && name[len - 1] == '"') {
+                snprintf(localized, sizeof(localized), "%.*s", (int)(len - 2), name + 1);
+                name = localized;
+            }
+            state->name = G_UnitNameConfigstring(G_LevelString(name));
+            state->stats[ENT_HEALTH] = compress_stat(&ent->health);
+            state->flags |= EF_NEUTRAL;
+            /* TFT authors breakable selectability explicitly. ROC predates
+             * that column, where the debris target contract is the available
+             * gate after normal destructable attackability checks. */
+            if (!G_UnitHasFlag(ent, UNIT_FLAG_INVULNERABLE) &&
+                (ent->data.DestructableData->selectable ||
+                 atoi(gi.CvarString ? gi.CvarString("fs_expansion", "0") : "0") == 0))
+                state->flags |= EF_HOVER_HEALTH;
+        }
+        return;
+    }
+    if (minimap_marker != WC3_MINIMAP_CONTACT_NONE || hoverable) {
+        selectionRelation_t const relation = G_SelectionRelation(player, ent);
+        if (relation == SELECT_RELATION_ENEMY) {
+            state->flags |= EF_HOSTILE;
+        } else {
+            if (G_PlayerTreatsPlayerAsAlly(player, ent->s.player))
+                state->flags |= EF_ALLIED;
+            if (relation == SELECT_RELATION_NEUTRAL && hoverable)
+                state->flags |= EF_NEUTRAL;
+        }
+    }
+    if (hoverable) {
+        uint32_t const cargo_capacity = S_CargoCapacity((edict_t *)ent);
+        if (cargo_capacity > 0)
+            state->stats[ENT_CARGO] = EntityCargoPack(ent->cargo ? ent->cargo->count : 0, cargo_capacity);
+        /* The client has no MAPINFO WTS table; the old path published raw TRIGSTR_* tokens in CS_GENERAL. */
+        /* Name remains the hover gate for invulnerable units with no mana bar. */
+        state->name = G_UnitNameConfigstring(G_UnitName(ent->s.class_id));
+        state->hover_value = G_HoverResourceValue(ent);
+        if (!G_UnitHasFlag(ent, UNIT_FLAG_INVULNERABLE)) state->flags |= EF_HOVER_HEALTH;
+        if (ent->mana.max_value > 0.0f) state->flags |= EF_HOVER_MANA;
+    }
+
+}
+
+#ifdef BZ_TESTS
+#include "shared/test.h"
+void reset_entities(void);
+void setup_test_world(void);
+bool run_test_jass(cstring_t src);
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+/* The filesystem import is an engine capability: these tests isolate request
+ * ordering without creating a real campaign scope. */
+static bool G_TestScriptSavePath(cstring_t name, string_t out, uint32_t size) {
+    (void)name;
+    strlcpy(out, Test_TempPath("missing-script-save-parent/zone.sav"), size);
+    return true;
+}
+static bool G_TestScriptSavePathOk(cstring_t name, string_t out, uint32_t size) {
+    (void)name;
+    strlcpy(out, Test_TempPath("script-save-transition-success.sav"), size);
+    return true;
+}
+static bool G_TestScriptSaveExists(cstring_t name) {
+    return name && !strcmp(name, "Blizzard/Zones/OrcX01_02.w3z");
+}
+static bool G_TestScriptSaveMissing(cstring_t name) { (void)name; return false; }
+/* The client resolves a JASS basename into its exact map identity before
+ * dispatching SV_Map. Exercise that same engine-provided resolver contract. */
+static bool G_TestDifficultyResolveMap(cstring_t input, string_t out, uint32_t size) {
+    cstring_t resolved = input;
+    if (!input || !*input || !strcmp(input, "missing.w3x")) return false;
+    if (!strcmp(input, "OrcX01_02.w3x"))
+        resolved = "Maps\\FrozenThrone\\Campaign\\OrcX01_02.w3x";
+    if (strlen(resolved) >= size) return false;
+    strlcpy(out, resolved, size);
+    return true;
+}
+static int script_save_test_menu_actions;
+static char script_save_test_last_action[16];
+static char script_save_test_last_argument[MAX_PATHLEN];
+static void G_TestScriptMenuAction(cstring_t action, cstring_t argument) {
+    strlcpy(script_save_test_last_argument, argument ? argument : "", sizeof(script_save_test_last_argument));
+    strlcpy(script_save_test_last_action, action, sizeof(script_save_test_last_action));
+    script_save_test_menu_actions++;
+}
+/* Capture the state at the real deferred navigation boundary, rather than
+ * assuming that a request has already finalized its entity removals. */
+static edict_t *postgame_test_removal;
+static bool postgame_test_removed_at_menu;
+static void G_TestPostgameFrameMenuAction(cstring_t action, cstring_t argument) {
+    postgame_test_removed_at_menu = postgame_test_removal && !postgame_test_removal->inuse;
+    G_TestScriptMenuAction(action, argument);
+}
+static bool postgame_test_paused;
+static void G_TestPostgamePause(bool paused) { postgame_test_paused = paused; }
+/* Entering the completed single-player score screen claims a permanent
+ * pause reason. Ending script/modal pause must not resume its simulation. */
+TEST(wc3_score_postgame, terminal_score_presentation_blocks_resume_and_simulation) {
+    void (*old_set_paused)(bool) = gi.SetPaused;
+    edict_t *player;
+    inputCmd_t input = { .action = BZ_INPUT_VIEW, .view = { .angles = { 10, 20, 30 }, .distance = 900 } };
+    uint32_t before_frame;
+    uint32_t before_time;
+
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    player = &g_edicts[0];
+    game.clients[0].connected = true;
+    level.started = true;
+    level.framenum = 17;
+    level.time = 1700;
+    level.script_paused = true;
+    level.modal_paused = true;
+    score_transition.pending = true;
+    score_transition.shown = true;
+    gi.SetPaused = G_TestPostgamePause;
+    postgame_test_paused = false;
+    G_EnterScorePresentation();
+    T_ASSERT(score_transition.terminal);
+    T_ASSERT(postgame_test_paused);
+
+    G_SetScriptPaused(false);
+    G_SetClientModal(player, WC3_MODAL_CLIENT, false);
+    T_ASSERT(postgame_test_paused);
+    before_frame = level.framenum;
+    before_time = level.time;
+    postgame_test_paused = false; /* Simulate an external pause release. */
+    G_RunFrame();
+    T_ASSERT(postgame_test_paused); /* Terminal owner reasserted pause. */
+    T_EQ(level.framenum, before_frame);
+    T_EQ(level.time, before_time);
+
+    player->client->camera.state.viewangles = (vec3_t){ 0, 0, 0 };
+    G_ClientInput(player, &input);
+    T_FEQ(player->client->camera.state.viewangles.x, 0.0f, 0.001f);
+    gi.SetPaused = old_set_paused;
+    G_ResetScoreTransition();
+    level.started = false;
+    level.script_paused = false;
+    level.modal_paused = false;
+}
+
+/* Existing multi-recipient matches must keep their current score behavior. */
+TEST(wc3_score_postgame, multiplayer_score_does_not_claim_terminal_pause) {
+    void (*old_set_paused)(bool) = gi.SetPaused;
+    mapInfo_t *mapinfo;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].connected = true;
+    game.clients[1].connected = true;
+    score_transition.pending = true;
+    score_transition.shown = true;
+    gi.SetPaused = G_TestPostgamePause;
+    postgame_test_paused = false;
+    G_EnterScorePresentation();
+    T_ASSERT(!score_transition.terminal);
+    T_ASSERT(!postgame_test_paused);
+
+    /* Even one remaining network recipient is not a local SP match if the
+     * authored map still has multiple human participants. */
+    game.clients[1].connected = false;
+    mapinfo = (mapInfo_t *)level.mapinfo;
+    mapinfo->players[0].used = mapinfo->players[1].used = true;
+    mapinfo->players[0].playerType = kPlayerTypeHuman;
+    mapinfo->players[1].playerType = kPlayerTypeHuman;
+    G_EnterScorePresentation();
+    T_ASSERT(!score_transition.terminal);
+    T_ASSERT(!postgame_test_paused);
+
+    gi.SetPaused = old_set_paused;
+    G_ResetScoreTransition();
+}
+
+/* The real command dispatcher must reject gameplay mutations and minimap
+ * overlays after completion, while still routing every score-view control. */
+TEST(wc3_score_postgame, commands_remain_score_only_after_terminal_presentation) {
+    edict_t *player;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    player = &g_edicts[0];
+    game.clients[0].connected = true;
+    score_transition.pending = true;
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    level.setup.difficulty = 2;
+    player->client->ps.stats[PLAYERSTATE_GAME_RESULT] = 1;
+
+    /* Gameplay result controls remain usable until presentation is terminal. */
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_EQ(level.setup.difficulty, 1u);
+    level.setup.difficulty = 2; /* Keep the later terminal guard check independent. */
+
+    G_EnterScorePresentation();
+    T_ASSERT(score_transition.terminal);
+    G_ClientCommand(player, 1, (cstring_t[]){ "signal" });
+    T_ASSERT(!player->client->cursor_signal);
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_EQ(level.setup.difficulty, 2u);
+    G_ClientCommand(player, 2, (cstring_t[]){ "pause", "0" });
+    T_ASSERT(!player->client->modal_flags);
+
+    G_ClientCommand(player, 1, (cstring_t[]){ "scorescreen_teams" });
+    T_ASSERT(score_transition.view[0].teams);
+    G_ClientCommand(player, 1, (cstring_t[]){ "scorescreen_allycolors" });
+    T_ASSERT(score_transition.view[0].ally_colors);
+    G_ResetScoreTransition();
+    T_ASSERT(!G_ScoreTransitionTerminal());
+}
+
+/* Even after Continue consumes the destination ticket, the outgoing world
+ * remains stopped until the map/session loader resets transient state. */
+TEST(wc3_score_postgame, continue_preserves_terminal_guard_until_next_map) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].connected = true;
+    score_transition.pending = true;
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    strlcpy(score_transition.action, "menu", sizeof(score_transition.action));
+    strlcpy(score_transition.argument, "menu_main", sizeof(score_transition.argument));
+    G_EnterScorePresentation();
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    G_ScoreTransitionContinue(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(score_transition.terminal);
+    T_ASSERT(!score_transition.pending);
+    G_ScoreTransitionContinue(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    gi.MenuAction = old_menu_action;
+    G_ResetScoreTransition();
+}
+
+/* Paused servers continue to receive disconnect callbacks but cannot reach
+ * G_RunFrame's old all-viewers-gone poll. Complete directly on the final
+ * network disconnect and preserve the terminal pause until map replacement. */
+TEST(wc3_score_postgame, last_viewer_disconnect_completes_destination_once) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    void (*old_set_paused)(bool) = gi.SetPaused;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].connected = true;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    gi.MenuAction = G_TestScriptMenuAction;
+    gi.SetPaused = G_TestPostgamePause;
+    script_save_test_menu_actions = 0;
+    G_EnterScorePresentation();
+    T_ASSERT(score_transition.terminal);
+
+    G_ClientDisconnect(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "menu");
+    T_STREQ(script_save_test_last_argument, "menu_single_player_campaign");
+    T_ASSERT(!score_transition.pending);
+    T_ASSERT(score_transition.terminal);
+    T_ASSERT(!game.clients[0].connected);
+    G_ClientDisconnect(&g_edicts[0]); /* duplicate network callback is harmless */
+    T_EQ(script_save_test_menu_actions, 1);
+
+    gi.MenuAction = old_menu_action;
+    gi.SetPaused = old_set_paused;
+    G_ResetScoreTransition();
+}
+
+/* A LAN opponent that drops mid-match reads as PLAYER_SLOT_STATE_LEFT, so a map
+ * script can award the remaining player; rejoining restores the playing slot. */
+TEST(wc3_multiplayer, dropped_player_reads_left_until_rejoin) {
+    reset_entities();
+    setup_test_world();
+    game.clients[0].connected = false;
+    game.clients[0].departed = false;
+    G_ClientDisconnect(&g_edicts[0]);
+    T_ASSERT(!game.clients[0].departed); /* never begun: still loading, not departed */
+    game.clients[0].connected = true;
+    G_ClientDisconnect(&g_edicts[0]);
+    T_ASSERT(game.clients[0].departed);
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(GetPlayerSlotState(Player(0)) == PLAYER_SLOT_STATE_LEFT, \"dropped player left\")\n"
+        "endfunction\n"));
+    G_ClientBegin(&g_edicts[0]);
+    T_ASSERT(!game.clients[0].departed);
+    T_ASSERT(game.clients[0].connected);
+}
+
+TEST(wc3_score_postgame, paused_disconnect_finalizes_unshown_score_without_frame) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t frame;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].connected = true;
+    level.script_paused = true;
+    level.framenum = 19;
+    frame = level.framenum;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    T_ASSERT(!score_transition.snapshot_frozen);
+    G_ClientDisconnect(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(!score_transition.pending);
+    T_EQ(level.framenum, frame); /* no simulation frame was available */
+
+    gi.MenuAction = old_menu_action;
+    G_ResetScoreTransition();
+    level.script_paused = false;
+}
+
+TEST(wc3_score_postgame, multiplayer_disconnect_waits_for_last_viewer) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].connected = game.clients[1].connected = true;
+    G_QueueScoreTransition("menu", "menu_main");
+    score_transition.shown = true;
+    score_transition.awaiting[0] = score_transition.awaiting[1] = true;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+
+    G_ClientDisconnect(&g_edicts[0]);
+    T_ASSERT(score_transition.pending);
+    T_EQ(script_save_test_menu_actions, 0);
+    G_ClientDisconnect(&g_edicts[1]);
+    T_ASSERT(!score_transition.pending);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(!score_transition.terminal); /* no new multiplayer pause policy */
+
+    gi.MenuAction = old_menu_action;
+    G_ResetScoreTransition();
+}
+
+TEST(wc3_score_postgame, no_recipient_falls_through_without_terminal_pause) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    FOR_LOOP(i, game.max_clients) game.clients[i].connected = false;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+
+    G_FlushScoreTransition();
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_argument, "menu_single_player_campaign");
+    T_ASSERT(!score_transition.pending);
+    T_ASSERT(!score_transition.terminal);
+    T_ASSERT(score_transition.destination_submitted);
+    G_FlushScoreTransition();
+    G_RequestEndGame(true);
+    G_RequestChangeLevel("Maps/Campaign/Human03.w3m", false);
+    T_EQ(script_save_test_menu_actions, 1);
+
+    gi.MenuAction = old_menu_action;
+    G_ResetScoreTransition();
+}
+
+/* The accepted ChangeLevel ticket owns the staged campaign difficulty pair;
+ * later EndGame/Quit/Restart/ChangeLevel requests (even no-score variants)
+ * cannot reset it or start a loading screen before Continue. */
+TEST(wc3_score_postgame, first_exit_retains_destination_and_difficulty) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.MenuAction = G_TestScriptMenuAction;
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 1;
+    level.setup.default_difficulty = 2;
+    game.clients[0].connected = true;
+
+    G_RequestChangeLevel("OrcX01_02.w3x", true);
+    T_ASSERT(score_transition.pending);
+    T_ASSERT(G_HasPendingDifficultyTransition());
+    T_STREQ(score_transition.argument, "OrcX01_02.w3x");
+    G_RequestEndGame(true);
+    G_RequestQuitGame();
+    G_RequestRestartGame(false);
+    G_RequestChangeLevel("Maps/Campaign/Human03.w3m", false);
+    G_RequestLoadGameNamed("some-save");
+    T_ASSERT(!G_RequestScriptSaveGame("late-zone-save"));
+    T_ASSERT(!G_RequestScriptLoadGame("late-zone-load"));
+    T_ASSERT(!script_save_rejected);
+    G_RequestCampaignSelect();
+    G_RequestLoadGameMenu();
+    T_EQ(script_save_test_menu_actions, 0);
+    T_STREQ(score_transition.action, "level");
+    T_STREQ(score_transition.argument, "OrcX01_02.w3x");
+    T_ASSERT(G_HasPendingDifficultyTransition());
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    G_ScoreTransitionContinue(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "level");
+    T_STREQ(script_save_test_last_argument, "OrcX01_02.w3x");
+    T_ASSERT(G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                        &current, &original_default));
+    T_EQ(current, 1u);
+    T_EQ(original_default, 2u);
+    G_ScoreTransitionContinue(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+
+    gi.MenuAction = old_menu_action;
+    gi.ResolveMap = old_resolve_map;
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+}
+
+TEST(wc3_score_postgame, completed_ticket_rejects_new_exit_until_map_reset) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+    game.clients[0].connected = true;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    G_EnterScorePresentation();
+    G_ScoreTransitionContinue(&g_edicts[0]);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(score_transition.terminal);
+    G_RequestEndGame(true);
+    G_RequestChangeLevel("Maps/Campaign/Human03.w3m", false);
+    G_RequestQuitGame();
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(!score_transition.pending);
+    T_ASSERT(score_transition.terminal);
+
+    gi.MenuAction = old_menu_action;
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+}
+
+/* An unpaused ChangeLevel request must not start the next map before the
+ * outgoing G_RunFrame tail has drained the deferred-removal queue. The test
+ * takes the real scheduler entry and the existing no-viewer fallback, without
+ * requiring any installed Warcraft assets. */
+TEST(wc3_score_postgame, frame_tail_removes_entities_before_navigation) {
+    void (*old_menu)(cstring_t, cstring_t) = gi.MenuAction;
+    edict_t *hero;
+    uint32_t before;
+
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    G_ResetDeferredFrees();
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0.0f, 0.0f);
+    T_NOT_NULL(hero);
+    if (!hero) return;
+    hero->s.player = 0;
+    hero->unit_state->hero.level = 3;
+    postgame_test_removal = hero;
+    postgame_test_removed_at_menu = false;
+    T_ASSERT(run_test_jass("function main takes nothing returns nothing\nendfunction\n"));
+    gi.MenuAction = G_TestPostgameFrameMenuAction;
+    script_save_test_menu_actions = 0;
+    /* No connected viewer: test the fail-open route after the actual frame. */
+    FOR_LOOP(i, game.max_clients) game.clients[i].connected = false;
+    level.started = level.scriptsStarted = true;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    G_DeferFreeEdict(hero);
+    before = level.framenum;
+    T_ASSERT(score_transition.pending);
+    T_EQ(script_save_test_menu_actions, 0);
+    T_ASSERT(hero->inuse);
+    globals.RunFrame();
+    T_EQ(level.framenum, before + 1u);
+    T_ASSERT(postgame_test_removed_at_menu);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_argument, "menu_single_player_campaign");
+    T_ASSERT(!score_transition.pending);
+    T_ASSERT(!score_transition.terminal); /* Missing UI never claims pause. */
+    globals.RunFrame();
+    T_EQ(script_save_test_menu_actions, 1); /* No repeated fallback. */
+
+    gi.MenuAction = old_menu;
+    postgame_test_removal = NULL;
+    G_ResetScoreTransition();
+    level.started = false;
+}
+
+/* Score page input must still reach the game-owned dispatcher when terminal
+ * pause is active. It must not refresh frozen results or permit a second map
+ * action while the completed outgoing world remains loaded. */
+TEST(wc3_score_postgame, terminal_page_controls_use_frozen_data_and_one_shot_ok) {
+    void (*old_menu)(cstring_t, cstring_t) = gi.MenuAction;
+    void (*old_pause)(bool) = gi.SetPaused;
+    gameClient_t *client;
+    uint32_t before;
+
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    client = &game.clients[0];
+    client->connected = true;
+    gi.MenuAction = G_TestScriptMenuAction;
+    gi.SetPaused = G_TestPostgamePause;
+    script_save_test_menu_actions = 0;
+    G_QueueScoreTransition("menu", "menu_single_player_campaign");
+    score_transition.shown = true;
+    score_transition.awaiting[0] = true;
+    score_transition.frozen.count = WC3_SCORE_VISIBLE_ROWS + 3u;
+    score_transition.frozen.players[0].values[WC3_PLAYER_SCORE_UNIT_TOTAL] = 77;
+    score_transition.snapshot_frozen = true;
+    G_EnterScorePresentation();
+    T_ASSERT(score_transition.terminal);
+    level.started = level.scriptsStarted = true;
+    before = level.framenum;
+
+    G_ClientCommand(&g_edicts[0], 2, (cstring_t[]){ "scorescreen_tab", "1" });
+    T_EQ(score_transition.tab[0], 1u);
+    G_ClientCommand(&g_edicts[0], 2, (cstring_t[]){ "scorescreen_sort", "0" });
+    T_EQ(score_transition.view[0].column, 0u);
+    G_ClientCommand(&g_edicts[0], 2, (cstring_t[]){ "scorescreen_scroll", "1" });
+    T_EQ(score_transition.scroll[0], 3u);
+    G_ClientCommand(&g_edicts[1], 2, (cstring_t[]){ "scorescreen_tab", "3" });
+    T_EQ(score_transition.tab[0], 1u); /* Unauthorised viewer has no effect. */
+    G_ClientCommand(&g_edicts[0], 1, (cstring_t[]){ "signal" });
+    T_ASSERT(!client->cursor_signal);
+    globals.RunFrame(); /* Even an unexpected unpaused callback is inert. */
+    T_EQ(level.framenum, before);
+    T_EQ(score_transition.frozen.players[0].values[WC3_PLAYER_SCORE_UNIT_TOTAL], 77);
+    T_EQ(script_save_test_menu_actions, 0);
+    G_ClientCommand(&g_edicts[0], 1, (cstring_t[]){ "scorescreen_continue" });
+    G_ClientCommand(&g_edicts[0], 1, (cstring_t[]){ "scorescreen_continue" });
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_argument, "menu_single_player_campaign");
+    T_ASSERT(score_transition.terminal);
+    T_ASSERT(!score_transition.pending);
+
+    gi.MenuAction = old_menu;
+    gi.SetPaused = old_pause;
+    G_ResetScoreTransition();
+    level.started = false;
+}
+
+/* A skip-scores transition intentionally bypasses the score presentation.
+ * Its navigation is immediate and it must not claim terminal pause or leave
+ * an old score ticket that would double-dispatch a later load. */
+TEST(wc3_score_postgame, skip_scores_preserves_direct_change_level_route) {
+    void (*old_menu)(cstring_t, cstring_t) = gi.MenuAction;
+    bool (*old_resolve)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    G_ResetDifficultyTransition();
+    gi.MenuAction = G_TestScriptMenuAction;
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 1;
+    level.setup.default_difficulty = 2;
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "level");
+    T_STREQ(script_save_test_last_argument, "OrcX01_02.w3x");
+    T_ASSERT(!score_transition.pending);
+    T_ASSERT(!score_transition.terminal);
+    T_ASSERT(G_HasPendingDifficultyTransition());
+
+    gi.MenuAction = old_menu;
+    gi.ResolveMap = old_resolve;
+    G_ResetDifficultyTransition();
+    G_ResetScoreTransition();
+}
+
+/* A request is only a destination ticket. Scores/hero roster freeze at the
+ * finalization boundary, and must never refresh after that first capture. */
+TEST(wc3_score_finalization, captures_at_boundary_not_at_request) {
+    gameClient_t *client;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    client = &game.clients[0];
+    client->ps.number = 0;
+    client->jass.on_score_screen_set = true;
+    client->jass.on_score_screen = true;
+    client->score.values[WC3_PLAYER_SCORE_UNITS_TRAINED] = 3;
+
+    G_QueueScoreTransition("menu", "menu_main");
+    T_ASSERT(score_transition.pending);
+    T_ASSERT(!score_transition.snapshot_frozen);
+    T_EQ(score_transition.frozen.count, 0u);
+    client->score.values[WC3_PLAYER_SCORE_UNITS_TRAINED] = 7;
+    G_QueueScoreTransition("menu", "another_menu"); /* first request wins */
+    G_FreezePendingScoreSnapshot();
+    T_ASSERT(score_transition.snapshot_frozen);
+    T_EQ(score_transition.frozen.count, 1u);
+    T_EQ(score_transition.frozen.players[0].values[WC3_PLAYER_SCORE_UNITS_TRAINED], 7);
+    T_STREQ(score_transition.argument, "menu_main");
+
+    client->score.values[WC3_PLAYER_SCORE_UNITS_TRAINED] = 12;
+    G_FreezePendingScoreSnapshot();
+    T_EQ(score_transition.frozen.players[0].values[WC3_PLAYER_SCORE_UNITS_TRAINED], 7);
+    G_ResetScoreTransition();
+}
+
+/* A late RemoveUnit may retire the hero after ChangeLevel was requested but
+ * before the frame-end snapshot. This tests the actual deferred-free queue. */
+TEST(wc3_score_finalization, deferred_hero_removal_precedes_snapshot) {
+    edict_t *hero;
+    reset_entities();
+    setup_test_world();
+    G_ResetScoreTransition();
+    game.clients[0].ps.number = 0;
+    game.clients[0].jass.on_score_screen_set = true;
+    game.clients[0].jass.on_score_screen = true;
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0.0f, 0.0f);
+    T_NOT_NULL(hero);
+    if (!hero) return;
+    hero->s.player = 0;
+    hero->unit_state->hero.level = 3;
+    G_QueueScoreTransition("menu", "menu_main");
+    G_DeferFreeEdict(hero);
+    G_RunDeferredFrees();
+    G_FreezePendingScoreSnapshot();
+    T_EQ(score_transition.frozen.count, 1u);
+    T_EQ(score_transition.frozen.players[0].hero_count, 0u);
+    G_ResetScoreTransition();
+}
+
+TEST(wc3_difficulty_transition, restart_preserves_current_and_default_independently) {
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    level.setup.difficulty = 1;
+    level.setup.default_difficulty = 2;
+    G_RequestRestartGame(false);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "level");
+    T_STREQ(script_save_test_last_argument, "Maps\\Campaign\\Human02.w3m");
+    T_ASSERT(G_TakeDifficultyTransition("maps/campaign/HUMAN02.w3m", &current, &original_default));
+    T_EQ(current, 1u);
+    T_EQ(original_default, 2u);
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/Campaign/Human02.w3m", &current, &original_default));
+    T_EQ(current, 1u);
+    T_EQ(original_default, 2u);
+    G_ResetDifficultyTransition();
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_difficulty_transition, scripted_change_level_uses_resolved_target) {
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 0;
+    level.setup.default_difficulty = 3;
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "level");
+    T_ASSERT(G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                        &current, &original_default));
+    T_EQ(current, 0u);
+    T_EQ(original_default, 3u);
+    G_ResetDifficultyTransition();
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_difficulty_transition, mismatched_destination_consumes_override) {
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 2;
+    level.setup.default_difficulty = 1;
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/Campaign/Human03.w3m", &current, &original_default));
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                         &current, &original_default));
+    T_EQ(current, 99u);
+    T_EQ(original_default, 99u);
+    G_ResetDifficultyTransition();
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_difficulty_transition, script_load_cancels_outgoing_override) {
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.ScriptSaveExists = G_TestScriptSaveExists;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 0;
+    level.setup.default_difficulty = 2;
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_ASSERT(G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                         &current, &original_default));
+    G_ResetScriptSave();
+    G_ResetDifficultyTransition();
+    gi.ResolveMap = old_resolve_map;
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_difficulty_transition, invalid_map_cannot_queue_or_leave_override) {
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    reset_entities();
+    setup_test_world();
+    G_ResetDifficultyTransition();
+    G_ResetScriptSave();
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    level.setup.difficulty = 2;
+    level.setup.default_difficulty = 1;
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 1);
+    G_RequestChangeLevel("missing.w3x", false);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                         &current, &original_default));
+    G_ResetDifficultyTransition();
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_script_save, invalid_save_blocks_following_change_level) {
+    bool (*old_save_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSavePath = NULL;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(!G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 0);
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    T_ASSERT(!G_ScriptSavePending());
+    gi.ScriptSavePath = old_save_path;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_save, duplicate_save_aborts_pending_transition) {
+    bool (*old_save_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSavePath = G_TestScriptSavePath;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    T_ASSERT(G_ScriptSavePending());
+    T_ASSERT(!G_RequestScriptSaveGame("Blizzard/Zones/OrcX01_02.w3z"));
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    T_ASSERT(!G_ScriptSavePending());
+    gi.ScriptSavePath = old_save_path;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_save, successful_save_commits_before_next_level) {
+    bool (*old_save_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    cstring_t const filename = Test_TempPath("script-save-transition-success.sav");
+    reset_entities();
+    setup_test_world();
+    G_ResetScriptSave();
+    gi.ScriptSavePath = G_TestScriptSavePathOk;
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    level.setup.difficulty = 1;
+    level.setup.default_difficulty = 2;
+    script_save_test_menu_actions = 0;
+    script_save_test_last_action[0] = '\0';
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 0);
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "level");
+    T_ASSERT(!G_ScriptSavePending());
+    T_ASSERT(G_TakeDifficultyTransition("maps/frozenthrone/campaign/orcx01_02.w3x",
+                                        &current, &original_default));
+    T_EQ(current, 1u);
+    T_EQ(original_default, 2u);
+    FILE *saved = fopen(filename, "rb");
+    T_NOT_NULL(saved);
+    if (saved) fclose(saved);
+    remove(filename);
+    gi.ScriptSavePath = old_save_path;
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_save, failed_write_never_starts_next_level) {
+    bool (*old_save_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    bool (*old_resolve_map)(cstring_t, string_t, uint32_t) = gi.ResolveMap;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t current = 99, original_default = 99;
+    G_ResetScriptSave();
+    G_ResetDifficultyTransition();
+    gi.ScriptSavePath = G_TestScriptSavePath;
+    gi.ResolveMap = G_TestDifficultyResolveMap;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    G_RequestChangeLevel("OrcX01_02.w3x", false);
+    T_EQ(script_save_test_menu_actions, 0);
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    T_ASSERT(!G_ScriptSavePending());
+    T_ASSERT(!G_TakeDifficultyTransition("Maps/FrozenThrone/Campaign/OrcX01_02.w3x",
+                                         &current, &original_default));
+    gi.ScriptSavePath = old_save_path;
+    gi.ResolveMap = old_resolve_map;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_script_load, standalone_load_is_deferred_to_safe_point) {
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSaveExists = G_TestScriptSaveExists;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    T_EQ(script_save_test_menu_actions, 0);
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "scriptload");
+    T_STREQ(script_save_test_last_argument, "Blizzard/Zones/OrcX01_02.w3z");
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 1);
+    G_ResetScriptSave();
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_load, missing_or_conflicting_target_never_dispatches) {
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSaveExists = G_TestScriptSaveMissing;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(!G_RequestScriptLoadGame("Blizzard/Zones/no-such-save.w3z"));
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    gi.ScriptSaveExists = G_TestScriptSaveExists;
+    T_ASSERT(G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    T_ASSERT(!G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0); /* rejected duplicates cancel */
+    G_ResetScriptSave();
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_load, save_then_load_waits_for_committed_snapshot) {
+    bool (*old_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    cstring_t filename = Test_TempPath("script-save-transition-success.sav");
+    reset_entities();
+    setup_test_world();
+    G_ResetScriptSave();
+    gi.ScriptSavePath = G_TestScriptSavePathOk;
+    gi.ScriptSaveExists = G_TestScriptSaveExists;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    T_ASSERT(G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    T_EQ(script_save_test_menu_actions, 0);
+    G_FlushScriptSave();
+    FILE *saved = fopen(filename, "rb");
+    T_NOT_NULL(saved);
+    if (saved) fclose(saved);
+    T_EQ(script_save_test_menu_actions, 1);
+    T_STREQ(script_save_test_last_action, "scriptload");
+    T_STREQ(script_save_test_last_argument, "Blizzard/Zones/OrcX01_02.w3z");
+    remove(filename);
+    G_ResetScriptSave();
+    gi.ScriptSavePath = old_path;
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_load, failed_source_save_does_not_load_destination) {
+    bool (*old_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSavePath = G_TestScriptSavePath;
+    gi.ScriptSaveExists = G_TestScriptSaveExists;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    T_ASSERT(G_RequestScriptLoadGame("Blizzard/Zones/OrcX01_02.w3z"));
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    G_ResetScriptSave();
+    gi.ScriptSavePath = old_path;
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+TEST(wc3_script_load, failed_target_after_save_aborts_source_transaction) {
+    bool (*old_path)(cstring_t, string_t, uint32_t) = gi.ScriptSavePath;
+    bool (*old_exists)(cstring_t) = gi.ScriptSaveExists;
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    G_ResetScriptSave();
+    gi.ScriptSavePath = G_TestScriptSavePathOk;
+    gi.ScriptSaveExists = G_TestScriptSaveMissing;
+    gi.MenuAction = G_TestScriptMenuAction;
+    script_save_test_menu_actions = 0;
+    T_ASSERT(G_RequestScriptSaveGame("Blizzard/Zones/OrcX01.w3z"));
+    T_ASSERT(!G_RequestScriptLoadGame("Blizzard/Zones/absent.w3z"));
+    G_FlushScriptSave();
+    T_EQ(script_save_test_menu_actions, 0);
+    G_ResetScriptSave();
+    gi.ScriptSavePath = old_path;
+    gi.ScriptSaveExists = old_exists;
+    gi.MenuAction = old_menu_action;
+}
+
+#endif
+
+/* Return the game API vtable to the server.
+ * Called once at startup; after this point the server drives the game
+ * exclusively through the returned function pointers. */
+struct game_export *GetGameAPI(struct game_import *import) {
+    gi = *import;
+    FS_SetSheetHost(&MAKE(sheetHost_t,
+        .ReadFile = G_ReadGameDataFile,
+        .FreeFile = (void (*)(handle_t))gi.MemFree,
+        .MemAlloc = gi.MemAlloc,
+        .MemFree = gi.MemFree,
+    ));
+    globals.Init = G_InitGame;
+    globals.Shutdown = G_ShutdownGame;
+    globals.RunFrame = G_RunFrame;
+#ifdef WC3_SC2API
+    globals.ExternalActive = WC3_SC2API_ExternalActive;
+    globals.ExternalOwnsClock = WC3_SC2API_ExternalOwnsClock;
+    globals.ExternalFrame = WC3_SC2API_ExternalFrame;
+    globals.ExternalCanAdvance = WC3_SC2API_ExternalCanAdvance;
+    globals.ExternalStepComplete = WC3_SC2API_ExternalStepComplete;
+    globals.ExternalMapComplete = WC3_SC2API_ExternalMapComplete;
+#endif
+    globals.ClientCommand = G_ClientCommand;
+    globals.ClientInput = G_ClientInput;
+    globals.PrepareMap = G_PrepareMap;
+    globals.ClientBegin = G_ClientBegin;
+    globals.ClientDisconnect = G_ClientDisconnect;
+    globals.CanSeeEntity = G_FowPlayerCanSeeEntity;
+    globals.IsSnapshotPriorityEntity = G_IsSnapshotPriorityEntity;
+    globals.CustomizeEntity = G_CustomizeEntity;
+    globals.WriteClientDatagram = G_WriteClientDatagram;
+    globals.GetThemeValue = G_GetThemeValue;
+    globals.LoadMap = G_LoadMap;
+    globals.SaveGame = WriteGame;
+    globals.LoadGame = ReadGame;
+    globals.GetSaveMap = G_GetSaveMap;
+    globals.BeforeSaveGame = G_BeforeSaveGame;
+    globals.AfterLoadGame = G_AfterLoadGame;
+    globals.AfterScriptLoadGame = G_AfterScriptLoadGame;
+    globals.GetWorldBounds = CM_GetWorldBounds;
+    globals.PathingEntityIsIgnored = entity_is_pathing_ignored;
+    globals.edict_size = sizeof(struct edict_s);
+    return &globals;
+}

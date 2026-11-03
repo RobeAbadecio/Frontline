@@ -1,0 +1,1952 @@
+#ifdef BZ_TESTS
+/*
+ * t_jass_map.c — JASS integration tests for quests and win conditions.
+ *
+ * Quest tests are purely self-contained JASS scripts: they create quests,
+ * mutate fields, and assert using BJassAssert + IsQuest* getters.  The C
+ * wrapper only checks that run_test_jass() returned true (no JASS error).
+ *
+ * Win condition tests are hybrid: the JASS script calls RemovePlayer(), and
+ * C checks level.events because there is no JASS introspection for the
+ * server-side event queue.
+ *
+ * Scripts load generated fixtures from build/tests/tests.mpq — no War3.mpq.
+ *
+ * Covered:
+ *   Quests   — CreateQuest, QuestSet+IsQuest+ round-trips, QuestCreateItem,
+ *              QuestItemSet+IsQuestItem+, quest completion cheats
+ *   Trigger  — direct trigger/JASS/cinematic/objective developer cheats, selected event context
+ *              and in-game console feedback transport
+ *   Win      — RemovePlayer(DEFEAT) and RemovePlayer(VICTORY) each publish
+ *              exactly the right EVENT_PLAYER_* into level.events
+ *   Movies   — PlayCinematic maps logical names to classic Movies\*.mpq assets
+ *   Sanity   — BJassAssert true passes, BJassAssert false is caught
+ */
+
+#include "test.h"
+#include "../g_local.h"
+
+bool run_test_jass(cstring_t src);
+bool run_test_jass_error(cstring_t src, cstring_t expected);
+void setup_test_world(void);
+
+/* =========================================================================
+ * Helper: scan the event queue for a given type.
+ * ========================================================================= */
+
+static bool event_in_queue(EVENTTYPE type) {
+    for (uint32_t i = level.events.read; i < level.events.write; i++)
+        if (level.events.queue[i % MAX_EVENT_QUEUE].type == type) return true;
+    return false;
+}
+
+static char victory_menu_action[32];
+static char victory_menu_arg[256];
+static char cinematic_movie_path[MAX_PATHLEN];
+
+static void capture_cinematic_movie(cstring_t path) {
+    strlcpy(cinematic_movie_path, path ? path : "", sizeof(cinematic_movie_path));
+}
+
+static void capture_victory_menu_action(cstring_t action, cstring_t arg) {
+    strlcpy(victory_menu_action, action ? action : "", sizeof(victory_menu_action));
+    strlcpy(victory_menu_arg, arg ? arg : "", sizeof(victory_menu_arg));
+}
+
+static void victory_noop_write(pfWriteType_t type, void const *value) {
+    (void)type;
+    (void)value;
+}
+
+static void victory_noop_unicast(edict_t *ent) {
+    (void)ent;
+}
+
+static cstring_t result_cheats_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "sv_cheats") ? "1" : fallback;
+}
+
+static char cheat_console_text[8192];
+static int32_t cheat_console_opcode;
+static uint32_t cheat_console_unicasts;
+
+static void cheat_console_capture_write(pfWriteType_t type, void const *value) {
+    if (type == PF_BYTE) {
+        cheat_console_opcode = *(int32_t const *)value;
+    } else if (type == PF_STRING && value) {
+        if (cheat_console_text[0]) strlcat(cheat_console_text, "\n", sizeof(cheat_console_text));
+        strlcat(cheat_console_text, (cstring_t)value, sizeof(cheat_console_text));
+    }
+}
+
+static void cheat_console_capture_unicast(edict_t *ent) {
+    (void)ent;
+    cheat_console_unicasts++;
+}
+
+static void cheat_console_capture_reset(void) {
+    cheat_console_text[0] = '\0';
+    cheat_console_opcode = -1;
+    cheat_console_unicasts = 0;
+}
+
+/* =========================================================================
+ * Shared JASS/list lexer regressions
+ * ========================================================================= */
+
+TEST(wc3_jass_map, parse_segment_quoted_single_value_stops_at_end) {
+    wordExtractor_t parser = {
+        .buffer = "\"Learn Holy Light - [Level %d]\"",
+        .delimiters = ""
+    };
+    cstring_t value = parse_segment(&parser);
+
+    T_NOT_NULL(value);
+    T_STREQ(value, "Learn Holy Light - [Level %d]");
+    T_NULL(parse_segment(&parser));
+}
+
+TEST(wc3_jass_map, parse_segment_quoted_list_advances_to_next_value) {
+    wordExtractor_t parser = {
+        .buffer = "\"Level 1\",\"Level 2\"",
+        .delimiters = ""
+    };
+    char first[32];
+    cstring_t value = parse_segment(&parser);
+
+    T_NOT_NULL(value);
+    strlcpy(first, value, sizeof(first));
+    value = parse_segment(&parser);
+    T_STREQ(first, "Level 1");
+    T_NOT_NULL(value);
+    T_STREQ(value, "Level 2");
+    T_NULL(parse_segment(&parser));
+}
+
+/* Minified Vexorian JASS: return"" / return"hello" with no space (#441).
+ * Double-quote is not a jdo delimiter; identifier scan must stop at '"'.
+ * Call jlex_parse_token: game unity TU shadows parse_token with stb_fdf's copy. */
+TEST(wc3_jass_map, minified_return_empty_string_tokens) {
+    char const *src = "return\"\"";
+    wordExtractor_t parser = {
+        .buffer = src,
+        .start = src,
+        .delimiters = ",;()[]+-/*=<>!"
+    };
+    char first[16];
+    cstring_t tok = jlex_parse_token(&parser);
+
+    T_STREQ(tok, "return");
+    strlcpy(first, tok, sizeof(first));
+    tok = jlex_parse_token(&parser);
+    T_STREQ(first, "return");
+    T_STREQ(tok, "\"\"");
+}
+
+TEST(wc3_jass_map, minified_return_nonempty_string_tokens) {
+    char const *src = "return\"hello\"";
+    wordExtractor_t parser = {
+        .buffer = src,
+        .start = src,
+        .delimiters = ",;()[]+-/*=<>!"
+    };
+    char first[16];
+    cstring_t tok = jlex_parse_token(&parser);
+
+    T_STREQ(tok, "return");
+    strlcpy(first, tok, sizeof(first));
+    tok = jlex_parse_token(&parser);
+    T_STREQ(first, "return");
+    T_STREQ(tok, "\"hello\"");
+}
+
+TEST(wc3_jass_map, jass_lexer_eof_does_not_advance_past_nul) {
+    char const src[] = "";
+    wordExtractor_t parser = { .buffer = src, .start = src, .delimiters = ",;()[]+-/*=<>!" };
+
+    T_STREQ(jlex_parse_token(&parser), "");
+    T_ASSERT(parser.buffer == src);
+}
+
+TEST(wc3_jass_map, minified_return_empty_string) {
+    T_ASSERT(run_test_jass(
+        "function foo takes nothing returns string\n"
+        "  return\"\"\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(foo() == \"\", \"empty minified return\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_return_nonempty_string) {
+    T_ASSERT(run_test_jass(
+        "function foo takes nothing returns string\n"
+        "  return\"ok\"\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(foo() == \"ok\", \"nonempty minified return\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_set_empty_string) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local string s\n"
+        "  set s=\"\"\n"
+        "  call BJassAssert(s == \"\", \"minified set empty string\")\n"
+        "endfunction\n"));
+}
+
+/* DotA's compiled script is CR-only and glues )then / if( the way Vexorian does. */
+TEST(wc3_jass_map, minified_constant_function) {
+    T_ASSERT(run_test_jass(
+        "constant function Warpath_AbilityCode takes nothing returns integer\n"
+        "  return 'A0F0'\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(Warpath_AbilityCode() == 'A0F0', \"constant function\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_c_hex_integer) {
+    T_ASSERT(run_test_jass(
+        "function foo takes nothing returns integer\n"
+        "  return 0x10\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(foo() == 16, \"0x hex\")\n"
+        "  call BJassAssert(I2R(0x10) == 16.0, \"I2R 0x hex\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_int_then_or_glued) {
+    T_ASSERT(run_test_jass(
+        "function foo takes integer n returns integer\n"
+        "  if n!=851983then\n"
+        "    return 1\n"
+        "  endif\n"
+        "  if n==851983or n==2 then\n"
+        "    return 2\n"
+        "  endif\n"
+        "  return 0\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(foo(3) == 1, \"int then\")\n"
+        "  call BJassAssert(foo(851983) == 2, \"int or\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_fourcc_or_glued) {
+    T_ASSERT(run_test_jass(
+        "function foo takes integer id returns integer\n"
+        "  if(id=='Hmbr'or(id=='Hfoo'))then\n"
+        "    return 1\n"
+        "  endif\n"
+        "  return 0\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(foo('Hmbr') == 1, \"glued fourcc or\")\n"
+        "  call BJassAssert(foo('Hfoo') == 1, \"glued paren or\")\n"
+        "  call BJassAssert(foo('Hbar') == 0, \"no match\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, minified_cr_if_then) {
+    T_ASSERT(run_test_jass(
+        "globals\rboolean flag=true\rendglobals\r"
+        "function foo takes string script, string void returns integer\r"
+        "if flag then\r"
+        "return 1\r"
+        "endif\r"
+        "if(1>0)then\r"
+        "return 2\r"
+        "endif\r"
+        "return 0\r"
+        "endfunction\r"
+        "function main takes nothing returns nothing\r"
+        "  call BJassAssert(foo(\"a\", \"b\") == 1, \"cr if then\")\r"
+        "endfunction\r"));
+}
+
+/* =========================================================================
+ * Sanity — assertion helpers work end-to-end
+ * ========================================================================= */
+
+TEST(wc3_jass_map, bjassassert_true_passes) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(1 + 1 == 2, \"arithmetic\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, bjassassert_false_is_caught) {
+    T_ASSERT(run_test_jass_error(
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(false, \"intentional failure\")\n"
+        "endfunction\n"
+    , "assertion failed: intentional failure"));
+}
+
+TEST(wc3_jass_map, bjassassert_error_message_must_match) {
+    T_ASSERT(!run_test_jass_error(
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(false, \"actual failure\")\n"
+        "endfunction\n"
+    , "assertion failed: different failure"));
+}
+
+TEST(wc3_jass_map, array_assignment_and_access_evaluate_expressions) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer array values\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  local integer i = 2\n"
+        "  set values[i + 1] = 40 + 2\n"
+        "  call BJassAssert(values[3] == 42, \"array expression evaluation\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, empty_globals_block_parses) {
+    /* NightElf01 AI scripts (n01_yellow/pink/gray) declare an empty
+     * globals/endglobals block; the top-level parser must accept it
+     * instead of throwing "unknown keyword". */
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  call BJassAssert(true, \"empty globals\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, coroutine_discards_statement_return_values) {
+    T_ASSERT(run_test_jass(
+        "function retained takes nothing returns integer\n"
+        "  return 1\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local integer i = 0\n"
+        "  loop\n"
+        "    exitwhen i == 300\n"
+        "    call retained()\n"
+        "    set i = i + 1\n"
+        "  endloop\n"
+        "  call BJassAssert(i == 300, \"coroutine return cleanup\")\n"
+        "endfunction\n"
+    ));
+}
+
+/* Orc03's gate runs ForGroup, TriggerExecute()s one counter action per
+ * qualifying zeppelin, then immediately reads the counter. */
+TEST(wc3_jass_map, orc03_home_counter_actions_complete_before_victory_gate_check) {
+    setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  group zeppelinGroup = null\n"
+        "  trigger homeCounter = null\n"
+        "  trigger victoryTrigger = null\n"
+        "  integer zeppelinsHome = 0\n"
+        "  integer countAtGate = -1\n"
+        "  integer victoryRan = 0\n"
+        "endglobals\n"
+        "function ConditionalTriggerExecute takes trigger trig returns nothing\n"
+        "  if TriggerEvaluate(trig) then\n"
+        "    call TriggerExecute(trig)\n"
+        "  endif\n"
+        "endfunction\n"
+        "function IncrementHome takes nothing returns nothing\n"
+        "  set zeppelinsHome = zeppelinsHome + 1\n"
+        "endfunction\n"
+        "function MarkVictory takes nothing returns nothing\n"
+        "  set victoryRan = victoryRan + 1\n"
+        "endfunction\n"
+        "function CountZeppelinAtHome takes nothing returns nothing\n"
+        "  call ConditionalTriggerExecute(homeCounter)\n"
+        "endfunction\n"
+        "function Orc03BuildingCheck takes nothing returns nothing\n"
+        "  set zeppelinsHome = 0\n"
+        "  call ForGroup(zeppelinGroup, function CountZeppelinAtHome)\n"
+        "  set countAtGate = zeppelinsHome\n"
+        "  if zeppelinsHome < 2 then\n"
+        "    return\n"
+        "  endif\n"
+        "  call ConditionalTriggerExecute(victoryTrigger)\n"
+        "endfunction\n"
+        "function VerifyOrc03BuildingCheck takes nothing returns nothing\n"
+        "  call BJassAssert(countAtGate == 2, \"gate sees both synchronously executed counter actions\")\n"
+        "  call BJassAssert(zeppelinsHome == 2, \"both counter actions ran\")\n"
+        "  call BJassAssert(victoryRan == 1, \"victory trigger ran before the gate returned\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local unit zeppelinOne = CreateUnit(Player(0), 'hfoo', 0.0, 0.0, 0.0)\n"
+        "  local unit zeppelinTwo = CreateUnit(Player(0), 'hfoo', 32.0, 0.0, 0.0)\n"
+        "  set zeppelinGroup = CreateGroup()\n"
+        "  call GroupAddUnit(zeppelinGroup, zeppelinOne)\n"
+        "  call GroupAddUnit(zeppelinGroup, zeppelinTwo)\n"
+        "  set homeCounter = CreateTrigger()\n"
+        "  call TriggerAddAction(homeCounter, function IncrementHome)\n"
+        "  set victoryTrigger = CreateTrigger()\n"
+        "  call TriggerAddAction(victoryTrigger, function MarkVictory)\n"
+        "  call Orc03BuildingCheck()\n"
+        "endfunction\n"
+    ));
+    jass_callbyname(level.vm, "VerifyOrc03BuildingCheck", true);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+/* NightElfX01 removes two seven-unit cinematic groups before enabling rescue regions. */
+TEST(wc3_jass_map, nightelfx01_cleanup_removes_every_tracker) {
+    setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  unit array trackers\n"
+        "  group first = null\n"
+        "  group second = null\n"
+        "endglobals\n"
+        "function RemoveTracker takes nothing returns nothing\n"
+        "  call RemoveUnit(GetEnumUnit())\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local integer i = 0\n"
+        "  set first = CreateGroup()\n"
+        "  set second = CreateGroup()\n"
+        "  loop\n"
+        "    exitwhen i == 14\n"
+        "    set trackers[i] = CreateUnit(Player(0), 'hfoo', 64.0 * i, 128.0, 0.0)\n"
+        "    if i < 7 then\n"
+        "      call GroupAddUnit(first, trackers[i])\n"
+        "    else\n"
+        "      call GroupAddUnit(second, trackers[i])\n"
+        "    endif\n"
+        "    set i = i + 1\n"
+        "  endloop\n"
+        "  call ForGroup(first, function RemoveTracker)\n"
+        "  call ForGroup(second, function RemoveTracker)\n"
+        "endfunction\n"
+        "function VerifyCleanup takes nothing returns nothing\n"
+        "  local integer i = 0\n"
+        "  loop\n"
+        "    exitwhen i == 14\n"
+        "    call BJassAssert(GetUnitTypeId(trackers[i]) == 0, \"cinematic tracker survived cleanup\")\n"
+        "    set i = i + 1\n"
+        "  endloop\n"
+        "  call BJassAssert(FirstOfGroup(first) == null, \"first tracker group is empty\")\n"
+        "  call BJassAssert(FirstOfGroup(second) == null, \"second tracker group is empty\")\n"
+        "endfunction\n"));
+    G_RunDeferredFrees();
+    jass_callbyname(level.vm, "VerifyCleanup", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+/* Snapshot membership survives mutation; removed handles are skipped and nested context is restored. */
+TEST(wc3_jass_map, forgroup_snapshot_survives_nested_mutation) {
+    setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  group outer = null\n"
+        "  group inner = null\n"
+        "  unit removed = null\n"
+        "  unit added = null\n"
+        "  integer total = 0\n"
+        "endglobals\n"
+        "function InnerAction takes nothing returns nothing\n"
+        "  call BJassAssert(GetEnumUnit() == added, \"nested enum unit\")\n"
+        "endfunction\n"
+        "function OuterAction takes nothing returns nothing\n"
+        "  local unit u = GetEnumUnit()\n"
+        "  set total = total + GetUnitUserData(u)\n"
+        "  if GetUnitUserData(u) == 1 then\n"
+        "    call GroupClear(outer)\n"
+        "    call GroupAddUnit(outer, added)\n"
+        "    call RemoveUnit(removed)\n"
+        "    call ForGroup(inner, function InnerAction)\n"
+        "    call BJassAssert(GetEnumUnit() == u, \"outer enum unit restored\")\n"
+        "    call DestroyGroup(outer)\n"
+        "  endif\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local integer i = 1\n"
+        "  local unit u\n"
+        "  set outer = CreateGroup()\n"
+        "  set inner = CreateGroup()\n"
+        "  loop\n"
+        "    exitwhen i == 5\n"
+        "    set u = CreateUnit(Player(0), 'hfoo', 128.0 * i, 128.0, 0.0)\n"
+        "    call SetUnitUserData(u, i)\n"
+        "    if i < 4 then\n"
+        "      call GroupAddUnit(outer, u)\n"
+        "    else\n"
+        "      set added = u\n"
+        "      call GroupAddUnit(inner, u)\n"
+        "    endif\n"
+        "    if i == 2 then\n"
+        "      set removed = u\n"
+        "    endif\n"
+        "    set i = i + 1\n"
+        "  endloop\n"
+        "  call ForGroup(outer, function OuterAction)\n"
+        "  call BJassAssert(total == 4, \"visit original live members once despite group mutation\")\n"
+        "endfunction\n"));
+}
+
+TEST(wc3_jass_map, trigger_execute_runs_until_child_sleep_then_resumes) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger sleepingTrigger = null\n"
+        "  integer sleepStage = 0\n"
+        "  integer stageAfterExecute = 0\n"
+        "endglobals\n"
+        "function SleepingAction takes nothing returns nothing\n"
+        "  set sleepStage = 1\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set sleepStage = 2\n"
+        "endfunction\n"
+        "function ExecuteSleepingTrigger takes nothing returns nothing\n"
+        "  call TriggerExecute(sleepingTrigger)\n"
+        "  set stageAfterExecute = sleepStage\n"
+        "endfunction\n"
+        "function VerifySleepingTrigger takes nothing returns nothing\n"
+        "  call BJassAssert(stageAfterExecute == 1, \"TriggerExecute ran child to its first wait\")\n"
+        "  call BJassAssert(sleepStage == 2, \"yielded child resumed after caller returned\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set sleepingTrigger = CreateTrigger()\n"
+        "  call TriggerAddAction(sleepingTrigger, function SleepingAction)\n"
+        "  call ExecuteSleepingTrigger()\n"
+        "endfunction\n"
+    ));
+    jass_callbyname(level.vm, "VerifySleepingTrigger", true);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass_map, nested_trigger_execute_preserves_parent_coroutine) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger parentTrigger = null\n"
+        "  trigger childTrigger = null\n"
+        "  integer nestedStage = 0\n"
+        "  integer parentStageAtReturn = 0\n"
+        "endglobals\n"
+        "function ChildAction takes nothing returns nothing\n"
+        "  set nestedStage = 1\n"
+        "endfunction\n"
+        "function ParentAction takes nothing returns nothing\n"
+        "  call TriggerExecute(childTrigger)\n"
+        "  set nestedStage = 2\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set nestedStage = 3\n"
+        "endfunction\n"
+        "function VerifyNestedTriggerExecute takes nothing returns nothing\n"
+        "  call BJassAssert(parentStageAtReturn == 2, \"parent yielded after nested TriggerExecute\")\n"
+        "  call BJassAssert(nestedStage == 3, \"parent resumed after its own wait\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set childTrigger = CreateTrigger()\n"
+        "  call TriggerAddAction(childTrigger, function ChildAction)\n"
+        "  set parentTrigger = CreateTrigger()\n"
+        "  call TriggerAddAction(parentTrigger, function ParentAction)\n"
+        "  call TriggerExecute(parentTrigger)\n"
+        "  set parentStageAtReturn = nestedStage\n"
+        "endfunction\n"
+    ));
+    jass_callbyname(level.vm, "VerifyNestedTriggerExecute", true);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass_map, trigger_execute_snapshots_actions_before_callbacks_mutate_them) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger clearTrigger = null\n"
+        "  trigger removeTrigger = null\n"
+        "  triggeraction removedAction = null\n"
+        "  integer clearCount = 0\n"
+        "  integer pendingAfterClearCount = 0\n"
+        "  integer lateCount = 0\n"
+        "  integer removeCount = 0\n"
+        "  integer pendingAfterRemoveCount = 0\n"
+        "endglobals\n"
+        "function ClearActionsDuringDispatch takes nothing returns nothing\n"
+        "  set clearCount = clearCount + 1\n"
+        "  call TriggerClearActions(clearTrigger)\n"
+        "endfunction\n"
+        "function PendingAfterClear takes nothing returns nothing\n"
+        "  set pendingAfterClearCount = pendingAfterClearCount + 1\n"
+        "endfunction\n"
+        "function LateAction takes nothing returns nothing\n"
+        "  set lateCount = lateCount + 1\n"
+        "endfunction\n"
+        "function RemovePendingAction takes nothing returns nothing\n"
+        "  set removeCount = removeCount + 1\n"
+        "  call TriggerRemoveAction(removeTrigger, removedAction)\n"
+        "  set removedAction = null\n"
+        "endfunction\n"
+        "function PendingAfterRemove takes nothing returns nothing\n"
+        "  set pendingAfterRemoveCount = pendingAfterRemoveCount + 1\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set clearTrigger = CreateTrigger()\n"
+        "  call TriggerAddAction(clearTrigger, function PendingAfterClear)\n"
+        "  call TriggerAddAction(clearTrigger, function ClearActionsDuringDispatch)\n"
+        "  call TriggerExecute(clearTrigger)\n"
+        "  call BJassAssert(clearCount == 1, \"clear callback ran once\")\n"
+        "  call BJassAssert(pendingAfterClearCount == 1, \"dispatch retained action list captured before clear\")\n"
+        "  call TriggerAddAction(clearTrigger, function LateAction)\n"
+        "  call TriggerExecute(clearTrigger)\n"
+        "  call BJassAssert(clearCount == 1 and pendingAfterClearCount == 1 and lateCount == 1, \"cleared trigger accepts a new action without stale nodes\")\n"
+        "  set removeTrigger = CreateTrigger()\n"
+        "  set removedAction = TriggerAddAction(removeTrigger, function PendingAfterRemove)\n"
+        "  call TriggerAddAction(removeTrigger, function RemovePendingAction)\n"
+        "  call TriggerExecute(removeTrigger)\n"
+        "  call BJassAssert(removeCount == 1 and pendingAfterRemoveCount == 1, \"dispatch retained action list captured before remove\")\n"
+        "  call TriggerExecute(removeTrigger)\n"
+        "  call BJassAssert(removeCount == 2 and pendingAfterRemoveCount == 1, \"removed action is absent from the next dispatch\")\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+/* =========================================================================
+ * Map/player setup — config() state round trips through native enum handles
+ * ========================================================================= */
+
+TEST(wc3_jass_map, map_configuration_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call SetTeams(3)\n"
+        "  call SetPlayers(6)\n"
+        "  call SetGameTypeSupported(GAME_TYPE_MELEE, true)\n"
+        "  call SetGameTypeSupported(GAME_TYPE_FFA, false)\n"
+        "  call SetMapFlag(MAP_FOG_MAP_EXPLORED, true)\n"
+        "  call SetMapFlag(MAP_FOG_HIDE_TERRAIN, false)\n"
+        "  call SetGamePlacement(MAP_PLACEMENT_FIXED)\n"
+        "  call SetGameSpeed(MAP_SPEED_FAST)\n"
+        "  call SetGameDifficulty(MAP_DIFFICULTY_HARD)\n"
+        "  call SetDefaultDifficulty(MAP_DIFFICULTY_EASY)\n"
+        "  call SetResourceDensity(MAP_DENSITY_HEAVY)\n"
+        "  call SetCreatureDensity(MAP_DENSITY_LIGHT)\n"
+        "  call BJassAssert(GetTeams() == 3, \"team count\")\n"
+        "  call BJassAssert(GetPlayers() == 6, \"player count\")\n"
+        "  call BJassAssert(IsGameTypeSupported(GAME_TYPE_MELEE), \"melee supported\")\n"
+        "  call BJassAssert(not IsGameTypeSupported(GAME_TYPE_FFA), \"ffa disabled\")\n"
+        "  call BJassAssert(IsMapFlagSet(MAP_FOG_MAP_EXPLORED), \"explored flag\")\n"
+        "  call BJassAssert(not IsMapFlagSet(MAP_FOG_HIDE_TERRAIN), \"hide terrain disabled\")\n"
+        "  call BJassAssert(GetGamePlacement() == MAP_PLACEMENT_FIXED, \"placement\")\n"
+        "  call BJassAssert(GetGameSpeed() == MAP_SPEED_FAST, \"speed\")\n"
+        "  call BJassAssert(GetGameDifficulty() == MAP_DIFFICULTY_HARD, \"difficulty\")\n"
+        "  call BJassAssert(GetDefaultDifficulty() == MAP_DIFFICULTY_EASY, \"default difficulty\")\n"
+        "  call BJassAssert(GetResourceDensity() == MAP_DENSITY_HEAVY, \"resource density\")\n"
+        "  call BJassAssert(GetCreatureDensity() == MAP_DENSITY_LIGHT, \"creature density\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, map_metadata_and_start_priority_persist) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call SetMapName(\"Native Test Map\")\n"
+        "  call SetMapDescription(\"Native setup state\")\n"
+        "  call SetStartLocPrioCount(2, 2)\n"
+        "  call SetStartLocPrio(2, 0, 5, MAP_LOC_PRIO_HIGH)\n"
+        "  call SetStartLocPrio(2, 1, 7, MAP_LOC_PRIO_NOT)\n"
+        "  call BJassAssert(GetStartLocPrioSlot(2, 0) == 5, \"priority location\")\n"
+        "  call BJassAssert(GetStartLocPrio(2, 0) == MAP_LOC_PRIO_HIGH, \"high priority\")\n"
+        "  call BJassAssert(GetStartLocPrioSlot(2, 1) == 7, \"excluded location\")\n"
+        "  call BJassAssert(GetStartLocPrio(2, 1) == MAP_LOC_PRIO_NOT, \"excluded priority\")\n"
+        "endfunction\n"
+    ));
+    T_STREQ(level.setup.name, "Native Test Map");
+    T_STREQ(level.setup.description, "Native setup state");
+}
+
+/* Human07 creates the Player 6 Crypt gg_unit_usep_0049, removes it from the
+ * Normal difficulty branch, then later counts Player 6 structures through the
+ * stock GetUnitsOfPlayerMatching/CountUnitsInGroup wrappers. The one-client
+ * harness uses Player 0 for that authored slot. Keep the exact trigger order:
+ * the removed Crypt must not satisfy CheckGreenBuildings, even while its
+ * deferred edict is still alive for the current frame. */
+TEST(wc3_jass_map, human07_normal_removal_is_absent_from_green_building_count) {
+    edict_t *crypt = NULL, *town_hall = NULL;
+
+    setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  unit gg_unit_usep_0049 = null\n"
+        "endglobals\n"
+        "function GetUnitsOfPlayerMatching takes player whichPlayer, boolexpr filter returns group\n"
+        "  local group g = CreateGroup()\n"
+        "  call GroupEnumUnitsOfPlayer(g, whichPlayer, filter)\n"
+        "  call DestroyBoolExpr(filter)\n"
+        "  return g\n"
+        "endfunction\n"
+        "function CountUnitsInGroup takes group g returns integer\n"
+        "  local integer count = 0\n"
+        "  local unit u\n"
+        "  loop\n"
+        "    set u = FirstOfGroup(g)\n"
+        "    exitwhen u == null\n"
+        "    set count = count + 1\n"
+        "    call GroupRemoveUnit(g, u)\n"
+        "  endloop\n"
+        "  return count\n"
+        "endfunction\n"
+        "function Human07GreenBuildingFilter takes nothing returns boolean\n"
+        "  local unit u = GetFilterUnit()\n"
+        "  return IsUnitType(u, UNIT_TYPE_STRUCTURE) and GetUnitTypeId(u) != 'uzg1' and\n"
+        "      GetUnitTypeId(u) != 'uzig' and IsUnitAliveBJ(u)\n"
+        "endfunction\n"
+        "function Human07CountGreenBuildings takes nothing returns integer\n"
+        "  return CountUnitsInGroup(GetUnitsOfPlayerMatching(Player(0),\n"
+        "      Condition(function Human07GreenBuildingFilter)))\n"
+        "endfunction\n"
+        "function Human07NormalInitialization takes nothing returns nothing\n"
+        "  call BJassAssert(Human07CountGreenBuildings() == 2, \"both Human07 buildings are initially counted\")\n"
+        "  call SetGameDifficulty(MAP_DIFFICULTY_NORMAL)\n"
+        "  call BJassAssert(GetGameDifficulty() == MAP_DIFFICULTY_NORMAL, \"Human07 difficulty is Normal\")\n"
+        "  if GetGameDifficulty() == MAP_DIFFICULTY_NORMAL then\n"
+        "    call RemoveUnit(gg_unit_usep_0049)\n"
+        "  endif\n"
+        "  call BJassAssert(GetUnitTypeId(gg_unit_usep_0049) == 'usep', "
+        "\"removed Crypt handle survives the trigger\")\n"
+        "  call BJassAssert(Human07CountGreenBuildings() == 1, \"removed Crypt must not be counted\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local unit survivingBuilding = CreateUnit(Player(0), 'hbar', 0.0, 0.0, 0.0)\n"
+        "  set gg_unit_usep_0049 = CreateUnit(Player(0), 'usep', 128.0, 0.0, 0.0)\n"
+        "  call BJassAssert(IsUnitType(survivingBuilding, UNIT_TYPE_STRUCTURE), "
+        "\"surviving Town Hall is a structure\")\n"
+        "endfunction\n"
+    ));
+
+    FOR_LOOP(i, globals.num_edicts) {
+        if (g_edicts[i].class_id == BZ_WC3_UNIT_CRYPT) crypt = &g_edicts[i];
+        if (g_edicts[i].class_id == BZ_WC3_UNIT_BARRACKS) town_hall = &g_edicts[i];
+    }
+    T_NOT_NULL(crypt); T_NOT_NULL(town_hall);
+    if (!crypt || !town_hall) goto cleanup;
+    T_ASSERT(G_UnitIsBuilding(crypt->class_id));
+    T_ASSERT(G_UnitIsBuilding(town_hall->class_id));
+    /* The fixture has simulation metadata for these structures but no model
+     * rows, so provide the live-unit state that SP_SpawnUnit supplies. */
+    G_InitUnitOrders(crypt);
+    crypt->svflags |= SVF_MONSTER;
+    G_InitUnitOrders(town_hall);
+    town_hall->svflags |= SVF_MONSTER;
+    crypt->s.flags |= EF_BUILDING;
+    town_hall->s.flags |= EF_BUILDING;
+    crypt->health.value = crypt->health.max_value = 1000.0f;
+    town_hall->health.value = town_hall->health.max_value = 1000.0f;
+    jass_callbyname(level.vm, "Human07NormalInitialization", false);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(crypt->inuse);
+    T_ASSERT(G_IsDeferredFree(crypt));
+    level.started = true; level.scriptsStarted = true; globals.RunFrame();
+    T_ASSERT(!crypt->inuse);
+
+cleanup:
+    ; /* label cannot end a compound statement pre-C23 */
+}
+
+/* Human04 initializes difficulty before the opening cinematic, removes the
+ * Player 6 Crypt, and later runs OpeningCancelled after EVENT_PLAYER_END_CINEMATIC.
+ * OpeningCancelled removes the old Town Hall and creates a replacement.  Keep
+ * the authored order and verify the replacement is the only counted/selectable
+ * building before deferred handles are finally released. */
+TEST(wc3_jass_map, human04_cancel_replaces_townhall_after_difficulty_removal) {
+    edict_t *crypt = NULL, *old_town_hall = NULL, *replacement = NULL;
+    uint32_t const bit = 1u << game.clients[0].ps.number;
+
+    setup_test_world();
+    currentplayer = &game.clients[0].ps;
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  unit gg_unit_usep_0087 = null\n"
+        "  unit udg_Townhall = null\n"
+        "endglobals\n"
+        "function Human04BuildingFilter takes nothing returns boolean\n"
+        "  local unit u = GetFilterUnit()\n"
+        "  return GetUnitTypeId(u) == 'hbar' or GetUnitTypeId(u) == 'htow'\n"
+        "endfunction\n"
+        "function Human04BuildingCount takes nothing returns integer\n"
+        "  local group g = CreateGroup()\n"
+        "  local unit u\n"
+        "  local integer count = 0\n"
+        "  call GroupEnumUnitsOfPlayer(g, Player(0), Condition(function Human04BuildingFilter))\n"
+        "  loop\n"
+        "    set u = FirstOfGroup(g)\n"
+        "    exitwhen u == null\n"
+        "    set count = count + 1\n"
+        "    call GroupRemoveUnit(g, u)\n"
+        "  endloop\n"
+        "  call DestroyGroup(g)\n"
+        "  return count\n"
+        "endfunction\n"
+        "function Human04DifficultyNormal takes nothing returns nothing\n"
+        "  call RemoveUnit(gg_unit_usep_0087)\n"
+        "  call BJassAssert(Human04BuildingCount() == 1, \"difficulty removal excludes Crypt\")\n"
+        "endfunction\n"
+        "function Human04OpeningCancelled takes nothing returns nothing\n"
+        "  call RemoveUnit(udg_Townhall)\n"
+        "  set udg_Townhall = CreateUnit(Player(0), 'htow', 128.0, 0.0, 0.0)\n"
+        "  call BJassAssert(Human04BuildingCount() == 1, \"cancel count has only replacement Town Hall\")\n"
+        "  call BJassAssert(IsUnitAliveBJ(udg_Townhall), \"replacement Town Hall is alive\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger endCinematic = CreateTrigger()\n"
+        "  set gg_unit_usep_0087 = CreateUnit(Player(0), 'usep', -128.0, 0.0, 0.0)\n"
+        "  set udg_Townhall = CreateUnit(Player(0), 'hbar', 0.0, 0.0, 0.0)\n"
+        "  call TriggerRegisterPlayerEvent(endCinematic, Player(0), EVENT_PLAYER_END_CINEMATIC)\n"
+        "  call TriggerAddAction(endCinematic, function Human04OpeningCancelled)\n"
+        "endfunction\n"
+    ));
+
+    FOR_LOOP(i, globals.num_edicts) {
+        if (g_edicts[i].class_id == BZ_WC3_UNIT_CRYPT) crypt = &g_edicts[i];
+        if (g_edicts[i].class_id == BZ_WC3_UNIT_BARRACKS) old_town_hall = &g_edicts[i];
+    }
+    T_NOT_NULL(crypt); T_NOT_NULL(old_town_hall);
+    if (!crypt || !old_town_hall) goto cleanup;
+    G_InitUnitOrders(crypt);
+    crypt->svflags |= SVF_MONSTER;
+    G_InitUnitOrders(old_town_hall);
+    old_town_hall->svflags |= SVF_MONSTER;
+    game.clients[0].ps.rdflags |= RDF_NOFOG;
+    jass_callbyname(level.vm, "Human04DifficultyNormal", false);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(G_IsDeferredFree(crypt));
+    G_PublishEvent(&g_edicts[0], EVENT_PLAYER_END_CINEMATIC);
+    G_RunEvents();
+    jass_runevents(level.vm);
+
+    FOR_LOOP(i, globals.num_edicts)
+        if (g_edicts[i].class_id == BZ_WC3_UNIT_TOWN_HALL && g_edicts[i].inuse)
+            replacement = &g_edicts[i];
+    T_NOT_NULL(replacement);
+    T_ASSERT(G_IsDeferredFree(crypt));
+    T_ASSERT(G_IsDeferredFree(old_town_hall));
+    T_ASSERT(replacement && replacement->inuse);
+    if (replacement) {
+        replacement->s.player = 0;
+        G_InitUnitOrders(replacement);
+        replacement->svflags |= SVF_MONSTER;
+        replacement->health.value = replacement->health.max_value = 1000.0f;
+        T_ASSERT(G_UnitCanBeSelected(&game.clients[0], replacement));
+        T_ASSERT(!(replacement->selected & bit));
+    }
+    level.started = true; level.scriptsStarted = true; globals.RunFrame();
+    T_ASSERT(!crypt->inuse);
+    T_ASSERT(!old_town_hall->inuse);
+
+cleanup:
+    currentplayer = NULL;
+}
+
+TEST(wc3_jass_map, player_technology_roundtrip_uses_declared_types) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call SetPlayerTechMaxAllowed(Player(0), 123456, 3)\n"
+        "  call SetPlayerTechResearched(Player(0), 123456, 1)\n"
+        "  call AddPlayerTechResearched(Player(0), 123456, 1)\n"
+        "  call BJassAssert(GetPlayerTechMaxAllowed(Player(0), 123456) == 3, \"tech maximum\")\n"
+        "  call BJassAssert(GetPlayerTechResearched(Player(0), 123456, true), \"tech researched boolean\")\n"
+        "  call BJassAssert(GetPlayerTechCount(Player(0), 123456, true) == 2, \"tech level count\")\n"
+        "  call SetPlayerTechMaxAllowed(Player(0), 123456, -1)\n"
+        "  call BJassAssert(GetPlayerTechMaxAllowed(Player(0), 123456) == -1, \"unlimited tech maximum\")\n"
+        "  call SetPlayerTechResearched(Player(0), 123456, 0)\n"
+        "  call BJassAssert(not GetPlayerTechResearched(Player(0), 123456, false), \"tech researched cleared\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, player_configuration_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call SetPlayerName(Player(0), \"Jaina\")\n"
+        "  call SetPlayerRacePreference(Player(0), RACE_PREF_HUMAN)\n"
+        "  call SetPlayerRacePreference(Player(0), RACE_PREF_RANDOM)\n"
+        "  call SetPlayerRaceSelectable(Player(0), false)\n"
+        "  call SetPlayerController(Player(0), MAP_CONTROL_COMPUTER)\n"
+        "  call SetPlayerTaxRate(Player(0), Player(1), PLAYER_STATE_RESOURCE_GOLD, 35)\n"
+        "  call SetPlayerHandicap(Player(0), 80.0)\n"
+        "  call SetPlayerHandicapXPBJ(Player(0), 300.0)\n"
+        "  call SetPlayerOnScoreScreen(Player(0), true)\n"
+        "  call BJassAssert(GetPlayerName(Player(0)) == \"Jaina\", \"player name\")\n"
+        "  call BJassAssert(IsPlayerRacePrefSet(Player(0), RACE_PREF_HUMAN), \"human pref\")\n"
+        "  call BJassAssert(IsPlayerRacePrefSet(Player(0), RACE_PREF_RANDOM), \"random pref\")\n"
+        "  call BJassAssert(not IsPlayerRacePrefSet(Player(0), RACE_PREF_ORC), \"orc absent\")\n"
+        "  call BJassAssert(not GetPlayerSelectable(Player(0)), \"race locked\")\n"
+        "  call BJassAssert(GetPlayerController(Player(0)) == MAP_CONTROL_COMPUTER, \"controller\")\n"
+        "  call BJassAssert(GetPlayerTaxRate(Player(0), Player(1), PLAYER_STATE_RESOURCE_GOLD) == 35, \"tax\")\n"
+        "  call BJassAssert(GetPlayerHandicap(Player(0)) == 80.0, \"handicap\")\n"
+        "  call BJassAssert(GetPlayerHandicapXP(Player(0)) == 3.0, \"xp handicap native multiplier\")\n"
+        "  call BJassAssert(GetPlayerHandicapXPBJ(Player(0)) == 300.0, \"xp handicap percentage wrapper\")\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(game.clients[0].jass.on_score_screen);
+}
+
+TEST(wc3_jass_map, region_rectangles_add_query_and_clear) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local region area = CreateRegion()\n"
+        "  local rect west = Rect(0.0, 0.0, 10.0, 10.0)\n"
+        "  local rect east = Rect(20.0, 20.0, 30.0, 30.0)\n"
+        "  local location point = Location(25.0, 25.0)\n"
+        "  call RegionAddRect(area, west)\n"
+        "  call RegionAddRect(area, east)\n"
+        "  call BJassAssert(IsPointInRegion(area, 5.0, 5.0), \"west point\")\n"
+        "  call BJassAssert(IsLocationInRegion(area, point), \"east location\")\n"
+        "  call BJassAssert(not IsPointInRegion(area, 15.0, 15.0), \"union gap\")\n"
+        "  call RegionClearRect(area, west)\n"
+        "  call BJassAssert(not IsPointInRegion(area, 5.0, 5.0), \"cleared west\")\n"
+        "  call BJassAssert(IsLocationInRegion(area, point), \"east remains\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, force_filters_counts_callbacks_and_alliances) {
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[1].ps, ALLIANCE_PASSIVE, true);
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer enum_count = 0\n"
+        "  integer enum_sum = 0\n"
+        "endglobals\n"
+        "function KeepNotOne takes nothing returns boolean\n"
+        "  return GetPlayerId(GetFilterPlayer()) != 1\n"
+        "endfunction\n"
+        "function CountPlayer takes nothing returns nothing\n"
+        "  set enum_count = enum_count + 1\n"
+        "  set enum_sum = enum_sum + GetPlayerId(GetEnumPlayer())\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local force picked = CreateForce()\n"
+        "  local force allies = CreateForce()\n"
+        "  local force enemies = CreateForce()\n"
+        "  call ForceEnumPlayersCounted(picked, Condition(function KeepNotOne), 2)\n"
+        "  call BJassAssert(IsPlayerInForce(Player(0), picked), \"first accepted player\")\n"
+        "  call BJassAssert(not IsPlayerInForce(Player(1), picked), \"filtered player\")\n"
+        "  call BJassAssert(IsPlayerInForce(Player(2), picked), \"limit counts accepted players\")\n"
+        "  call ForForce(picked, function CountPlayer)\n"
+        "  call BJassAssert(enum_count == 2, \"force callback count\")\n"
+        "  call BJassAssert(enum_sum == 2, \"enum player context\")\n"
+        "  call BJassAssert(GetEnumPlayer() == null, \"enum context restored\")\n"
+        "  call ForceEnumAllies(allies, Player(0), null)\n"
+        "  call BJassAssert(IsPlayerInForce(Player(1), allies), \"allied player\")\n"
+        "  call ForceEnumEnemies(enemies, Player(0), Condition(function KeepNotOne))\n"
+        "  call BJassAssert(not IsPlayerInForce(Player(1), enemies), \"ally excluded from enemies\")\n"
+        "  call BJassAssert(IsPlayerInForce(Player(2), enemies), \"enemy included\")\n"
+        "  call ForceClear(picked)\n"
+        "  call BJassAssert(not IsPlayerInForce(Player(0), picked), \"force clear\")\n"
+        "endfunction\n"
+    ));
+}
+
+/* =========================================================================
+ * Quests — pure JASS tests using IsQuest* getters and BJassAssert
+ * ========================================================================= */
+
+TEST(wc3_jass_map, quest_created_is_non_null) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call BJassAssert(q != null, \"CreateQuest returned null\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_flags_default_state) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call BJassAssert(not IsQuestCompleted(q),  \"completed should default false\")\n"
+        "  call BJassAssert(not IsQuestFailed(q),     \"failed should default false\")\n"
+        "  call BJassAssert(not IsQuestDiscovered(q), \"discovered should default false\")\n"
+        "  call BJassAssert(not IsQuestRequired(q),   \"required should default false\")\n"
+        "  call BJassAssert(IsQuestEnabled(q),        \"enabled should default true\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_discovered_required_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call QuestSetDiscovered(q, true)\n"
+        "  call QuestSetRequired(q, true)\n"
+        "  call BJassAssert(IsQuestDiscovered(q), \"should be discovered\")\n"
+        "  call BJassAssert(IsQuestRequired(q),   \"should be required\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_completed_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call QuestSetCompleted(q, true)\n"
+        "  call BJassAssert(IsQuestCompleted(q), \"should be completed\")\n"
+        "  call BJassAssert(not IsQuestFailed(q), \"failed stays false\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_completed_null_handle_is_ignored) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call QuestSetCompleted(null, true)\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_failed_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call QuestSetFailed(q, true)\n"
+        "  call BJassAssert(IsQuestFailed(q), \"should be failed\")\n"
+        "  call BJassAssert(not IsQuestCompleted(q), \"completed stays false\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_enabled_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  call QuestSetEnabled(q, true)\n"
+        "  call BJassAssert(IsQuestEnabled(q), \"should be enabled\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_multiple_independent) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q1 = CreateQuest()\n"
+        "  local quest q2 = CreateQuest()\n"
+        "  call QuestSetCompleted(q1, true)\n"
+        "  call BJassAssert(IsQuestCompleted(q1),      \"q1 should be completed\")\n"
+        "  call BJassAssert(not IsQuestCompleted(q2),  \"q2 should not be completed\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_item_completed_roundtrip) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  local questitem item = QuestCreateItem(q)\n"
+        "  call BJassAssert(not IsQuestItemCompleted(item), \"item defaults incomplete\")\n"
+        "  call QuestItemSetCompleted(item, true)\n"
+        "  call BJassAssert(IsQuestItemCompleted(item), \"item should be completed\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_multiple_items_independent) {
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  local questitem a = QuestCreateItem(q)\n"
+        "  local questitem b = QuestCreateItem(q)\n"
+        "  call QuestItemSetCompleted(a, true)\n"
+        "  call BJassAssert(IsQuestItemCompleted(a),      \"item a should be complete\")\n"
+        "  call BJassAssert(not IsQuestItemCompleted(b),  \"item b should be incomplete\")\n"
+        "endfunction\n"
+    ));
+}
+
+TEST(wc3_jass_map, quest_complete_cheat_marks_quest_and_objectives) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "quest", "complete", "0" };
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "  local questitem a = QuestCreateItem(q)\n"
+        "  local questitem b = QuestCreateItem(q)\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+
+    G_ClientCommand(&g_edicts[0], 3, command);
+
+    T_ASSERT(level.quests[0].completed);
+    T_ASSERT(level.quests[0].items[0].completed);
+    T_ASSERT(level.quests[0].items[1].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, quest_complete_all_cheat_marks_every_allocated_quest) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "quest", "complete", "all" };
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q1 = CreateQuest()\n"
+        "  local quest q2 = CreateQuest()\n"
+        "  local questitem item = QuestCreateItem(q2)\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+
+    G_ClientCommand(&g_edicts[0], 3, command);
+
+    T_ASSERT(level.quests[0].completed);
+    T_ASSERT(level.quests[1].completed);
+    T_ASSERT(level.quests[1].items[0].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, cheat_console_feedback_skips_disconnected_client_transport) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    void (*old_write)(pfWriteType_t, void const *);
+    void (*old_unicast)(edict_t *);
+    cstring_t command[] = { "quest", "complete", "all" };
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  local quest q = CreateQuest()\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    old_write = gi.Write;
+    old_unicast = gi.unicast;
+    gi.CvarString = result_cheats_cvar;
+    gi.Write = cheat_console_capture_write;
+    gi.unicast = cheat_console_capture_unicast;
+    game.clients[0].connected = false;
+    cheat_console_capture_reset();
+
+    G_ClientCommand(&g_edicts[0], 3, command);
+
+    T_ASSERT(level.quests[0].completed);
+    T_EQ(cheat_console_unicasts, 0);
+    T_EQ(cheat_console_opcode, -1);
+    T_ASSERT(!cheat_console_text[0]);
+
+    gi.CvarString = old_cvar;
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+}
+
+TEST(wc3_jass_map, trigger_fire_cheat_bypasses_disabled_conditions_and_can_supply_selected_context) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    char index_text[16];
+    cstring_t command[] = { "trigger", "fire", index_text, "selected" };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function Never takes nothing returns boolean\n"
+        "  return false\n"
+        "endfunction\n"
+        "function DebugComplete takes nothing returns nothing\n"
+        "  if GetTriggerUnit() != null and GetTriggerPlayer() == Player(0) then\n"
+        "    call QuestSetCompleted(debugQuest, true)\n"
+        "  endif\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set debugQuest = CreateQuest()\n"
+        "  call TriggerAddCondition(t, Condition(function Never))\n"
+        "  call TriggerAddAction(t, function DebugComplete)\n"
+        "  call DisableTrigger(t)\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(level.num_triggers > 0);
+    snprintf(index_text, sizeof(index_text), "%u", (unsigned)(level.num_triggers - 1));
+
+    g_edicts[0].inuse = true;
+    g_edicts[0].health.value = 1.0f;
+    g_edicts[0].s.player = 0;
+    g_edicts[0].selected = 1u << game.clients[0].ps.number;
+
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+    G_ClientCommand(&g_edicts[0], 4, command);
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, cinematic_list_rejects_helpers_and_victory_defeat_triggers) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    void (*old_write)(pfWriteType_t, void const *);
+    void (*old_unicast)(edict_t *);
+    cstring_t command[] = { "cinematic", "list" };
+
+    T_ASSERT(run_test_jass(
+        "function Intro_Cinematic_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Intro_Cinematic_Skip_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Intro_Time_Stop_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function End_Cinematic_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Victory_Cheat_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Victory_Found_Medivh_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Defeat_Thrall_Dies_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger a = CreateTrigger()\n"
+        "  local trigger b = CreateTrigger()\n"
+        "  local trigger c = CreateTrigger()\n"
+        "  local trigger d = CreateTrigger()\n"
+        "  local trigger e = CreateTrigger()\n"
+        "  local trigger f = CreateTrigger()\n"
+        "  local trigger g = CreateTrigger()\n"
+        "  call TriggerAddAction(a, function Intro_Cinematic_Actions)\n"
+        "  call TriggerAddAction(b, function Intro_Cinematic_Skip_Actions)\n"
+        "  call TriggerAddAction(c, function Intro_Time_Stop_Actions)\n"
+        "  call TriggerAddAction(d, function End_Cinematic_Actions)\n"
+        "  call TriggerAddAction(e, function Victory_Cheat_Actions)\n"
+        "  call TriggerAddAction(f, function Victory_Found_Medivh_Actions)\n"
+        "  call TriggerAddAction(g, function Defeat_Thrall_Dies_Actions)\n"
+        "endfunction\n"
+    ));
+
+    old_cvar = gi.CvarString;
+    old_write = gi.Write;
+    old_unicast = gi.unicast;
+    gi.CvarString = result_cheats_cvar;
+    gi.Write = cheat_console_capture_write;
+    gi.unicast = cheat_console_capture_unicast;
+    game.clients[0].connected = true;
+    cheat_console_capture_reset();
+
+    G_ClientCommand(&g_edicts[0], 2, command);
+
+    T_ASSERT(strstr(cheat_console_text, "Intro_Cinematic_Actions") != NULL);
+    T_ASSERT(strstr(cheat_console_text, "End_Cinematic_Actions") != NULL);
+    T_ASSERT(strstr(cheat_console_text, "Intro_Cinematic_Skip_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "Intro_Time_Stop_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "Victory_Cheat_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "Victory_Found_Medivh_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "Defeat_Thrall_Dies_Actions") == NULL);
+    T_EQ(cheat_console_opcode, svc_console_print);
+    T_ASSERT(cheat_console_unicasts > 0);
+
+    game.clients[0].connected = false;
+    gi.CvarString = old_cvar;
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+}
+
+TEST(wc3_jass_map, objective_list_finds_real_victory_progression_not_cheat_or_defeat) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    void (*old_write)(pfWriteType_t, void const *);
+    void (*old_unicast)(edict_t *);
+    cstring_t command[] = { "objective", "list" };
+
+    T_ASSERT(run_test_jass(
+        "function Victory_Cheat_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Victory_Found_Medivh_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function Defeat_Thrall_Dies_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function End_Cinematic_Actions takes nothing returns nothing\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger a = CreateTrigger()\n"
+        "  local trigger b = CreateTrigger()\n"
+        "  local trigger c = CreateTrigger()\n"
+        "  local trigger d = CreateTrigger()\n"
+        "  call TriggerAddAction(a, function Victory_Cheat_Actions)\n"
+        "  call TriggerAddAction(b, function Victory_Found_Medivh_Actions)\n"
+        "  call TriggerAddAction(c, function Defeat_Thrall_Dies_Actions)\n"
+        "  call TriggerAddAction(d, function End_Cinematic_Actions)\n"
+        "endfunction\n"
+    ));
+
+    old_cvar = gi.CvarString;
+    old_write = gi.Write;
+    old_unicast = gi.unicast;
+    gi.CvarString = result_cheats_cvar;
+    gi.Write = cheat_console_capture_write;
+    gi.unicast = cheat_console_capture_unicast;
+    game.clients[0].connected = true;
+    cheat_console_capture_reset();
+
+    G_ClientCommand(&g_edicts[0], 2, command);
+
+    T_ASSERT(strstr(cheat_console_text, "Victory_Found_Medivh_Actions") != NULL);
+    T_ASSERT(strstr(cheat_console_text, "Victory_Cheat_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "Defeat_Thrall_Dies_Actions") == NULL);
+    T_ASSERT(strstr(cheat_console_text, "End_Cinematic_Actions") == NULL);
+    T_EQ(cheat_console_opcode, svc_console_print);
+    T_ASSERT(cheat_console_unicasts > 0);
+
+    game.clients[0].connected = false;
+    gi.CvarString = old_cvar;
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+}
+
+TEST(wc3_jass_map, objective_complete_executes_completion_trigger) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    char index_text[16];
+    cstring_t command[] = { "objective", "complete", index_text };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function Victory_Found_Medivh_Actions takes nothing returns nothing\n"
+        "  call QuestSetCompleted(debugQuest, true)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set debugQuest = CreateQuest()\n"
+        "  call TriggerAddAction(t, function Victory_Found_Medivh_Actions)\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(level.num_triggers > 0);
+    snprintf(index_text, sizeof(index_text), "%u", (unsigned)(level.num_triggers - 1));
+
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+    G_ClientCommand(&g_edicts[0], 3, command);
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, objc_alias_executes_objective_complete) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    char index_text[16];
+    cstring_t command[] = { "objc", index_text };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function Victory_Found_Medivh_Actions takes nothing returns nothing\n"
+        "  call QuestSetCompleted(debugQuest, true)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set debugQuest = CreateQuest()\n"
+        "  call TriggerAddAction(t, function Victory_Found_Medivh_Actions)\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(level.num_triggers > 0);
+    snprintf(index_text, sizeof(index_text), "%u", (unsigned)(level.num_triggers - 1));
+
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+    G_ClientCommand(&g_edicts[0], 2, command);
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, cinematic_play_cheat_executes_authored_trigger_actions) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    char index_text[16];
+    cstring_t command[] = { "cinematic", "play", index_text };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function CinematicNever takes nothing returns boolean\n"
+        "  return false\n"
+        "endfunction\n"
+        "function Intro_Cinematic_Actions takes nothing returns nothing\n"
+        "  call QuestSetCompleted(debugQuest, true)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set debugQuest = CreateQuest()\n"
+        "  call TriggerAddCondition(t, Condition(function CinematicNever))\n"
+        "  call TriggerAddAction(t, function Intro_Cinematic_Actions)\n"
+        "  call DisableTrigger(t)\n"
+        "endfunction\n"
+    ));
+    T_ASSERT(level.num_triggers > 0);
+    snprintf(index_text, sizeof(index_text), "%u", (unsigned)(level.num_triggers - 1));
+
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+    G_ClientCommand(&g_edicts[0], 3, command);
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, cinematic_stop_cheat_uses_end_cinematic_event_handler) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "cinematic", "stop" };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function End_Cinematic_Actions takes nothing returns nothing\n"
+        "  call QuestSetCompleted(debugQuest, true)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set debugQuest = CreateQuest()\n"
+        "  call TriggerRegisterPlayerEvent(t, Player(0), EVENT_PLAYER_END_CINEMATIC)\n"
+        "  call TriggerAddAction(t, function End_Cinematic_Actions)\n"
+        "endfunction\n"
+    ));
+
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+    G_ClientCommand(&g_edicts[0], 2, command);
+    G_RunEvents();
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, jass_cheat_starts_named_zero_argument_function) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "jass", "DebugComplete" };
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  quest debugQuest = null\n"
+        "endglobals\n"
+        "function DebugComplete takes nothing returns nothing\n"
+        "  call QuestSetCompleted(debugQuest, true)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set debugQuest = CreateQuest()\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+
+    G_ClientCommand(&g_edicts[0], 2, command);
+    jass_runevents(level.vm);
+
+    T_ASSERT(level.quests[0].completed);
+
+    gi.CvarString = old_cvar;
+}
+
+/* =========================================================================
+ * Win conditions — JASS calls RemovePlayer, C checks the event queue
+ * ========================================================================= */
+
+TEST(wc3_jass_map, defeat_publishes_event) {
+    bool ok = run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call RemovePlayer(Player(0), PLAYER_GAME_RESULT_DEFEAT)\n"
+        "  call BJassAssert(GetPlayerState(Player(0), PLAYER_STATE_GAME_RESULT) == 1, \"defeat result\")\n"
+        "  call BJassAssert(GetPlayerSlotState(Player(0)) == PLAYER_SLOT_STATE_LEFT, \"defeated player left\")\n"
+        "endfunction\n"
+    );
+    T_ASSERT(ok);
+    T_ASSERT( event_in_queue(EVENT_PLAYER_DEFEAT));
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_VICTORY));
+}
+
+TEST(wc3_jass_map, victory_publishes_event) {
+    bool ok = run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call RemovePlayer(Player(0), PLAYER_GAME_RESULT_VICTORY)\n"
+        "  call BJassAssert(GetPlayerState(Player(0), PLAYER_STATE_GAME_RESULT) == 0, \"victory result\")\n"
+        "  call BJassAssert(GetPlayerSlotState(Player(0)) == PLAYER_SLOT_STATE_LEFT, \"victorious player left\")\n"
+        "endfunction\n"
+    );
+    T_ASSERT(ok);
+    T_ASSERT( event_in_queue(EVENT_PLAYER_VICTORY));
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_DEFEAT));
+}
+
+TEST(wc3_jass_map, win_cheat_uses_remove_player_result_pipeline) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "win" };
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+
+    T_ASSERT(game.clients[0].jass.removed);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_GAME_RESULT], 0);
+    T_ASSERT(event_in_queue(EVENT_PLAYER_VICTORY));
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_DEFEAT));
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, lose_cheat_uses_remove_player_result_pipeline) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t);
+    cstring_t command[] = { "lose" };
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "endfunction\n"
+    ));
+    old_cvar = gi.CvarString;
+    gi.CvarString = result_cheats_cvar;
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+
+    T_ASSERT(game.clients[0].jass.removed);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_GAME_RESULT], 1);
+    T_ASSERT(event_in_queue(EVENT_PLAYER_DEFEAT));
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_VICTORY));
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_jass_map, paused_victory_drains_result_event_and_releases_fallback) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  boolean victoryFired = false\n"
+        "endglobals\n"
+        "function onEndCinematic takes nothing returns nothing\n"
+        "  call RemovePlayer(Player(0), PLAYER_GAME_RESULT_VICTORY)\n"
+        "  call PauseGame(true)\n"
+        "endfunction\n"
+        "function onVictory takes nothing returns nothing\n"
+        "  set victoryFired = true\n"
+        "endfunction\n"
+        "function verifyVictory takes nothing returns nothing\n"
+        "  call BJassAssert(victoryFired, \"victory event stranded behind pause\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger endTrigger = CreateTrigger()\n"
+        "  local trigger victoryTrigger = CreateTrigger()\n"
+        "  call TriggerRegisterPlayerEvent(endTrigger, Player(0), EVENT_PLAYER_END_CINEMATIC)\n"
+        "  call TriggerAddAction(endTrigger, function onEndCinematic)\n"
+        "  call TriggerRegisterPlayerEvent(victoryTrigger, Player(0), EVENT_PLAYER_VICTORY)\n"
+        "  call TriggerAddAction(victoryTrigger, function onVictory)\n"
+        "endfunction\n"
+    ));
+
+    game.clients[0].connected = true;
+    game.clients[0].ps.client_ui_state = CLIENT_UI_CINEMATIC;
+    G_PublishEvent(&g_edicts[0], EVENT_PLAYER_END_CINEMATIC);
+
+    /* This is the normal frame ordering: the first event pass schedules a
+     * JASS action, and that action publishes VICTORY too late for the pass. */
+    G_RunEvents();
+    jass_runevents(level.vm);
+    T_ASSERT(level.script_paused);
+    T_EQ(game.clients[0].jass.pending_game_result, 1);
+    T_ASSERT(level.events.read < game.clients[0].jass.pending_game_result_event);
+
+    G_DrainPausedResultEvents();
+    T_EQ(level.events.read, level.events.write);
+    jass_callbyname(level.vm, "verifyVictory", true);
+    jass_runevents(level.vm);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+
+    /* Stock CustomVictoryDialogBJ pauses while the map can still be in
+     * cinematic UI state. The fallback must not wait for another sim frame. */
+    UI_FlushPendingGameResults();
+    T_EQ(game.clients[0].jass.pending_game_result, 0);
+}
+
+
+TEST(wc3_jass_map, score_transition_defers_map_change_and_falls_back_without_viewers) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    __typeof__(gi.ResolveMap) old_resolver = gi.ResolveMap;
+    uint32_t const clients = game.max_clients;
+
+    G_ResetScriptSave();
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    gi.MenuAction = capture_victory_menu_action;
+    gi.ResolveMap = NULL; /* This controller test exercises deferred routing, not archive lookup. */
+    /* No connected recipient: the score FDF cannot be displayed. The exact
+     * outgoing destination must still execute, and only once. */
+    game.max_clients = 0;
+    G_RequestChangeLevel("Maps\\Campaign\\Human03.w3m", true);
+    T_ASSERT(G_ScoreTransitionPending());
+    T_STREQ(victory_menu_action, "");
+    G_FlushScoreTransition();
+    T_ASSERT(!G_ScoreTransitionPending());
+    T_ASSERT(!G_ScoreTransitionTerminal()); /* no displayed window, no terminal pause */
+    T_STREQ(victory_menu_action, "level");
+    T_STREQ(victory_menu_arg, "Maps\\Campaign\\Human03.w3m");
+    victory_menu_action[0] = '\0';
+    G_FlushScoreTransition();
+    T_STREQ(victory_menu_action, "");
+
+    game.max_clients = clients;
+    gi.MenuAction = old_menu_action;
+    gi.ResolveMap = old_resolver;
+}
+
+/* A victory/defeat dialog may dispatch its action while the server is
+ * paused, so the next G_RunFrame never happens. The command boundary must
+ * finalize without a further simulation tick and must still fall through to
+ * the campaign menu if no score-screen viewer can be shown. */
+TEST(wc3_jass_map, paused_result_command_finalizes_without_another_frame) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    uint32_t const old_max_clients = game.max_clients;
+    bool const old_script_paused = level.script_paused;
+    bool const old_modal_paused = level.modal_paused;
+    char old_map[MAX_PATHLEN];
+    cstring_t command[] = { "gameresult_quit" };
+
+    reset_entities();
+    setup_test_world();
+    G_ResetScriptSave();
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    level.mapinfo = NULL;
+    level.script_paused = true;
+    level.modal_paused = false;
+    game.max_clients = 0; /* test the existing missing-recipient fallback */
+    gi.MenuAction = capture_victory_menu_action;
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+
+    uint32_t const outgoing_frame = level.framenum;
+    G_ClientCommand(&g_edicts[0], 1, command);
+    T_EQ(level.framenum, outgoing_frame); /* no G_RunFrame was required */
+    T_ASSERT(!G_ScoreTransitionPending());
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    /* No second destination is sent by a subsequent empty score flush. */
+    victory_menu_action[0] = '\0';
+    G_FlushScoreTransition();
+    T_STREQ(victory_menu_action, "");
+
+    gi.MenuAction = old_menu_action;
+    level.mapinfo = old_mapinfo;
+    level.script_paused = old_script_paused;
+    level.modal_paused = old_modal_paused;
+    game.max_clients = old_max_clients;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+}
+
+TEST(wc3_jass_map, campaign_quit_waits_for_score_screen_before_campaign_menu) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    uint32_t const clients = game.max_clients;
+    PATHSTR old_map;
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    strlcpy(level.map_path, "Maps\\FrozenThrone\\Campaign\\UndeadX07c.w3x",
+            sizeof(level.map_path));
+    setup_test_world(); /* no human-controlled peers: single-player semantics */
+    G_ResetScriptSave();
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    gi.MenuAction = capture_victory_menu_action;
+    game.max_clients = 0; /* cannot present a modal; verify deferred fallback */
+
+    G_RequestQuitGame();
+    T_ASSERT(G_ScoreTransitionPending());
+    T_STREQ(victory_menu_action, "");
+    G_FlushScoreTransition();
+    T_ASSERT(!G_ScoreTransitionPending());
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    game.max_clients = clients;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, victory_continue_runs_blizzard_continuation_while_paused) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    __typeof__(gi.ResolveMap) old_resolver = gi.ResolveMap;
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    cstring_t command[] = { "hidegameresult" };
+
+    T_ASSERT(run_test_jass(
+        "function CustomVictoryOkBJ takes nothing returns nothing\n"
+        "  call PauseGame(false)\n"
+        "  call ChangeLevel(\"Maps\\Campaign\\Human03.w3m\", false)\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "endfunction\n"
+    ));
+
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    gi.MenuAction = capture_victory_menu_action;
+    gi.ResolveMap = NULL; /* The test map path is already resolved in this harness. */
+    gi.Write = victory_noop_write;
+    gi.unicast = victory_noop_unicast;
+    level.script_paused = true;
+    game.clients[0].ps.stats[PLAYERSTATE_GAME_RESULT] = 0;
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+
+    T_ASSERT(!level.script_paused);
+    T_STREQ(victory_menu_action, "level");
+    T_STREQ(victory_menu_arg, "Maps\\Campaign\\Human03.w3m");
+
+    gi.MenuAction = old_menu_action;
+    gi.ResolveMap = old_resolver;
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+}
+
+TEST(wc3_jass_map, force_campaign_select_defers_until_endgame) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    gi.MenuAction = capture_victory_menu_action;
+
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call ForceCampaignSelectScreen()\n"
+        "endfunction\n"
+    ));
+
+    T_ASSERT(level.campaign_select_on_end);
+    T_STREQ(victory_menu_action, "");
+    T_STREQ(victory_menu_arg, "");
+
+    G_RequestEndGame(false);
+
+    T_ASSERT(!level.campaign_select_on_end);
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, endgame_without_campaign_select_returns_to_main_menu) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    bool old_campaign_select = level.campaign_select_on_end;
+    char old_map[MAX_PATHLEN];
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    level.mapinfo = NULL;
+    level.campaign_select_on_end = false;
+    strlcpy(level.map_path, "Maps\\Melee\\Test.w3m", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+
+    G_RequestEndGame(false);
+
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_main");
+
+    level.mapinfo = old_mapinfo;
+    level.campaign_select_on_end = old_campaign_select;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, endgame_campaign_map_returns_to_campaign_select) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    bool old_campaign_select = level.campaign_select_on_end;
+    char old_map[MAX_PATHLEN];
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    level.mapinfo = NULL;
+    level.campaign_select_on_end = false;
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+
+    G_RequestEndGame(false);
+
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    level.mapinfo = old_mapinfo;
+    level.campaign_select_on_end = old_campaign_select;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, endgame_respects_legacy_campaign_race) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    bool old_campaign_select = level.campaign_select_on_end;
+    int32_t old_race = level.campaign_menu_race;
+    char old_map[MAX_PATHLEN];
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    level.mapinfo = NULL;
+    level.campaign_select_on_end = false;
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+    static cstring_t const routes[] = {
+        "menu_single_player_campaign", "menu_single_player_campaign_human",
+        "menu_single_player_campaign_orc", "menu_single_player_campaign_undead",
+        "menu_single_player_campaign_night_elf"
+    };
+    FOR_LOOP(i, 5) {
+        level.campaign_menu_race = (int32_t)i;
+        victory_menu_arg[0] = '\0';
+        G_RequestEndGame(false);
+        T_STREQ(victory_menu_arg, routes[i]);
+    }
+    level.campaign_menu_race = 4;
+    G_RequestQuitGame();
+    T_STREQ(victory_menu_arg, routes[4]);
+    G_TestResetScoreTransition();
+    level.campaign_menu_race = 99;
+    G_RequestEndGame(false);
+    T_STREQ(victory_menu_arg, routes[0]);
+    level.mapinfo = old_mapinfo;
+    level.campaign_select_on_end = old_campaign_select;
+    level.campaign_menu_race = old_race;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, escape_menu_quit_campaign_returns_to_campaign_select) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    cstring_t command[] = { "menu_quit_game" };
+    char old_map[MAX_PATHLEN];
+    uint32_t const clients = game.max_clients;
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    level.mapinfo = NULL;
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+    game.max_clients = 0; /* Exercise fallback when no score-screen recipient exists. */
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+    T_STREQ(victory_menu_action, "");
+    T_ASSERT(G_ScoreTransitionPending());
+    G_FlushScoreTransition();
+
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    level.mapinfo = old_mapinfo;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    game.max_clients = clients;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, escape_menu_quit_frozen_throne_campaign_returns_to_campaign_select) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    cstring_t command[] = { "menu_quit_game" };
+    char old_map[MAX_PATHLEN];
+    uint32_t const clients = game.max_clients;
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    level.mapinfo = NULL;
+    strlcpy(level.map_path, "Maps/FrozenThrone/Campaign/HumanX02.w3x", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+    game.max_clients = 0;
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+    T_STREQ(victory_menu_action, "");
+    T_ASSERT(G_ScoreTransitionPending());
+    G_FlushScoreTransition();
+
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_single_player_campaign");
+
+    level.mapinfo = old_mapinfo;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    game.max_clients = clients;
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, escape_menu_quit_non_campaign_returns_to_main_menu) {
+    void (*old_menu_action)(cstring_t, cstring_t) = gi.MenuAction;
+    mapInfo_t const *old_mapinfo = level.mapinfo;
+    cstring_t command[] = { "menu_quit_game" };
+    char old_map[MAX_PATHLEN];
+
+    strlcpy(old_map, level.map_path, sizeof(old_map));
+    victory_menu_action[0] = '\0';
+    victory_menu_arg[0] = '\0';
+    level.mapinfo = NULL;
+    strlcpy(level.map_path, "Maps\\FrozenThrone\\Scenario\\Monolith.w3x", sizeof(level.map_path));
+    gi.MenuAction = capture_victory_menu_action;
+
+    G_ClientCommand(&g_edicts[0], 1, command);
+
+    T_STREQ(victory_menu_action, "menu");
+    T_STREQ(victory_menu_arg, "menu_main");
+
+    level.mapinfo = old_mapinfo;
+    strlcpy(level.map_path, old_map, sizeof(level.map_path));
+    gi.MenuAction = old_menu_action;
+}
+
+TEST(wc3_jass_map, play_cinematic_queues_classic_movie_asset_path) {
+    void (*old_queue_movie)(cstring_t) = gi.QueueMovie;
+
+    cinematic_movie_path[0] = '\0';
+    gi.QueueMovie = capture_cinematic_movie;
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call PlayCinematic(\"HumanEd\")\n"
+        "endfunction\n"
+    ));
+    T_STREQ(cinematic_movie_path, "Movies\\HumanEd.mpq");
+    gi.QueueMovie = old_queue_movie;
+}
+
+TEST(wc3_jass_map, model_cinematic_queues_original_mdl_asset_path) {
+    void (*old_queue_model)(cstring_t) = gi.QueueModelCinematic;
+    cinematic_movie_path[0] = '\0';
+    gi.QueueModelCinematic = capture_cinematic_movie;
+    T_ASSERT(run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call PlayModelCinematic(\"Doodads\\\\Cinematic\\\\ArthasIllidanFight\\\\ArthasIllidanFight.mdl\")\n"
+        "endfunction\n"
+    ));
+    T_STREQ(cinematic_movie_path, "Doodads\\Cinematic\\ArthasIllidanFight\\ArthasIllidanFight.mdl");
+    gi.QueueModelCinematic = old_queue_model;
+}
+
+TEST(wc3_jass_map, neutral_remove_records_result_without_victory_or_defeat_event) {
+    bool ok = run_test_jass(
+        "function main takes nothing returns nothing\n"
+        "  call RemovePlayer(Player(0), PLAYER_GAME_RESULT_NEUTRAL)\n"
+        "  call BJassAssert(GetPlayerState(Player(0), PLAYER_STATE_GAME_RESULT) == 3, \"neutral result\")\n"
+        "  call BJassAssert(GetPlayerSlotState(Player(0)) == PLAYER_SLOT_STATE_LEFT, \"neutral player left\")\n"
+        "endfunction\n"
+    );
+    T_ASSERT(ok);
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_VICTORY));
+    T_ASSERT(!event_in_queue(EVENT_PLAYER_DEFEAT));
+}
+
+#endif /* BZ_TESTS */

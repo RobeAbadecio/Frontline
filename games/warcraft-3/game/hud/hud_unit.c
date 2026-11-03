@@ -1,0 +1,950 @@
+/*
+ * hud_unit.c — Server-side unit HUD data helpers.
+ */
+
+#include "hud_local.h"
+#include "hud_utils.h"
+
+typedef struct {
+    edict_t *ent;
+    uint32_t code;
+    uint32_t level;
+    gameCommandButton_t *button;
+} commandCooldownParams_t;
+
+/* Focused diagnostics for the worker repair command card.  This is opt-in
+ * because command buttons are rebuilt frequently while a unit is selected. */
+static bool G_RepairCommandDebugEnabled(void) {
+    return gi.CvarString && atoi(gi.CvarString("wc3_repair_command_debug", "0")) != 0;
+}
+
+static bool G_IsRepairCommandDebugUnit(edict_t const *ent) {
+    cstring_t id;
+    if (!ent) return false;
+    id = GetClassName(ent->class_id);
+    return id && (!strcmp(id, "hpea") || !strcmp(id, "opeo") ||
+                  !strcmp(id, "ewsp") || !strcmp(id, "uaco"));
+}
+
+static bool G_IsRepairDiagnosticRawcode(cstring_t rawcode);
+
+static void G_RepairCommandTrace(edict_t const *ent, cstring_t rawcode, cstring_t stage,
+                                 ability_t const *ability, bool eligible, bool emitted) {
+    if (!G_RepairCommandDebugEnabled() || !G_IsRepairCommandDebugUnit(ent)) return;
+    fprintf(stderr,
+            "WC3_REPAIR_BUTTON unit=%ld id=%.4s rawcode=%.4s stage=%s handler=%s flags=0x%x eligible=%d emitted=%d\n",
+            (long)(ent - g_edicts), GetClassName(ent->class_id), rawcode ? rawcode : "----",
+            stage ? stage : "?", ability && ability->classname ? ability->classname : "<unresolved>",
+            ability ? ability->flags : 0, eligible ? 1 : 0, emitted ? 1 : 0);
+}
+
+static void G_RepairAbilityDataTrace(edict_t const *ent, cstring_t rawcode) {
+    AbilityData_t const *data;
+    if (!G_RepairCommandDebugEnabled() || !G_IsRepairCommandDebugUnit(ent) || !G_IsRepairDiagnosticRawcode(rawcode)) return;
+    data = G_AbilityDataName(rawcode);
+    fprintf(stderr,
+            "WC3_REPAIR_BUTTON unit=%ld id=%.4s rawcode=%.4s ability_data=id=%.4s code=%.4s uberAlias=%.4s resolved=%s\n",
+            (long)(ent - g_edicts), GetClassName(ent->class_id), rawcode,
+            data && data->id ? GetClassName(data->id) : "----",
+            data && data->code ? GetClassName(data->code) : "----",
+            data && data->uberAlias ? GetClassName(data->uberAlias) : "----",
+            FindAbilityForCommand(rawcode) && FindAbilityForCommand(rawcode)->classname ?
+                FindAbilityForCommand(rawcode)->classname : "<unresolved>");
+}
+
+static bool G_IsRepairDiagnosticRawcode(cstring_t rawcode) {
+    return rawcode && strlen(rawcode) == 4 &&
+           (!strcmp(rawcode, "Ahrp") || !strcmp(rawcode, "Arep") ||
+            !strcmp(rawcode, "Aren") || !strcmp(rawcode, "Auns"));
+}
+
+static void G_SetCommandCooldown(commandCooldownParams_t const *params) {
+    abilityCooldownWindow_t window;
+    if (!params || !params->button) return;
+    params->button->cooldown = S_SpellCooldownFraction(params->ent, params->code, params->level);
+    if (!S_SpellCooldownWindow(params->ent, params->code, &window)) {
+        params->button->cooldown_start_time = 0;
+        params->button->cooldown_end_time = 0;
+    } else {
+        params->button->cooldown_start_time = window.start_time;
+        params->button->cooldown_end_time = window.end_time;
+    }
+}
+
+static cstring_t G_ResearchField(cstring_t field, bool research) {
+    static char buffer[64];
+
+    if (!research) {
+        return field;
+    }
+    snprintf(buffer, sizeof(buffer), "Research%s", field);
+    return buffer;
+}
+
+cstring_t GetBuildCommand(unitRace_t race) {
+    switch (race) {
+        case RACE_HUMAN: return STR_CmdBuildHuman;
+        case RACE_ORC: return STR_CmdBuildOrc;
+        case RACE_UNDEAD: return STR_CmdBuildUndead;
+        case RACE_NIGHTELF: return STR_CmdBuildNightElf;
+        default: return STR_CmdBuild;
+    }
+}
+
+static cstring_t G_CommandArtCode(edict_t *ent, cstring_t code) {
+    if (!strcmp(code, STR_CmdBuild)) {
+        return GetBuildCommand(WC3_RaceFromString(ent->data.UnitData->race));
+    }
+    return code;
+}
+
+static cstring_t G_RemoveQuotes(cstring_t text) {
+    static char buffers[4][1024];
+    static uint32_t cursor;
+    string_t out = buffers[cursor++ & 3];
+    size_t len;
+
+    out[0] = '\0';
+    if (!text) {
+        return out;
+    }
+    len = strlen(text);
+    if (len >= 2 && text[0] == '"' && text[len - 1] == '"') {
+        len = MIN(len - 2, sizeof(buffers[0]) - 1);
+        memcpy(out, text + 1, len);
+        out[len] = '\0';
+    } else {
+        strlcpy(out, text, sizeof(buffers[0]));
+    }
+    return out;
+}
+
+static cstring_t G_AbilityString(cstring_t classname, cstring_t field) {
+    return G_AbilityDataText(classname, field);
+}
+
+static cstring_t G_ProcessTooltipString(cstring_t input) {
+    static char buffers[4][1024];
+    static uint32_t cursor;
+    string_t out = buffers[cursor++ & 3];
+
+    out[0] = '\0';
+    if (!input) {
+        return out;
+    }
+    for (cstring_t p = input; *p && strlen(out) < sizeof(buffers[0]) - 1; p++) {
+        if (*p == '<') {
+            char classname[16];
+            char field[16];
+            cstring_t replacement;
+            int matched = sscanf(p, "<%15[^,],%15[^>]>", classname, field);
+
+            if (matched == 2 && (replacement = G_AbilityString(classname, field))) {
+                strncat(out, replacement, sizeof(buffers[0]) - strlen(out) - 1);
+                p += strlen(classname) + strlen(field) + 2;
+                continue;
+            }
+        }
+        strncat(out, p, 1);
+    }
+    return out;
+}
+
+static cstring_t G_StringForLevel(cstring_t text, uint32_t level) {
+    if (!text || level == 0) {
+        return text;
+    }
+    PARSE_LIST(text, perlevel, parse_segment) {
+        if (level > 1) {
+            level--;
+        } else {
+            return perlevel;
+        }
+    }
+    return text;
+}
+
+static cstring_t G_FormatTooltipLevel(cstring_t input, uint32_t level) {
+    static char buffers[4][1024];
+    static uint32_t cursor;
+    string_t out = buffers[cursor++ & 3];
+    string_t const out_end = out + sizeof(buffers[0]) - 1;
+
+    if (!input) {
+        out[0] = '\0';
+        return out;
+    }
+    while (*input && out < out_end) {
+        if (level && input[0] == '%' && input[1] == 'd') {
+            char number[16];
+            size_t count;
+
+            snprintf(number, sizeof(number), "%u", (unsigned)level);
+            count = MIN(strlen(number), (size_t)(out_end - out));
+            memcpy(out, number, count);
+            out += count;
+            input += 2;
+            continue;
+        }
+        *out++ = *input++;
+    }
+    *out = '\0';
+    return buffers[(cursor - 1) & 3];
+}
+
+static cstring_t G_CleanTooltipString(cstring_t text, uint32_t level) {
+    return G_RemoveQuotes(G_FormatTooltipLevel(
+        G_ProcessTooltipString(G_StringForLevel(text, level)), level));
+}
+
+static cstring_t G_UIArtPath(cstring_t art) {
+    if (!art || !*art) {
+        return art;
+    }
+    return Theme_String(art, art);
+}
+
+cstring_t G_CommandButtonValue(cstring_t normal, cstring_t alternate, bool toggle_on) {
+    /* Un* fields are optional in retail ability data. Keep the normal authored
+     * value while showing the active glow when no alternate value is supplied. */
+    return toggle_on && alternate && *alternate ? alternate : normal;
+}
+
+bool G_CommandButtonToggleOn(edict_t *ent, abilityitem_t const *item, bool research, int toggle_state) {
+    abilityCall_t call;
+    if (research || !ent || !item || !item->ability) return false;
+    if (toggle_state >= 0) return toggle_state != 0;
+    call = MAKE(abilityCall_t, .item = item);
+    return S_AbilityMessage(ent, A_TOGGLE_ON, &call);
+}
+
+static bool G_BuildCommandButtonState(edict_t *ent, cstring_t code, bool research, uint32_t level, int toggle_state, gameCommandButton_t *button) {
+    char command_code[256];
+    char item_art_code[5];
+    char art_level[256];
+    cstring_t base_code;
+    cstring_t art_code;
+    cstring_t art;
+    cstring_t art_path;
+    cstring_t buttonpos;
+    cstring_t tip;
+    cstring_t ubertip;
+    cstring_t hotkey;
+    ability_t const *ability;
+    abilityitem_t item;
+    uint32_t ability_code = 0;
+    bool toggle_on = false;
+    bool upgrade_research = false;
+    uint32_t x = UINT_MAX;
+    uint32_t y = UINT_MAX;
+
+    if (!ent || !code || !*code || !button) {
+        return false;
+    }
+
+    /* parse_segment() returns a shared static buffer. Command-card callers
+     * commonly pass that buffer here, while tooltip level selection also uses
+     * parse_segment(). Own the command string before any nested parsing so
+     * ResearchTip/ResearchUbertip processing cannot overwrite the rawcode. */
+    UI_CopyString(command_code, sizeof(command_code), code);
+    code = command_code;
+
+    memset(button, 0, sizeof(*button));
+    ability = FindAbilityForCommand(code);
+    if (strlen(code) == 4) {
+        ability_code = G_AbilityCodeName(code);
+        base_code = GetClassName(ability_code);
+        upgrade_research = research && G_UpgradeData(ability_code)->id == ability_code;
+    } else {
+        base_code = code;
+    }
+    art_code = G_CommandArtCode(ent, code);
+    if (!ability && strlen(code) == 4) {
+        ItemData_t const *stock_item = G_ItemData(ability_code);
+        uint32_t const base_item_id = G_ItemBaseID(ability_code);
+        if (stock_item->id == ability_code && base_item_id != ability_code) {
+            memcpy(item_art_code, &base_item_id, 4);
+            item_art_code[4] = '\0';
+            art_code = item_art_code;
+        }
+    }
+    item = MAKE(abilityitem_t, .code = ability_code, .ability = ability);
+    toggle_on = G_CommandButtonToggleOn(ent, &item, research, toggle_state);
+#if BZ_COMPAT_WORKAROUNDS
+    /* RoC's Human repair command is Ahrp, with Arep as its AbilityData code
+     * alias. Its presentation is authored under Arep in CommonAbilityFunc.txt,
+     * while the requested command remains Ahrp. An authored Ahrp presentation
+     * takes precedence when present. */
+    if ((!FindConfigValue(art_code, G_ResearchField(STR_ART, research && !upgrade_research)) ||
+         !*FindConfigValue(art_code, G_ResearchField(STR_ART, research && !upgrade_research))) &&
+        !strcmp(code, "Ahrp") && !strcmp(base_code, "Arep")) {
+        art_code = base_code;
+    }
+#endif
+    art = G_CommandButtonValue(
+        FindConfigValue(art_code, G_ResearchField(STR_ART, research && !upgrade_research)),
+        toggle_on ? FindConfigValue(art_code, STR_UNART) : NULL, toggle_on);
+    buttonpos = G_CommandButtonValue(
+        FindConfigValue(art_code, G_ResearchField(STR_BUTTONPOS, research && !upgrade_research)),
+        toggle_on ? FindConfigValue(art_code, STR_UNBUTTONPOS) : NULL, toggle_on);
+    tip = G_CommandButtonValue(
+        FindConfigValue(art_code, G_ResearchField(STR_TIP, research && !upgrade_research)),
+        toggle_on ? FindConfigValue(art_code, STR_UNTIP) : NULL, toggle_on);
+    ubertip = G_CommandButtonValue(
+        FindConfigValue(art_code, G_ResearchField(STR_UBERTIP, research && !upgrade_research)),
+        toggle_on ? FindConfigValue(art_code, STR_UNUBERTIP) : NULL, toggle_on);
+    hotkey = G_CommandButtonValue(
+        FindConfigValue(art_code, G_ResearchField(STR_HOTKEY, research && !upgrade_research)),
+        toggle_on ? FindConfigValue(art_code, STR_UNHOTKEY) : NULL, toggle_on);
+    UI_CopyString(art_level, sizeof(art_level), research ? G_StringForLevel(art, level) : art);
+    art_path = G_UIArtPath(art_level);
+
+    if (buttonpos && *buttonpos) {
+        sscanf(buttonpos, "%u,%u", &x, &y);
+    }
+
+    UI_CopyString(button->art, sizeof(button->art), art_path);
+    UI_CopyString(button->tooltip, sizeof(button->tooltip), G_CleanTooltipString(tip, level));
+    UI_CopyString(button->ubertip, sizeof(button->ubertip), G_CleanTooltipString(ubertip, level));
+    UI_CopyString(button->command, sizeof(button->command), code);
+    if (!research && ability && (ability->flags & AB_AUTOCAST)) {
+        strlcpy(button->alternate, "autocast ", sizeof(button->alternate));
+        strlcat(button->alternate, code, sizeof(button->alternate));
+        gameClient_t *client = ui_current_client ? ui_current_client : G_GetPlayerClientByNumber(ent->s.player);
+        uint32_t const autocast_code = FS_SLKKey(code);
+        bool active = G_UnitAutocastIsOn(ent, autocast_code);
+
+        if (client && G_GetMainSelectedUnit(client) == ent) {
+            active = G_SelectedSubgroupAutocastAllOn(client, ent, autocast_code);
+        }
+        button->alternate_active = active ? 1 : 0;
+    }
+    hotkey = research ? G_StringForLevel(hotkey, level) : hotkey;
+    button->hotkey = hotkey && *hotkey ? *hotkey : '\0';
+    button->x = x == UINT_MAX ? 255 : (uint8_t)MIN(x, 3);
+    button->y = y == UINT_MAX ? 255 : (uint8_t)MIN(y, 2);
+    button->research = research ? 1 : 0;
+    button->level = level;
+    button->active = (uint8_t)GetAbilityIndex(ability ? ability->proc : NULL);
+    button->engaged = !research && toggle_on ? 1 : 0;
+    button->queueable = !research && ((ability && (ability->flags & AB_QUEUEABLE)) ||
+        (!ability && strlen(code)==4 && G_UnitBalance(FS_SLKKey(code))->id) ||
+        (ability && ability->proc==CAbilityCarrierCommand &&
+         (G_AbilityCode(FS_SLKKey(code))==MAKEFOURCC('F','f','i','g') ||
+          G_AbilityCode(FS_SLKKey(code))==MAKEFOURCC('F','b','o','m') ||
+          G_AbilityCode(FS_SLKKey(code))==MAKEFOURCC('F','t','r','p'))));
+    /* Stop represents the ordinary idle/default state. Hold owns the engaged
+     * state while its persistent no-chase policy is active, including after
+     * combat returns the unit to idle. */
+    if (!research && ability && ability->proc == CAbilityStop) {
+        button->engaged = !ent->orders->holding_position && ent->currentmove &&
+                          ent->currentmove->think == ai_stand;
+    } else if (!research && ability && ability->proc == CAbilityHoldPosition) {
+        button->engaged = ent->orders->holding_position ? 1 : 0;
+    }
+    if (ability_code) {
+        button->manacost = S_SpellNumber(ability_code, ABILITY_NUMBER_COST, level);
+    }
+    if (!button->art[0]) {
+        fprintf(stderr,
+                "G_BuildCommandButton: skipping missing art unit=%.4s code=%s art_code=%s raw_art=%s\n",
+                (char *)&ent->class_id,
+                base_code,
+                art_code ? art_code : "",
+                art ? art : "");
+        return false;
+    }
+    return true;
+}
+
+bool G_BuildCommandButton(edict_t *ent, cstring_t code, bool research, uint32_t level, gameCommandButton_t *button) {
+    return G_BuildCommandButtonState(ent, code, research, level, -1, button);
+}
+
+static void G_AddCommandButton(edict_t *ent,
+                               gameCommandButton_t *buttons,
+                               uint8_t max_buttons,
+                               uint8_t *count,
+                               cstring_t code,
+                               bool research,
+                               uint32_t level) {
+    if (!buttons || !count || *count >= max_buttons) {
+        return;
+    }
+    if (G_BuildCommandButton(ent, code, research, level, &buttons[*count])) {
+        if (buttons[*count].x == 255 || buttons[*count].y == 255) {
+            buttons[*count].x = *count % 4;
+            buttons[*count].y = *count / 4;
+        }
+        (*count)++;
+    }
+}
+
+/* Campaign Naga production rows reuse Buttonpos=0,0 for every trained unit.
+ * Keep the first authored occupant and move later colliding commands into
+ * free command-card cells so all production choices remain reachable. */
+static void G_ResolveNagaCommandButtonCollisions(edict_t *ent,
+                                                gameCommandButton_t *buttons,
+                                                uint8_t count) {
+    UnitData_t const *data;
+
+    if (!ent || !ent->data.UnitData || !buttons || !count) return;
+    data = ent->data.UnitData;
+    if (WC3_RaceFromString(data->race) != RACE_NAGA) return;
+
+    FOR_LOOP(i, count) {
+        bool collision = false;
+        FOR_LOOP(j, i) {
+            if (buttons[i].x == buttons[j].x && buttons[i].y == buttons[j].y) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) continue;
+
+        bool placed = false;
+        FOR_LOOP(y, 3) {
+            FOR_LOOP(x, 4) {
+                bool occupied = false;
+                FOR_LOOP(j, i) {
+                    if (buttons[j].x == x && buttons[j].y == y) {
+                        occupied = true;
+                        break;
+                    }
+                }
+                if (occupied) continue;
+                buttons[i].x = (uint8_t)x;
+                buttons[i].y = (uint8_t)y;
+                placed = true;
+                break;
+            }
+            if (placed) break;
+        }
+    }
+}
+
+static bool G_IsImplementedAbility(cstring_t code) {
+    ability_t const *ability = FindAbilityForCommand(code);
+    return S_AbilityHasCommand(ability);
+}
+
+static bool G_AncientAbilityVisible(edict_t const *unit, ability_t const *ability) {
+    return S_AncientAbilityAvailable(unit, ability);
+}
+
+bool G_UnitHasBuildMenu(edict_t const *unit) {
+    UnitProfile_t const *profile = unit ? G_UnitProfile(unit->class_id) : NULL;
+    gameClient_t *client = unit ? G_GetPlayerClientByNumber(unit->s.player) : NULL;
+
+    if (!profile || !profile->builds || !*profile->builds || !client ||
+        client->ps.number != unit->s.player) return false;
+    PARSE_LIST(profile->builds, build, parse_segment) {
+        uint32_t building_id = 0;
+        char reason[128];
+        if (strlen(build) != 4) continue;
+        memcpy(&building_id, build, sizeof(building_id));
+        buildCommandState_t const state = G_GetBuildCommandState(client, (edict_t *)unit,
+                                                                  building_id, reason, sizeof(reason));
+        if (state != BUILD_COMMAND_ABSENT && state != BUILD_COMMAND_HIDDEN) return true;
+    }
+    return false;
+}
+
+static bool G_HasCommandRawcode(gameCommandButton_t const *buttons, uint8_t count, uint32_t code) {
+    FOR_LOOP(i, count) {
+        uint32_t button_code = 0;
+        if (strlen(buttons[i].command) < 4) continue;
+        memcpy(&button_code, buttons[i].command, sizeof(button_code));
+        if (button_code == code) return true;
+    }
+    return false;
+}
+
+static void G_AddAbilityCommandButtons(edict_t *ent, gameCommandButton_t *buttons, uint8_t max_buttons,
+                                       uint8_t *count, cstring_t code) {
+    ability_t const *ability = FindAbilityForCommand(code);
+    uint8_t idx;
+    uint32_t rawcode;
+    bool researched;
+    bool research_visible;
+
+    if (G_IsRepairDiagnosticRawcode(code)) {
+        G_RepairAbilityDataTrace(ent, code);
+        G_RepairCommandTrace(ent, code, "consider", ability, S_AbilityHasCommand(ability), false);
+    }
+    if (!S_AbilityHasCommand(ability) || !G_AncientAbilityVisible(ent, ability) ||
+        strlen(code) != 4 || *count >= max_buttons) {
+        if (G_IsRepairDiagnosticRawcode(code))
+            G_RepairCommandTrace(ent, code, "filtered-command-or-capability", ability,
+                                 S_AbilityHasCommand(ability) && G_AncientAbilityVisible(ent, ability), false);
+        return;
+    }
+    memcpy(&rawcode, code, sizeof(rawcode));
+    if (!G_IsUnitAbilityAvailable(ent, rawcode)) {
+        if (G_IsRepairDiagnosticRawcode(code)) G_RepairCommandTrace(ent, code, "filtered-unavailable", ability, false, false);
+        return;
+    }
+    /* Entangle Gold Mine becomes hidden/permanent per unit while the resulting
+     * mine exists. Keep the authored command unavailable for that overlay lifetime. */
+    if (ability->proc == CAbilityEntangle && S_EntangleCommandHidden(ent, rawcode)) return;
+    /* One AA Mount per structure: the purchase button leaves once it is installed. */
+    if (ability->proc == CAbilityAAMount && S_AAMountInstalled(ent)) return;
+    researched = G_UnitAbilityResearchAvailable(ent, rawcode);
+    research_visible = G_UnitAbilityResearchVisible(ent, rawcode);
+    if (!research_visible) {
+        if (G_IsRepairDiagnosticRawcode(code)) G_RepairCommandTrace(ent, code, "filtered-research-visibility", ability, false, false);
+        return;
+    }
+    /* Stand Down only has meaning while a Burrow contains cargo. Resolve by
+     * implementation pointer rather than rawcode so custom abilities derived
+     * from Astd inherit the same visibility rule. */
+    if (ability->proc == CAbilityStandDown && (!S_CargoIsBurrow(ent) || !ent->cargo || ent->cargo->count == 0)) return;
+    if (G_HasCommandRawcode(buttons, *count, rawcode)) {
+        if (G_IsRepairDiagnosticRawcode(code)) G_RepairCommandTrace(ent, code, "filtered-duplicate", ability, true, false);
+        return;
+    }
+    idx = *count;
+    G_AddCommandButton(ent, buttons, max_buttons, count, code, false, 0);
+    if (G_IsRepairDiagnosticRawcode(code)) {
+        G_RepairCommandTrace(ent, code, "added", ability, true, *count > idx);
+    }
+    if (*count > idx) {
+        if (!researched) buttons[idx].disabled = 1;
+        G_SetCommandCooldown(&(commandCooldownParams_t){ .ent = ent, .code = rawcode, .level = 0, .button = &buttons[idx] });
+    }
+    if (!(ability->flags & AB_SEPARATE_OFF) || *count >= max_buttons) return;
+    if (G_BuildCommandButtonState(ent, code, false, 0, 1, &buttons[*count])) {
+        size_t used;
+        if (buttons[*count].x == 255 || buttons[*count].y == 255) {
+            buttons[*count].x = *count % 4;
+            buttons[*count].y = *count / 4;
+        }
+        used = strlen(buttons[*count].command);
+        snprintf(buttons[*count].command + used, sizeof(buttons[*count].command) - used, ":off");
+        if (!researched) buttons[*count].disabled = 1;
+        (*count)++;
+    }
+}
+
+static void G_DisableCommandButton(gameCommandButton_t *button, cstring_t reason) {
+    size_t used;
+
+    if (!button) return;
+    button->disabled = 1;
+    if (!reason || !*reason) return;
+    used = strlen(button->ubertip);
+    snprintf(button->ubertip + used, sizeof(button->ubertip) - used,
+             "%s|cffffcc00%s|r", used ? "|n" : "", reason);
+}
+
+static bool G_BuildHeroReviveButton(edict_t *altar, edict_t *hero, uint8_t slot,
+                                    gameCommandButton_t *button) {
+    char command[32];
+    char fallback[128];
+    cstring_t code;
+    cstring_t art;
+    cstring_t tip;
+    cstring_t ubertip;
+
+    if (!G_HeroCanBeRevivedAt(altar, hero) || !button) return false;
+    code = GetClassName(hero->class_id);
+    art = FindConfigValue(code, STR_ART);
+    tip = hero->data.UnitProfile ? hero->data.UnitProfile->reviveTip : NULL;
+    ubertip = hero->data.UnitProfile ? hero->data.UnitProfile->uberTip : NULL;
+    if (!art || !*art) return false;
+
+    memset(button, 0, sizeof(*button));
+    UI_CopyString(button->art, sizeof(button->art), G_UIArtPath(art));
+    if (tip && *tip) {
+        UI_CopyString(button->tooltip, sizeof(button->tooltip), G_CleanTooltipString(tip, 0));
+    } else {
+        snprintf(fallback, sizeof(fallback), "Revive %s",
+                 hero->data.UnitProfile && hero->data.UnitProfile->name ? hero->data.UnitProfile->name : code);
+        UI_CopyString(button->tooltip, sizeof(button->tooltip), fallback);
+    }
+    UI_CopyString(button->ubertip, sizeof(button->ubertip), G_CleanTooltipString(ubertip, 0));
+    snprintf(command, sizeof(command), "revive:%u", (unsigned)hero->s.number);
+    UI_CopyString(button->command, sizeof(button->command), command);
+    button->x = slot % 4;
+    button->y = slot / 4;
+    button->active = 255;
+    return true;
+}
+
+uint8_t G_GetCommandButtons(edict_t *ent, gameCommandButton_t *buttons, uint8_t max_buttons) {
+    uint8_t count = 0;
+    UnitBalance_t const *b;
+    UnitWeapons_t const *w;
+    UnitAbilities_t const *a;
+    bool is_burrow;
+    bool burrow_occupied;
+
+    if (!ent || !ent->class_id || !buttons) {
+        return 0;
+    }
+    memset(buttons, 0, sizeof(*buttons) * max_buttons);
+    b = ent->data.UnitBalance;
+    w = ent->data.UnitWeapons;
+    a = ent->data.UnitAbilities;
+    is_burrow = S_CargoIsBurrow(ent);
+    burrow_occupied = is_burrow && ent->cargo && ent->cargo->count > 0;
+
+    /* Unsummon owns the building until destruction. Rally metadata remains
+     * editable, but actions and cancellation are hidden. */
+    if (G_BuildingIsUnsummoning(ent)) {
+        if (G_UnitHasRally(ent))
+            G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdRally, false, 0);
+        return count;
+    }
+
+    /* In-place structure upgrades expose only Cancel while the existing edict
+     * is in its Birth/progress state, matching the construction-style command
+     * lock without treating the building as newly constructed. */
+    if (G_BuildingUpgradeActive(ent)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdCancelBuild, false, 0);
+        return count;
+    }
+
+    /* Construction has its own command-card state.  Returning no buttons for
+     * every birth move made spawned Human buildings impossible to cancel. */
+    if (ent->construction) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdCancelBuild, false, 0);
+        return count;
+    }
+    /* Map-start buildings play their Birth move even though they are already
+     * complete and usable. Only suppress the ordinary unit command card for
+     * a mobile unit's birth presentation; the construction pointer above owns the
+     * actual unfinished-building command state. */
+    if (ent->currentmove && ent->currentmove->think == ai_birth && !G_UnitIsStructure(ent)) {
+        return 0;
+    }
+    if (S_AncientIsMorphing(ent)) return 0;
+    /* A carrier's Air Group page replaces the whole card: loadout counts, strike package, Replenish, Done. */
+    if (S_CarrierLoadoutPageOpen(ent)) {
+        static cstring_t const page[] = { "Fldf", "Fldd", "Fldt", "Fsif", "Fsid", "Fsit", "Frep", "Fbak" };
+        FOR_LOOP(i, sizeof(page) / sizeof(page[0]))
+            if (G_ActorHasSkill(ent, page[i])) G_AddAbilityCommandButtons(ent, buttons, max_buttons, &count, page[i]);
+        return count;
+    }
+
+    if (b->speed > 0 && !(ent->aiflags & AI_IMMOBILE)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdMove, false, 0);
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdHoldPos, false, 0);
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdPatrol, false, 0);
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdStop, false, 0);
+    } else if (burrow_occupied) {
+        /* Burrows are immobile, but Stop is meaningful once their Peons have
+         * enabled the building attack: it cancels the current attack/order. */
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdStop, false, 0);
+    }
+    if (S_AncientCanShowRootedAttackCommand(ent) &&
+        ((w->attack1.damageDice != 0 && S_UnitAttackSlotEnabled(ent, 0)) ||
+         (w->attack2.damageDice != 0 && S_UnitAttackSlotEnabled(ent, 1))) && (!is_burrow || burrow_occupied)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdAttack, false, 0);
+        if ((S_UnitAttackSlotEnabled(ent, 0) && ent->unit_state->attack1.weapon == WPN_ARTILLERY) ||
+            (S_UnitAttackSlotEnabled(ent, 1) && ent->unit_state->attack2.weapon == WPN_ARTILLERY))
+            G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdAttackGround, false, 0);
+    }
+    /* Some WC3 data paths expose the Burrow hold/battle-stations abilities
+     * without listing Astd in UnitAbilities.  Stand Down is nevertheless a
+     * state command of an occupied Burrow, so synthesize its stock command
+     * button while cargo exists.  G_AddAbilityCommandButtons() deduplicates
+     * it if Astd is also present in the authored ability list. */
+    if (burrow_occupied) {
+        G_AddAbilityCommandButtons(ent, buttons, max_buttons, &count, "Astd");
+    }
+    if (G_UnitHasBuildMenu(ent)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdBuild, false, 0);
+    }
+    if (a->heroAbilList) {
+        uint8_t const idx = count;
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdSelectSkill, false, 0);
+        if (count > idx) {
+            buttons[idx].number = ent->unit_state->hero.skillpoints;
+        }
+    }
+    if ((!S_AncientHasRootAbility(ent) || S_AncientIsRooted(ent)) && G_UnitHasRally(ent)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdRally, false, 0);
+    }
+    if (a->abilList) {
+        PARSE_LIST(a->abilList, abil, parse_segment) {
+            char ability_code[5] = {0};
+            if (strlen(abil) != 4) continue;
+            memcpy(ability_code, abil, 4);
+            /* These belong to the carrier's Air Group page only. */
+            if (!strcmp(ability_code, "Fldf") || !strcmp(ability_code, "Fldd") || !strcmp(ability_code, "Fldt") ||
+                !strcmp(ability_code, "Fsif") || !strcmp(ability_code, "Fsid") || !strcmp(ability_code, "Fsit") ||
+                !strcmp(ability_code, "Fbak") || !strcmp(ability_code, "Fhld") || !strcmp(ability_code, "Fh18") || !strcmp(ability_code, "Fh12")) continue; /* aircraft holds only size the hangar */
+            if (G_IsRepairDiagnosticRawcode(ability_code)) {
+                ability_t const *resolved = FindAbilityForCommand(ability_code);
+                G_RepairAbilityDataTrace(ent, ability_code);
+                G_RepairCommandTrace(ent, ability_code, "authored-list", resolved,
+                                     resolved && S_AbilityHasCommand(resolved), false);
+            }
+            if (G_IsImplementedAbility(ability_code) && G_ActorHasSkill(ent, ability_code))
+                G_AddAbilityCommandButtons(ent, buttons, max_buttons, &count, ability_code);
+        }
+    }
+    FOR_LOOP(i, (ent->unit_state ? ARRAY_COUNT(ent->unit_state->overrides.added) : 0)) {
+        char abil[5] = {0};
+        uint32_t const code = ent->unit_state->overrides.added[i];
+        if (!code) continue;
+        memcpy(abil, &code, 4);
+        if (G_IsImplementedAbility(abil) && G_ActorHasSkill(ent, abil))
+            G_AddAbilityCommandButtons(ent, buttons, max_buttons, &count, abil);
+    }
+    FOR_LOOP(i, ent->unit_state ? MAX_HERO_ABILITIES : 0) {
+        heroability_t const *ha = ent->unit_state->ranks + i;
+        ability_t const *ranked = FindAbilityForCommand(GetClassName(ha->code));
+        /* An installed AA Mount keeps its level here but offers no further purchase. */
+        if (ranked && ranked->proc == CAbilityAAMount) continue;
+        if (ha->level > 0 && G_IsUnitAbilityAvailable(ent, ha->code) &&
+            G_UnitAbilityResearchVisible(ent, ha->code)) {
+            uint8_t const idx = count;
+            G_AddCommandButton(ent, buttons, max_buttons, &count, GetClassName(ha->code), false, ha->level);
+            if (count > idx) {
+                if (!G_UnitAbilityResearchAvailable(ent, ha->code)) buttons[idx].disabled = 1;
+                G_SetCommandCooldown(&(commandCooldownParams_t){ .ent = ent, .code = ha->code, .level = ha->level, .button = &buttons[idx] });
+            }
+        }
+    }
+    if ((!S_AncientHasRootAbility(ent) || S_AncientIsRooted(ent)) && G_UnitProfile(ent->class_id)->upgrade) {
+        PARSE_LIST(G_UnitProfile(ent->class_id)->upgrade, upgrade_to, parse_segment) {
+            char upgrade_code[5] = {0};
+            gameClient_t *client = G_GetPlayerClientByNumber(ent->s.player);
+            uint32_t unit_id = 0;
+            buildCommandState_t state;
+            buildingUpgradeCommandParams_t params;
+            char reason[128];
+            uint8_t idx;
+
+            if (strlen(upgrade_to) != 4 || !client || client->ps.number != ent->s.player) continue;
+            memcpy(upgrade_code, upgrade_to, 4);
+            memcpy(&unit_id, upgrade_code, sizeof(unit_id));
+            params = (buildingUpgradeCommandParams_t){
+                .client = client, .producer = ent, .unit_id = unit_id,
+                .reason = reason, .reason_size = sizeof(reason) };
+            state = G_GetBuildingUpgradeCommandState(&params);
+            if (state == BUILD_COMMAND_ABSENT || state == BUILD_COMMAND_HIDDEN) continue;
+            idx = count;
+            G_AddCommandButton(ent, buttons, max_buttons, &count, upgrade_code, false, 0);
+            if (count > idx) {
+                buttons[idx].building_upgrade = 1;
+                if (state == BUILD_COMMAND_DISABLED) G_DisableCommandButton(&buttons[idx], reason);
+            }
+        }
+    }
+    if (G_UnitProfile(ent->class_id)->trains) {
+        PARSE_LIST(G_UnitProfile(ent->class_id)->trains, unit, parse_segment) {
+            char unit_code[5] = {0};
+            gameClient_t *client = G_GetPlayerClientByNumber(ent->s.player);
+            uint32_t unit_id = 0;
+            buildCommandState_t state;
+            char reason[128];
+            uint8_t idx;
+
+            if (strlen(unit) != 4 || !client || client->ps.number != ent->s.player) continue;
+            memcpy(unit_code, unit, 4);
+            memcpy(&unit_id, unit_code, sizeof(unit_id));
+            state = G_GetTrainCommandState(client, ent, unit_id, reason, sizeof(reason));
+            if (state == BUILD_COMMAND_ABSENT || state == BUILD_COMMAND_HIDDEN) continue;
+            idx = count;
+            G_AddCommandButton(ent, buttons, max_buttons, &count, unit_code, false, 0);
+            if (state == BUILD_COMMAND_DISABLED && count > idx) {
+                G_DisableCommandButton(&buttons[idx], reason);
+            }
+        }
+    }
+    if (G_UnitProfile(ent->class_id)->researches) {
+        PARSE_LIST(G_UnitProfile(ent->class_id)->researches, upgrade, parse_segment) {
+            char research_code[5] = {0};
+            gameClient_t *client = G_GetPlayerClientByNumber(ent->s.player);
+            uint32_t upgrade_id = 0;
+            int32_t next_level = 0;
+            buildCommandState_t state;
+            char reason[128];
+            uint8_t idx;
+
+            if (strlen(upgrade) != 4 || !client || client->ps.number != ent->s.player) continue;
+            memcpy(research_code, upgrade, 4);
+            memcpy(&upgrade_id, research_code, sizeof(upgrade_id));
+            state = G_GetResearchCommandState(client, ent, upgrade_id, &next_level, reason, sizeof(reason));
+            if (state == BUILD_COMMAND_ABSENT || state == BUILD_COMMAND_HIDDEN) continue;
+            idx = count;
+            G_AddCommandButton(ent, buttons, max_buttons, &count, research_code, true, (uint32_t)next_level);
+            if (state == BUILD_COMMAND_DISABLED && count > idx) {
+                G_DisableCommandButton(&buttons[idx], reason);
+            }
+        }
+    }
+    if (G_UnitCanReviveHeroes(ent)) {
+        FILTER_EDICTS(hero, hero->inuse && hero->s.player == ent->s.player) {
+            if (count >= max_buttons) break;
+            if (G_BuildHeroReviveButton(ent, hero, count, &buttons[count])) count++;
+        }
+    }
+    /* The existing Cancel command can safely cancel the active revival. Do
+     * not expose it for ordinary unit training until that queue has matching
+     * refund semantics. */
+    if (ent->build && (ent->build->revival && ent->build->revival->reviving)) {
+        G_AddCommandButton(ent, buttons, max_buttons, &count, STR_CmdCancel, false, 0);
+    }
+
+    G_ResolveNagaCommandButtonCollisions(ent, buttons, count);
+    return count;
+}
+
+bool G_BuildInventoryItem(edict_t *ent, edict_t *item, uint8_t slot, gameInventoryItem_t *out) {
+    cstring_t item_name;
+    cstring_t art;
+
+    if (!ent || !out || slot >= G_InventoryCapacity(ent) || !G_IsItem(item) ||
+        item->item->carrier != ent || item->item->inventory_slot != slot || item->item->in_world) return false;
+
+    memset(out, 0, sizeof(*out));
+    item_name = GetClassName(item->class_id);
+    art = FindConfigValue(item_name, STR_ART);
+    UI_CopyString(out->art, sizeof(out->art), G_UIArtPath(art));
+    /* Item Tip is also used by shop purchase buttons and may intentionally
+     * start with "Purchase".  Inventory owns the item already, so its title
+     * comes from ItemData's display name instead of the purchase tooltip. */
+    UI_CopyString(out->tooltip, sizeof(out->tooltip), G_ObjectName(item->class_id));
+    UI_CopyString(out->ubertip, sizeof(out->ubertip), G_CleanTooltipString(FindConfigValue(item_name, STR_UBERTIP), 0));
+    out->slot = slot;
+    out->charges = G_ItemCharges(item);
+    if (!out->art[0]) {
+        fprintf(stderr, "G_BuildInventoryItem: missing Art item=%.4s slot=%u\n",
+                (char *)&item->class_id, (unsigned)slot);
+    }
+    return true;
+}
+
+uint8_t G_GetInventory(edict_t *ent, gameInventoryItem_t *items, uint8_t max_items) {
+    uint8_t count = 0;
+    uint32_t capacity;
+
+    if (!ent || !items) return 0;
+    memset(items, 0, sizeof(*items) * max_items);
+    capacity = G_InventoryCapacity(ent);
+    FOR_LOOP(slot, capacity) {
+        if (count >= max_items) break;
+        if (G_BuildInventoryItem(ent, G_InventoryItem(ent, slot), (uint8_t)slot, &items[count])) count++;
+    }
+    return count;
+}
+
+uint8_t G_GetBuildQueue(edict_t *ent, gameQueueItem_t *queue, uint8_t max_queue) {
+    uint8_t count = 0;
+    uint32_t cursor = G_Time();
+    bool food_blocked = false;
+
+    if (!ent || !queue || max_queue == 0) {
+        return 0;
+    }
+    memset(queue, 0, sizeof(*queue) * max_queue);
+
+    /* A structure upgrade is not a producer child: the selected building owns
+     * its target/timer directly so entity identity survives the morph. Expose
+     * that state through the same queue payload used by training/research. */
+    if (G_BuildingUpgradeActive(ent)) {
+        gameCommandButton_t button;
+        uint32_t const duration = (uint32_t)(MAX(0.0f, ent->research->duration) * 1000.0f);
+        float progress = ent->research->duration > 0.0f
+            ? ent->research->progress / ent->research->duration : 1.0f;
+        uint32_t const elapsed = (uint32_t)((float)duration * MAX(0.0f, MIN(1.0f, progress)));
+
+        if (G_BuildCommandButton(ent, GetClassName(ent->research->upgrade), false, 0, &button)) {
+            UI_CopyString(queue[0].art, sizeof(queue[0].art), button.art);
+        } else {
+            UI_CopyString(queue[0].art, sizeof(queue[0].art),
+                          FindConfigValue(GetClassName(ent->research->upgrade), STR_ART));
+        }
+        queue[0].starttime = elapsed <= cursor ? cursor - elapsed : cursor;
+        queue[0].endtime = queue[0].starttime + duration;
+        return 1;
+    }
+
+    for (edict_t *build = ent->build; build && count < max_queue;
+         build = (build->revival && build->revival->reviving) ? build->revival->queue_next : build->build) {
+        uint32_t duration;
+        float progress = 0;
+
+        if (build->research && build->research->upgrade != 0) {
+            gameCommandButton_t button;
+            duration = (uint32_t)(MAX(0.0f, build->research->duration) * 1000.0f);
+            if (G_BuildCommandButton(ent, GetClassName(build->research->upgrade), true,
+                                     (uint32_t)build->research->level, &button)) {
+                UI_CopyString(queue[count].art, sizeof(queue[count].art), button.art);
+            }
+            if (count == 0 && build->research->duration > 0.0f) {
+                progress = build->research->progress / build->research->duration;
+                progress = MAX(0, MIN(progress, 1));
+            }
+        } else {
+            cstring_t build_name = GetClassName(build->class_id);
+            /* Tiny Structures author their own construction clock; the
+             * progress bar used to run on the unit's buildTime instead. */
+            duration = (build->revival && build->revival->reviving)
+                ? (uint32_t)(G_HeroReviveTime(build) * 1000.0f)
+                : (build->construction && build->construction->duration_ms > 0.0f)
+                ? (uint32_t)build->construction->duration_ms
+                : (build->data.UnitBalance ? (uint32_t)MAX(0, build->data.UnitBalance->buildTime) * 1000 : 0);
+            if (count == 0) {
+                int32_t cost = build->data.UnitBalance ? MAX(0, build->data.UnitBalance->foodUsed) : 0;
+                if ((build->revival && build->revival->reviving) && duration > 0) {
+                    progress = build->revival->progress / ((float)duration / 1000.0f);
+                    progress = MAX(0, MIN(progress, 1));
+                } else if (build->construction && build->construction->type == CONSTRUCTION_HUMAN && duration > 0) {
+                    progress = build->construction->progress / (float)duration;
+                    progress = MAX(0, MIN(progress, 1));
+                    bool working = false;
+                    FOR_LOOP(worker_index, globals.num_edicts) {
+                        if (S_RepairWorkerAdvancingHumanConstruction(&g_edicts[worker_index], build)) {
+                            working = true;
+                            break;
+                        }
+                    }
+                    if (!working) queue[count].flags |= UI_BUILDQUEUE_ITEM_PAUSED;
+                } else if (build->health.max_value > 0) {
+                    progress = build->health.value / build->health.max_value;
+                    progress = MAX(0, MIN(progress, 1));
+                }
+                food_blocked = G_UnitHasFlag(build, UNIT_FLAG_TRAINING) && cost > 0 && (!build->food || build->food->used == 0) && G_FoodLimitsEnabled();
+            }
+            UI_CopyString(queue[count].art, sizeof(queue[count].art), FindConfigValue(build_name, STR_ART));
+        }
+
+        if (food_blocked) {
+            /* A food-stalled head has no meaningful predicted completion time.
+             * Zero times are an explicit wire sentinel: the client holds the
+             * progress bar at zero and still renders every waiting queue icon. */
+            queue[count].starttime = 0;
+            queue[count].endtime = 0;
+        } else if (duration > 0) {
+            uint32_t elapsed = (uint32_t)(duration * progress);
+            queue[count].starttime = count == 0 && elapsed <= cursor ? cursor - elapsed : cursor;
+            queue[count].endtime = queue[count].starttime + duration;
+            cursor = queue[count].endtime;
+        } else {
+            queue[count].starttime = cursor;
+            queue[count].endtime = cursor;
+        }
+        queue[count].progress = MAX(0.0f, MIN(progress, 1.0f));
+#ifdef WC3_DEBUG_BUILD
+        if (count == 0 && build->construction && build->construction->type == CONSTRUCTION_HUMAN) {
+            fprintf(stderr, "WC3_BUILD queue-progress producer=%ld building=%ld id=%.4s construction_paused=%u progress=%.1f health=%.1f/%.1f fraction=%.4f duration_ms=%u queue_start=%u queue_end=%u frame=%u\n",
+                    (long)(ent - g_edicts), (long)(build - g_edicts),
+                    (cstring_t)&build->class_id, build->construction->paused,
+                    build->construction->progress, build->health.value,
+                    build->health.max_value, progress, duration,
+                    queue[count].starttime, queue[count].endtime, build->s.frame);
+        }
+#endif
+        count++;
+        if (((build->revival && build->revival->reviving) && build->revival->queue_next == build) ||
+            (!(build->revival && build->revival->reviving) && build->build == build)) {
+            break;
+        }
+    }
+    return count;
+}

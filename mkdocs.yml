@@ -1,0 +1,115 @@
+site_name: OpenWarcraft3
+site_url: https://corepunch.github.io/open-realm/
+site_description: Open-source Warcraft III implementation using SDL2, running on Linux and macOS.
+site_author: corepunch
+repo_url: https://github.com/corepunch/open-realm
+repo_name: corepunch/open-realm
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+validation:
+  links:
+    anchors: warn
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep orange
+      accent: orange
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Games:
+    - Warcraft III:
+      - Overview: games/warcraft-3/readme.md
+      - File Formats:
+        - 'Map (W3M/W3X)': games/warcraft-3/file-formats/map.md
+        - 'Model (MDX)': games/warcraft-3/file-formats/mdx.md
+        - 'SLK Spreadsheet': https://github.com/corepunch/open-realm/blob/main/games/warcraft-3/file-formats/slk.md
+        - 'UI Frame Definition (FDF)': games/warcraft-3/file-formats/fdf.md
+      - Detailed File Notes:
+        - Overview: games/warcraft-3/file-docs/readme.md
+        - MPQ Archive: games/warcraft-3/file-docs/mpq.md
+        - 'W3M / W3X Container': games/warcraft-3/file-docs/w3x-w3m.md
+        - Terrain W3E: games/warcraft-3/file-docs/w3e.md
+        - Doodads DOO: games/warcraft-3/file-docs/doo.md
+        - 'Shadow / Pathing': games/warcraft-3/file-docs/shd-wpm.md
+        - FDF Reference: games/warcraft-3/file-docs/fdf.md
+      - Implementation:
+        - Economy And Unit Presentation: games/warcraft-3/economy-and-unit-presentation.md
+        - Unit Selection And Control: games/warcraft-3/selection-and-control.md
+        - Pathfinding And Harvest Reachability: games/warcraft-3/pathfinding.md
+        - Inventory And World Items: games/warcraft-3/inventory-and-items.md
+        - Breakable Destructables: games/warcraft-3/breakable-destructables.md
+        - UI System: games/warcraft-3/architecture/ui.md
+        - UI Flow: games/warcraft-3/architecture/ui-flow.md
+        - UI Quick Reference: games/warcraft-3/architecture/ui-quick-reference.md
+        - Map Renderer: games/warcraft-3/architecture/map-renderer.md
+        - Cinematics: games/warcraft-3/cinematics.md
+        - Timer Dialogs And Mission Countdowns: games/warcraft-3/timer-dialogs.md
+        - Leaderboards And Counted Objective HUDs: games/warcraft-3/leaderboards.md
+        - Sounds: https://github.com/corepunch/open-realm/blob/main/games/warcraft-3/sounds.md
+    - World of Warcraft:
+      - Overview: games/world-of-warcraft/readme.md
+      - Data Loading: games/world-of-warcraft/data-loading.md
+      - File Formats: games/world-of-warcraft/file-formats.md
+      - Terrain And World Rendering: games/world-of-warcraft/terrain-and-world-rendering.md
+      - M2 And Character Display: games/world-of-warcraft/m2-and-character-display.md
+      - References: games/world-of-warcraft/references.md
+      - Gameplay:
+        - Enemies And Creatures: games/world-of-warcraft/enemies-and-creatures.md
+        - Magic And Effects: games/world-of-warcraft/magic-and-effects.md
+        - Weapons And Classes: games/world-of-warcraft/weapons-and-classes.md
+        - Spawn And Teleport: games/world-of-warcraft/spawn-and-teleport.md
+        - Quest UI: games/world-of-warcraft/quest-ui.md
+      - Rendering:
+        - Grass Rendering System: games/world-of-warcraft/grass-rendering-system.md
+        - Static Grass And Height Atlas: games/world-of-warcraft/static-grass-and-height-atlas.md
+        - Sounds: games/world-of-warcraft/sounds.md
+    - StarCraft II:
+      - Overview: games/starcraft-2/readme.md
+      - Model Format (M3): games/starcraft-2/file-formats/m3.md
+      - Map Storage And Loading: games/starcraft-2/map-storage-and-loading.md
+      - Embedded Map Files: games/starcraft-2/embedded-map-files.md
+      - Map, Model, And Unit Data: games/starcraft-2/map-model-unit-data.md
+      - Parser Notes: games/starcraft-2/parser-notes.md
+      - HUD Layout Pipeline: games/starcraft-2/hud-layout-pipeline.md
+      - Galaxy Scripting: games/starcraft-2/galaxy-scripting.md
+      - Galaxy Presentation State: games/starcraft-2/galaxy-presentation.md
+      - Galaxy Native Coverage: games/starcraft-2/galaxy-native-coverage.md
+      - References: games/starcraft-2/references.md
+      - Sounds: games/starcraft-2/sounds.md
+      - File Format Details:
+        - MapInfo: games/starcraft-2/file-formats/mapinfo.md
+        - PlacedObjects: games/starcraft-2/file-formats/objects.md
+        - Actors And Models: games/starcraft-2/file-formats/actors-and-models.md
+        - Assets.txt: games/starcraft-2/file-formats/assets-txt.md
+  - Architecture:
+    - Client: architecture/client.md
+    - Server: architecture/server.md
+    - Network: architecture/network.md
+    - Runtime Modules and Cvars: architecture/runtime.md
+    - UI System: architecture/ui-system.md
+    - Sound: https://github.com/corepunch/open-realm/blob/main/architecture/sound.md
+    - Fog of War Algorithms: architecture/fog-of-war-algorithms.md
+  - Build And Packaging:
+    - Build And Renderer Platforms: build-and-renderer-platforms.md
+    - Flatpak And Steam Deck: flatpak-steam-deck.md
+  - Renderer Backend: renderer-backend.md
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences

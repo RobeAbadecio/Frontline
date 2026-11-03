@@ -1,0 +1,2306 @@
+/*
+ * t_slk.c — In-engine SLK data reading and unit-stat tests.
+ *
+ * Part 1 (pure functions): typed cache decode and lookup tests.
+ * Part 2 (unit stats): real archive data for hpea/hfoo.
+ * Part 3 (typed table replacement): G_SetSLKRows tests mana/armor edge cases.
+ */
+#ifdef BZ_TESTS
+
+#include "test.h"
+#include "../g_local.h"
+#include "../skills/s_skills.h"
+#include "common/stb_slk.h"
+#include "common/mpq.h"
+
+void setup_test_world(void);
+void reset_entities(void);
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void CM_ReadDoodadOverrides(handle_t archive);
+
+static void wc3_slk_write_u32(uint8_t **cursor, uint32_t value) {
+    memcpy(*cursor, &value, sizeof(value));
+    *cursor += sizeof(value);
+}
+
+static void wc3_slk_write_w3d_mod(uint8_t **cursor, uint32_t field, uint32_t type,
+                                   uint32_t level, uint32_t data_pointer,
+                                   void const *value, uint32_t value_size) {
+    wc3_slk_write_u32(cursor, field);
+    wc3_slk_write_u32(cursor, type);
+    wc3_slk_write_u32(cursor, level);
+    wc3_slk_write_u32(cursor, data_pointer);
+    memcpy(*cursor, value, value_size);
+    *cursor += value_size;
+    wc3_slk_write_u32(cursor, 0); /* modification terminator */
+}
+
+TEST(wc3_slk, doodad_w3d_v1_uses_object_modification_layout) {
+    uint8_t payload[128] = { 0 }, *cursor = payload;
+    handle_t archive = NULL;
+    cstring_t path = Test_TempPath("doodad-w3d-v1-layout.mpq");
+    uint32_t dvar = MAKEFOURCC('d','v','a','r');
+    uint32_t original_id = MAKEFOURCC('L','O','f','l');
+    uint32_t value = 37;
+
+    wc3_slk_write_u32(&cursor, 1); /* format version */
+    wc3_slk_write_u32(&cursor, 1); /* original objects */
+    wc3_slk_write_u32(&cursor, original_id);
+    wc3_slk_write_u32(&cursor, 0);
+    wc3_slk_write_u32(&cursor, 1);
+    wc3_slk_write_u32(&cursor, dvar);
+    wc3_slk_write_u32(&cursor, mod_int);
+    wc3_slk_write_u32(&cursor, value);
+    wc3_slk_write_u32(&cursor, 0); /* modification terminator */
+    wc3_slk_write_u32(&cursor, 0); /* custom objects */
+
+    T_ASSERT(SFileCreateArchive(path, 0, 16, &archive));
+    T_ASSERT(SFileAddFileFromBuffer(archive, "war3map.w3d", payload,
+                                    (uint32_t)(cursor - payload)));
+    T_ASSERT(SFileCloseArchive(archive));
+    T_ASSERT(SFileOpenArchive(path, 0, 0, &archive));
+    CM_ReadDoodadOverrides(archive);
+    SFileCloseArchive(archive);
+
+    T_EQ(world.info.num_originalDoodads, 1);
+    T_EQ(world.info.num_userCreatedDoodads, 0);
+    T_EQ(world.info.originalDoodads[0].modifications[0].type, mod_int);
+    T_EQ(world.info.originalDoodads[0].modifications[0].level, 0);
+    T_EQ(*(uint32_t *)world.info.originalDoodads[0].modifications[0].data, value);
+
+    gi.MemFree(world.info.originalDoodads[0].modifications[0].data);
+    gi.MemFree(world.info.originalDoodads[0].modifications);
+    gi.MemFree(world.info.originalDoodads);
+    world.info.num_originalDoodads = 0;
+    world.info.originalDoodads = NULL;
+}
+
+TEST(wc3_slk, doodad_w3d_uses_ability_style_modification_layout) {
+    uint8_t payload[256] = { 0 }, *cursor = payload;
+    handle_t archive = NULL;
+    cstring_t path = Test_TempPath("doodad-w3d-layout.mpq");
+    uint32_t dfil = MAKEFOURCC('d','f','i','l');
+    uint32_t dvar = MAKEFOURCC('d','v','a','r');
+    uint32_t original_id = MAKEFOURCC('L','O','f','l');
+    uint32_t custom_id = MAKEFOURCC('X','O','f','l');
+    uint32_t variation = 3;
+    char const original_model[] = "Doodads\\Original.mdx";
+    char const custom_model[] = "Doodads\\Custom.mdx";
+    size_t original_length = sizeof(original_model);
+    size_t custom_length = sizeof(custom_model);
+
+    wc3_slk_write_u32(&cursor, 2); /* format version */
+    wc3_slk_write_u32(&cursor, 1); /* original objects */
+    wc3_slk_write_u32(&cursor, original_id);
+    wc3_slk_write_u32(&cursor, 0);
+    wc3_slk_write_u32(&cursor, 1);
+    wc3_slk_write_w3d_mod(&cursor, dfil, mod_string, 0, 0,
+                           original_model, (uint32_t)original_length);
+    wc3_slk_write_u32(&cursor, 1); /* custom objects */
+    wc3_slk_write_u32(&cursor, original_id);
+    wc3_slk_write_u32(&cursor, custom_id);
+    wc3_slk_write_u32(&cursor, 2);
+    wc3_slk_write_w3d_mod(&cursor, dfil, mod_string, 2, 0,
+                           custom_model, (uint32_t)custom_length);
+    wc3_slk_write_w3d_mod(&cursor, dvar, mod_int, 0, 0, &variation, sizeof(variation));
+
+    T_ASSERT(SFileCreateArchive(path, 0, 16, &archive));
+    T_ASSERT(SFileAddFileFromBuffer(archive, "war3map.w3d", payload,
+                                    (uint32_t)(cursor - payload)));
+    T_ASSERT(SFileCloseArchive(archive));
+    T_ASSERT(SFileOpenArchive(path, 0, 0, &archive));
+    CM_ReadDoodadOverrides(archive);
+    SFileCloseArchive(archive);
+
+    T_EQ(world.info.num_originalDoodads, 1);
+    T_EQ(world.info.num_userCreatedDoodads, 1);
+    T_EQ(world.info.originalDoodads[0].modifications[0].type, mod_string);
+    T_EQ(world.info.originalDoodads[0].modifications[0].level, 0);
+    T_EQ(world.info.userCreatedDoodads[0].modifications[0].level, 2);
+    T_EQ(world.info.userCreatedDoodads[0].modifications[0].dataPointer, 0);
+    T_STREQ(world.info.originalDoodads[0].modifications[0].data, original_model);
+    T_STREQ(world.info.userCreatedDoodads[0].modifications[0].data, custom_model);
+    T_EQ(*(uint32_t *)world.info.userCreatedDoodads[0].modifications[1].data, variation);
+
+    FOR_LOOP(i, world.info.num_originalDoodads) {
+        FOR_LOOP(j, world.info.originalDoodads[i].numbeOfModifications)
+            gi.MemFree(world.info.originalDoodads[i].modifications[j].data);
+        gi.MemFree(world.info.originalDoodads[i].modifications);
+    }
+    FOR_LOOP(i, world.info.num_userCreatedDoodads) {
+        FOR_LOOP(j, world.info.userCreatedDoodads[i].numbeOfModifications)
+            gi.MemFree(world.info.userCreatedDoodads[i].modifications[j].data);
+        gi.MemFree(world.info.userCreatedDoodads[i].modifications);
+    }
+    gi.MemFree(world.info.originalDoodads);
+    gi.MemFree(world.info.userCreatedDoodads);
+    world.info.num_originalDoodads = world.info.num_userCreatedDoodads = 0;
+    world.info.originalDoodads = world.info.userCreatedDoodads = NULL;
+}
+
+TEST(wc3_slk, map_game_data_set_matches_w3i_and_melee_fallback) {
+    mapInfo_t info = { 0 };
+
+    info.fileFormat = 24;
+    info.gameDataSet = WC3_MAP_GAME_DATA_SET_MELEE; /* field is absent on disk for ROC and must be ignored */
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_CUSTOM);
+    info.flags = melee_map;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_MELEE);
+
+    info.fileFormat = 25;
+    info.flags = 0;
+    info.gameDataSet = WC3_MAP_GAME_DATA_SET_DEFAULT;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_CUSTOM);
+    info.flags = melee_map;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_MELEE);
+
+    /* TFT W3I can use all ones for an unspecified data set.  This must
+     * resolve from the map type rather than implicitly selecting Melee. */
+    info.gameDataSet = UINT32_MAX;
+    info.flags = 0;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_CUSTOM);
+    info.flags = melee_map;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_MELEE);
+
+    /* Explicit values take precedence over the melee flag. */
+    info.gameDataSet = WC3_MAP_GAME_DATA_SET_CUSTOM;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_CUSTOM);
+    info.flags = 0;
+    info.gameDataSet = WC3_MAP_GAME_DATA_SET_MELEE;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_MELEE);
+    info.gameDataSet = 99;
+    T_EQ(G_MapGameDataSet(&info), WC3_MAP_GAME_DATA_SET_MELEE);
+}
+
+TEST(wc3_slk, map_game_data_prefix_tracks_dataset_and_edition) {
+    mapInfo_t info = { .fileFormat = 25, .gameDataSet = WC3_MAP_GAME_DATA_SET_CUSTOM };
+    char prefix[32];
+    wc3MapGameDataPrefixParams_t params = { .info = &info, .version = 0, .out = prefix, .size = sizeof(prefix) };
+
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Custom_V0");
+    params.version = 1;
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Custom_V1");
+
+    info.gameDataSet = WC3_MAP_GAME_DATA_SET_MELEE;
+    params.version = 0;
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Melee_V0");
+    params.version = 1;
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Melee_V1");
+
+    /* Regression: an unset TFT marker must select the campaign/custom
+     * overlay instead of falling through a missing Melee_V1 file to root. */
+    info.gameDataSet = UINT32_MAX;
+    info.flags = 0;
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Custom_V1");
+    info.flags = melee_map;
+    G_MapGameDataPrefix(&params);
+    T_STREQ(prefix, "Melee_V1");
+}
+
+TEST(wc3_slk, reign_of_chaos_map_requires_real_roc_w3i_version) {
+    mapInfo_t info = { 0 };
+
+    T_ASSERT(!G_IsReignOfChaosMap(NULL));
+    T_ASSERT(!G_IsReignOfChaosMap(&info));
+    info.fileFormat = 24;
+    T_ASSERT(G_IsReignOfChaosMap(&info));
+    info.fileFormat = 25;
+    T_ASSERT(!G_IsReignOfChaosMap(&info));
+}
+
+TEST(wc3_slk, reign_of_chaos_ability_targets_apply_to_every_rank) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y3;X6\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"uberAlias\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"targs2\"\nC;Y1;X6;K\"targs3\"\n"
+        "C;Y2;X1;K\"AHad\"\nC;Y2;X2;K\"AHad\"\nC;Y2;X3;K3\n"
+        "C;Y2;X4;K\"air,ground,friend,self,vuln,invu\"\n"
+        "C;Y3;X1;K\"XHad\"\nC;Y3;X3;K3\n"
+        "C;Y3;X5;K\"ground,friend\"\nC;Y3;X6;K\"air,friend\"\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+    uint32_t const roc = MAKEFOURCC('A','H','a','d'), tft = MAKEFOURCC('X','H','a','d');
+
+    T_STREQ(G_AbilityLevel(roc, 1)->targs, "air,ground,friend,self,vuln,invu");
+    T_STREQ(G_AbilityLevel(roc, 2)->targs, "air,ground,friend,self,vuln,invu");
+    T_STREQ(G_AbilityLevel(roc, 3)->targs, "air,ground,friend,self,vuln,invu");
+    T_NULL(G_AbilityLevel(tft, 1)->targs);
+    T_STREQ(G_AbilityLevel(tft, 2)->targs, "ground,friend");
+    T_STREQ(G_AbilityLevel(tft, 3)->targs, "air,friend");
+
+    G_SetSLKRows("AbilityData", old); free_slk_rows(rows);
+}
+
+TEST(wc3_slk, ability_effect_codes_cover_roc_omission_and_tft_rank_fields) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y4;X5\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"EfctID1\"\nC;Y1;X5;K\"EfctID2\"\n"
+        "C;Y2;X1;K\"AOeq\"\nC;Y2;X2;K\"AOeq\"\nC;Y2;X3;K1\n"
+        "C;Y3;X1;K\"Atst\"\nC;Y3;X2;K\"Atst\"\nC;Y3;X3;K2\n"
+        "C;Y3;X4;K\"Xone\"\nC;Y3;X5;K\"Xtwo\"\nE\n";
+    uint32_t const roc = MAKEFOURCC('A','O','e','q');
+    uint32_t const tft = MAKEFOURCC('A','t','s','t');
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+
+#if BZ_COMPAT_WORKAROUNDS
+    T_EQ(G_AbilityEffectCode(roc, 1), MAKEFOURCC('X','O','e','q'));
+#else
+    T_EQ(G_AbilityEffectCode(roc, 1), roc);
+#endif
+    T_EQ(G_AbilityEffectCode(tft, 1), MAKEFOURCC('X','o','n','e'));
+    T_EQ(G_AbilityEffectCode(tft, 2), MAKEFOURCC('X','t','w','o'));
+
+    G_SetSLKRows("AbilityData", old); free_slk_rows(rows);
+}
+
+TEST(wc3_slk, roc_chain_lightning_uses_primary_and_secondary_bolt_rows) {
+    uint32_t const ability = MAKEFOURCC('A','O','c','l');
+    InitUnitData();
+#if BZ_COMPAT_WORKAROUNDS
+    T_EQ(G_AbilityLightningId(ability, 0), MAKEFOURCC('C','L','P','B'));
+    T_EQ(G_AbilityLightningId(ability, 1), MAKEFOURCC('C','L','S','B'));
+#else
+    T_EQ(G_AbilityLightningId(ability, 0), 0);
+    T_EQ(G_AbilityLightningId(ability, 1), 0);
+#endif
+    ShutdownUnitData();
+    InitUnitData(); /* Restore shared tables for later tests in this process. */
+}
+
+TEST(wc3_slk, sheet_reader_prefers_active_map_data_overlay) {
+    stbIniCache_t data = { 0 };
+    char saved_prefix[sizeof(game.data_prefix)];
+
+    strlcpy(saved_prefix, game.data_prefix, sizeof(saved_prefix));
+
+    game.data_prefix[0] = '\0';
+    T_ASSERT(Stb_IniCacheLoad(&data, "TestData\\GameDataSet.txt"));
+    T_STREQ(Stb_IniCacheFind(&data, "Data", "Value"), "base");
+    Stb_IniCacheFree(&data);
+
+    strlcpy(game.data_prefix, "Custom_V0", sizeof(game.data_prefix));
+    T_ASSERT(Stb_IniCacheLoad(&data, "TestData\\GameDataSet.txt"));
+    T_STREQ(Stb_IniCacheFind(&data, "Data", "Value"), "custom-v0");
+    Stb_IniCacheFree(&data);
+
+    strlcpy(game.data_prefix, "Melee_V1", sizeof(game.data_prefix));
+    T_ASSERT(Stb_IniCacheLoad(&data, "TestData\\GameDataSet.txt"));
+    T_STREQ(Stb_IniCacheFind(&data, "Data", "Value"), "melee-v1");
+    Stb_IniCacheFree(&data);
+
+    strlcpy(game.data_prefix, "Custom_V1", sizeof(game.data_prefix));
+    T_ASSERT(Stb_IniCacheLoad(&data, "TestData\\GameDataSet.txt"));
+    T_STREQ(Stb_IniCacheFind(&data, "Data", "Value"), "base");
+    Stb_IniCacheFree(&data);
+
+    strlcpy(game.data_prefix, saved_prefix, sizeof(game.data_prefix));
+}
+
+TEST(wc3_slk, ini_cache_handles_carriage_return_only_lines) {
+    stbIniCache_t cache = { 0 };
+    T_ASSERT(Stb_IniCacheLoadBuffer(&cache, "[Data]\r// comment\rFirst=one\rSecond=two\rThird=three\r"));
+    T_STREQ(Stb_IniCacheFind(&cache, "Data", "First"), "one");
+    T_STREQ(Stb_IniCacheFind(&cache, "Data", "Second"), "two");
+    T_STREQ(Stb_IniCacheFind(&cache, "Data", "Third"), "three");
+    T_ASSERT(Stb_IniCacheLoadBuffer(&cache, "[Data]\r\nFirst=crlf\r\nSecond=still-crlf\r\n"));
+    T_STREQ(Stb_IniCacheFind(&cache, "Data", "First"), "crlf");
+    T_STREQ(Stb_IniCacheFind(&cache, "Data", "Second"), "still-crlf");
+    Stb_IniCacheFree(&cache);
+}
+
+TEST(wc3_slk, legacy_worldedit_destructable_names_use_compatibility_lookup) {
+    InitUnitData();
+#if BZ_COMPAT_WORKAROUNDS
+    T_STREQ(FindConfigValue("WorldEditStrings", "WESTRING_DOOD_LOBA"), "Barricade");
+    T_STREQ(FindConfigValue("WorldEditStrings", "WESTRING_DOOD_LOCS"), "Crates");
+#else
+    T_NULL(FindConfigValue("WorldEditStrings", "WESTRING_DOOD_LOBA"));
+    T_NULL(FindConfigValue("WorldEditStrings", "WESTRING_DOOD_LOCS"));
+#endif
+    ShutdownUnitData();
+    InitUnitData(); /* Restore shared tables for later tests in this process. */
+}
+
+/* Map-archive Units\CampaignUnitFunc.txt and war3mapMisc.txt must win over base
+ * TFT through gi.SetPriorityArchive (the same hook CM_LoadMapFormat installs). */
+TEST(wc3_slk, map_archive_campaign_unit_func_overrides_base) {
+    handle_t archive = NULL;
+    char saved_prefix[sizeof(game.data_prefix)];
+    stbIniCache_t data = { 0 };
+    uint32_t size = 0;
+    handle_t bytes;
+
+    T_NOT_NULL(gi.SetPriorityArchive);
+    strlcpy(saved_prefix, game.data_prefix, sizeof(saved_prefix));
+    game.data_prefix[0] = '\0'; /* exercise the unprefixed map-archive path */
+    bytes = gi.ReadFile("Maps\\MapOverlay.w3x", &size);
+    T_NOT_NULL(bytes);
+    T_ASSERT(SFileOpenArchiveFromMemory(bytes, size, 0, &archive));
+    gi.SetPriorityArchive(archive);
+
+    T_ASSERT(Stb_IniCacheLoad(&data, "Units\\CampaignUnitFunc.txt"));
+    T_STREQ(Stb_IniCacheFind(&data, "Harf", "Name"), "MapOverlay Omniknight");
+    Stb_IniCacheFree(&data);
+
+    gi.SetPriorityArchive(NULL);
+    SFileCloseArchive(archive);
+    gi.MemFree(bytes);
+    strlcpy(game.data_prefix, saved_prefix, sizeof(game.data_prefix));
+}
+
+TEST(wc3_slk, map_archive_war3map_misc_overrides_max_hero_level) {
+    handle_t archive = NULL;
+    char saved_prefix[sizeof(game.data_prefix)];
+    void *old_misc;
+    uint32_t size = 0;
+    handle_t bytes;
+    cstring_t expected;
+
+    T_NOT_NULL(gi.SetPriorityArchive);
+    strlcpy(saved_prefix, game.data_prefix, sizeof(saved_prefix));
+    game.data_prefix[0] = '\0';
+    bytes = gi.ReadFile("Maps\\MapOverlay.w3x", &size);
+    T_NOT_NULL(bytes);
+    T_ASSERT(SFileOpenArchiveFromMemory(bytes, size, 0, &archive));
+    gi.SetPriorityArchive(archive);
+
+    /* Read the fixture value first so the assertion cannot pass on a hardcoded 25. */
+    {
+        stbIniCache_t file = { 0 };
+        T_ASSERT(Stb_IniCacheLoad(&file, "war3mapMisc.txt"));
+        expected = Stb_IniCacheFind(&file, "Misc", "MaxHeroLevel");
+        T_NOT_NULL(expected);
+        T_ASSERT(atoi(expected) > 10); /* non-stock vs default 10 */
+        old_misc = game.config.misc.source;
+        game.config.misc.source = file.source;
+        T_EQ((int)G_MaxHeroLevel(), atoi(expected));
+        game.config.misc.source = old_misc;
+        Stb_IniCacheFree(&file);
+    }
+
+    gi.SetPriorityArchive(NULL);
+    SFileCloseArchive(archive);
+    gi.MemFree(bytes);
+    strlcpy(game.data_prefix, saved_prefix, sizeof(game.data_prefix));
+}
+
+TEST(wc3_slk, ini_duplicate_key_keeps_last_assignment) {
+    stbIniCache_t cache = { 0 };
+    T_ASSERT(Stb_IniCacheLoadBuffer(&cache,
+        "[Default]\nMinimapHeroTexture=old.blp\nMinimapHeroTexture=new.blp\n"));
+    T_STREQ(Stb_IniCacheFind(&cache, "Default", "MinimapHeroTexture"), "new.blp");
+    Stb_IniCacheFree(&cache);
+}
+
+TEST(wc3_slk, map_w3a_applies_levels_and_data_a) {
+    uint32_t const id = MAKEFOURCC('A','H','h','b');
+    float data_a = 123.0f;
+    uint32_t levels = 4; /* stock fixture AHhb uses 3 */
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('a','l','e','v'), .type = mod_int, .data = &levels },
+        { .modID = MAKEFOURCC('H','h','b','1'), .type = mod_real, .level = 1, .dataPointer = 1, .data = &data_a },
+    };
+    unitData_t original = {
+        .originalUnitID = id, .numbeOfModifications = 2, .modifications = mods
+    };
+    mapInfo_t mapinfo = { .num_originalAbilities = 1, .originalAbilities = &original };
+    AbilityData_t const *before;
+    AbilityData_t const *after;
+
+    setup_test_world();
+    before = G_AbilityData(id);
+    T_ASSERT(before->levels != 4);
+    T_ASSERT(before->level[0].data[0].number != 123.0f);
+
+    G_SetMapAbilityOverrides(&mapinfo);
+    after = G_AbilityData(id);
+    T_EQ(after->levels, 4);
+    T_FEQ(after->level[0].data[0].number, 123.0f, 0.001f);
+
+    G_SetMapAbilityOverrides(NULL);
+    T_EQ(G_AbilityData(id)->levels, before->levels);
+    T_ASSERT(G_AbilityData(id)->level[0].data[0].number != 123.0f);
+}
+
+TEST(wc3_slk, map_w3a_applies_ability_unit_id_and_marks_authored_override) {
+    const char ability_slk[] =
+        "ID;PWXL;N;EBB;Y3;X4\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\nC;Y1;X4;K\"UnitID1\"\n"
+        "C;Y2;X1;K\"AIbl\"\nC;Y2;X2;K\"AIbl\"\nC;Y2;X3;K1\nC;Y2;X4;K\"hcas\"\n"
+        "C;Y3;X1;K\"AIbg\"\nC;Y3;X2;K\"AIbl\"\nC;Y3;X3;K1\nC;Y3;X4;K\"htow\"\nE\n";
+    const char meta_slk[] =
+        "ID;PWXL;N;EBB;Y2;X4\n"
+        "C;Y1;X1;K\"ID\"\nC;Y1;X2;K\"field\"\nC;Y1;X3;K\"data\"\nC;Y1;X4;K\"useSpecific\"\n"
+        "C;Y2;X1;K\"AIbg\"\nC;Y2;X2;K\"UnitID\"\nC;Y2;X3;K-1\nC;Y2;X4;K\"AIbg\"\nE\n";
+    char custom_building[] = "hkee";
+    unitModification_t mod = {
+        .modID = MAKEFOURCC('A','I','b','g'), .type = mod_unitList,
+        .level = 1, .data = custom_building
+    };
+    unitData_t original = {
+        .originalUnitID = MAKEFOURCC('A','I','b','g'),
+        .numbeOfModifications = 1, .modifications = &mod
+    };
+    mapInfo_t mapinfo = { .num_originalAbilities = 1, .originalAbilities = &original };
+    slkTestData_t *abilities = parse_slk_string(ability_slk), *old_abilities;
+    slkTestData_t *metadata = parse_slk_string(meta_slk), *old_metadata;
+    edict_t *caster;
+
+    setup_test_world();
+    old_abilities = G_SetSLKRows("AbilityData", abilities);
+    old_metadata = G_SetSLKRows("AbilityMetaData", metadata);
+    caster = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    caster->s.player = 0;
+    game.clients[0].ps.race = kPlayerRaceOrc;
+
+    G_SetMapAbilityOverrides(&mapinfo);
+    T_EQ(G_AbilityLevel(MAKEFOURCC('A','I','b','g'), 1)->unitID, MAKEFOURCC('h','k','e','e'));
+    T_ASSERT(G_AbilityHasUnitIdOverride(MAKEFOURCC('A','I','b','g')));
+    T_EQ(S_TinyStructureUnitId(caster, MAKEFOURCC('A','I','b','g'), 1), MAKEFOURCC('h','k','e','e'));
+    T_EQ(S_TinyStructureUnitId(caster, MAKEFOURCC('A','I','b','l'), 1), MAKEFOURCC('h','c','a','s'));
+
+    G_SetMapAbilityOverrides(NULL);
+    T_ASSERT(!G_AbilityHasUnitIdOverride(MAKEFOURCC('A','I','b','g')));
+    G_SetSLKRows("AbilityMetaData", old_metadata);
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(metadata);
+    free_slk_rows(abilities);
+}
+
+/* DotA A00Y is an original-table row whose W3A field IDs identify Chain Lightning.
+ * Its level-five data uses W3A's one-based dataPointer convention. */
+TEST(wc3_slk, map_w3a_custom_rawcode_inherits_mechanics_and_authored_level) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X13\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"targs1\"\nC;Y1;X5;K\"targs2\"\nC;Y1;X6;K\"targs3\"\n"
+        "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Rng2\"\nC;Y1;X9;K\"Rng3\"\n"
+        "C;Y1;X10;K\"DataA1\"\nC;Y1;X11;K\"DataB1\"\nC;Y1;X12;K\"DataC1\"\nC;Y1;X13;K\"DataA3\"\n"
+        "C;Y2;X1;K\"AOcl\"\nC;Y2;X2;K\"AOcl\"\nC;Y2;X3;K\"3\"\n"
+        "C;Y2;X4;K\"air,ground,enemy\"\nC;Y2;X5;K\"air,ground,enemy\"\nC;Y2;X6;K\"air,ground,enemy\"\n"
+        "C;Y2;X7;K\"800\"\nC;Y2;X8;K\"800\"\nC;Y2;X9;K\"800\"\n"
+        "C;Y2;X10;K\"85\"\nC;Y2;X11;K\"4\"\nC;Y2;X12;K\"0.1\"\nC;Y2;X13;K\"100\"\nE\n";
+    uint32_t const id = MAKEFOURCC('A','0','0','Y'), parent = MAKEFOURCC('A','O','c','l');
+    float damage = 300.0f, parent_damage = 125.0f, reduction = 0.0f, area = 600.0f;
+    uint32_t bounces = 12;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('O','c','l','1'), .type = mod_unreal, .level = 5, .dataPointer = 1, .data = &damage },
+        { .modID = MAKEFOURCC('O','c','l','2'), .type = mod_int, .level = 5, .dataPointer = 2, .data = &bounces },
+        { .modID = MAKEFOURCC('O','c','l','3'), .type = mod_unreal, .level = 5, .dataPointer = 3, .data = &reduction },
+        { .modID = MAKEFOURCC('a','a','r','e'), .type = mod_unreal, .level = 5, .data = &area },
+    };
+    unitModification_t parent_mod = {
+        .modID = MAKEFOURCC('O','c','l','1'), .type = mod_unreal, .level = 3, .dataPointer = 1, .data = &parent_damage
+    };
+    unitData_t originals[] = {
+        { .originalUnitID = id, .numbeOfModifications = 4, .modifications = mods },
+        { .originalUnitID = parent, .numbeOfModifications = 1, .modifications = &parent_mod },
+    };
+    mapInfo_t mapinfo = { .num_originalAbilities = 2, .originalAbilities = originals };
+    slkTestData_t *rows = parse_slk_string(slk), *old;
+    abilityitem_t item;
+    UnitAbilities_t ability_list = { .abilList = "A00Y" };
+    edict_t *caster, *target, *next, *last, *thinker = NULL;
+
+    reset_entities(); setup_test_world(); level.time = 1000;
+    old = G_SetSLKRows("AbilityData", rows);
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetMapAbilityOverrides(&mapinfo);
+    T_EQ(G_AbilityCode(id), parent);
+    T_EQ(G_AbilityData(id)->levels, 5);
+    T_FEQ(G_AbilityLevel(id, 5)->data[0].number, damage, 0.001f);
+    T_EQ(G_AbilityLevel(id, 5)->data[1].id, bounces);
+    T_FEQ(G_AbilityLevel(id, 5)->data[2].number, reduction, 0.001f);
+    T_FEQ(G_AbilityLevel(id, 5)->area, area, 0.001f);
+    T_FEQ(G_AbilityLevel(id, 5)->range, 800.0f, 0.001f);
+    T_STREQ(G_AbilityLevel(id, 5)->targs, "air,ground,enemy");
+    T_FEQ(G_AbilityLevel(id, 1)->data[0].number, 85.0f, 0.001f);
+    T_FEQ(G_AbilityLevel(id, 3)->data[0].number, parent_damage, 0.001f);
+    item = S_AbilityItem(id);
+    T_ASSERT(item.ability && (item.ability->flags & AB_SPELL) && item.ability->proc == CAbilityChainLightning);
+    caster = alloc_test_unit(MAKEFOURCC('h','p','r','i'), 0, 0);
+    target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64, 0);
+    next = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 128, 0);
+    last = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 192, 0);
+    caster->data.UnitAbilities = &ability_list;
+    caster->s.player = 0; target->s.player = next->s.player = last->s.player = 1;
+    caster->svflags |= SVF_MONSTER;
+    target->svflags |= SVF_MONSTER; next->svflags |= SVF_MONSTER; last->svflags |= SVF_MONSTER;
+    target->targtype = next->targtype = last->targtype = TARG_GROUND;
+    caster->unit_state->ranks[0] = (heroability_t){ .code = id, .level = 5 };
+    target->health.value = target->health.max_value = 1000.0f;
+    next->health.value = next->health.max_value = 1000.0f;
+    last->health.value = last->health.max_value = 1000.0f;
+    T_ASSERT(S_CastUnitTargetSpell(caster, id, target));
+    T_FEQ(target->health.value, 700.0f, 0.01f);
+    FILTER_EDICTS(ent, ent->think == chain_lightning_think) { thinker = ent; break; }
+    T_NOT_NULL(thinker);
+    T_EQ(thinker->resources, 11);
+    T_FEQ(thinker->collision, 600.0f, 0.001f);
+    T_FEQ(thinker->wait, 300.0f, 0.001f);
+    level.time = thinker->freetime; G_RunEntities();
+    T_FEQ(next->health.value, 700.0f, 0.01f);
+    level.time += 250; G_RunEntities();
+    T_FEQ(last->health.value, 700.0f, 0.01f);
+    G_SetMapAbilityOverrides(NULL);
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+/* Retail AbilityMetaData assigns Ocl1 to both Chain Lightning and Healing Wave.
+ * A field ID alone cannot select one of their different procedures. */
+TEST(wc3_slk, map_w3a_shared_field_without_identity_keeps_mechanic_unresolved) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y3;X3\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y2;X1;K\"AOcl\"\nC;Y2;X2;K\"AOcl\"\nC;Y2;X3;K\"3\"\n"
+        "C;Y3;X1;K\"AOhw\"\nC;Y3;X2;K\"AOhw\"\nC;Y3;X3;K\"3\"\nE\n";
+    uint32_t id = MAKEFOURCC('A','0','0','Z'), healing = MAKEFOURCC('A','0','0','H');
+    float value = 20.0f;
+    unitModification_t mod = {
+        .modID = MAKEFOURCC('O','c','l','1'), .type = mod_unreal,
+        .level = 1, .dataPointer = 1, .data = &value
+    };
+    unitData_t originals[] = {
+        { .originalUnitID = id, .numbeOfModifications = 1, .modifications = &mod },
+        { .originalUnitID = healing, .numbeOfModifications = 1, .modifications = &mod },
+    };
+    mapInfo_t info = { .num_originalAbilities = 2, .originalAbilities = originals };
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+
+    G_SetMapAbilityOverrides(&info);
+    T_EQ(G_AbilityCode(id), id);
+    T_ASSERT(!S_AbilityItem(id).ability);
+    T_EQ(G_AbilityCode(healing), MAKEFOURCC('A','O','h','w'));
+    T_ASSERT(S_AbilityItem(healing).ability->proc == CAbilityHealingWave);
+    G_SetMapAbilityOverrides(NULL);
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_w3a_roc_order_confirms_only_matching_field_parent) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X2\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\n"
+        "C;Y2;X1;K\"AOcl\"\nC;Y2;X2;K\"AOcl\"\nE\n";
+    uint32_t lightning = MAKEFOURCC('A','0','0','Y'), healing = MAKEFOURCC('A','0','0','H');
+    float value = 20.0f;
+    uint8_t placeholder = 0;
+    unitModification_t mod = {
+        .modID = MAKEFOURCC('O','c','l','1'), .type = mod_unreal,
+        .level = 1, .dataPointer = 1, .data = &value
+    };
+    unitData_t originals[] = {
+        { .originalUnitID = lightning, .numbeOfModifications = 1, .modifications = &mod },
+        { .originalUnitID = healing, .numbeOfModifications = 1, .modifications = &mod },
+    };
+    mapInfo_t info = { .num_originalAbilities = 2, .originalAbilities = originals };
+    slkTestData_t absent_meta = { .rows = &placeholder }, *old_meta;
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+
+    old_meta = G_SetSLKRows("AbilityMetaData", &absent_meta);
+    G_SetMapAbilityOverrides(&info);
+    T_EQ(G_AbilityCode(lightning), MAKEFOURCC('A','O','c','l'));
+    T_EQ(G_AbilityCode(healing), healing);
+    G_SetMapAbilityOverrides(NULL);
+    G_SetSLKRows("AbilityMetaData", old_meta);
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_archive_w3a_parse_stores_original_ability_mods) {
+    handle_t archive = NULL;
+    uint32_t size = 0;
+    handle_t bytes;
+    uint32_t saved_orig = 0, saved_user = 0;
+    unitData_t *saved_orig_ptr = NULL, *saved_user_ptr = NULL;
+
+    bytes = gi.ReadFile("Maps\\MapOverlay.w3x", &size);
+    T_NOT_NULL(bytes);
+    T_ASSERT(SFileOpenArchiveFromMemory(bytes, size, 0, &archive));
+
+    saved_orig = world.info.num_originalAbilities;
+    saved_user = world.info.num_userCreatedAbilities;
+    saved_orig_ptr = world.info.originalAbilities;
+    saved_user_ptr = world.info.userCreatedAbilities;
+    world.info.num_originalAbilities = 0;
+    world.info.num_userCreatedAbilities = 0;
+    world.info.originalAbilities = NULL;
+    world.info.userCreatedAbilities = NULL;
+
+    CM_ReadAbilities(archive);
+    T_EQ(world.info.num_originalAbilities, 1);
+    T_EQ(world.info.originalAbilities[0].originalUnitID, MAKEFOURCC('A','H','h','b'));
+    T_EQ(world.info.originalAbilities[0].numbeOfModifications, 2);
+    T_EQ(world.info.originalAbilities[0].modifications[0].modID, MAKEFOURCC('a','l','e','v'));
+    T_EQ(*(uint32_t const *)world.info.originalAbilities[0].modifications[0].data, 3);
+    T_EQ(world.info.originalAbilities[0].modifications[1].dataPointer, 1);
+    T_EQ(world.info.originalAbilities[0].modifications[1].level, 1);
+    T_FEQ(*(float const *)world.info.originalAbilities[0].modifications[1].data, 123.0f, 0.001f);
+
+    /* Free parse results; restore any prior world pointers. */
+    FOR_LOOP(i, world.info.num_originalAbilities) {
+        FOR_LOOP(j, world.info.originalAbilities[i].numbeOfModifications)
+            gi.MemFree(world.info.originalAbilities[i].modifications[j].data);
+        gi.MemFree(world.info.originalAbilities[i].modifications);
+    }
+    gi.MemFree(world.info.originalAbilities);
+    world.info.num_originalAbilities = saved_orig;
+    world.info.num_userCreatedAbilities = saved_user;
+    world.info.originalAbilities = saved_orig_ptr;
+    world.info.userCreatedAbilities = saved_user_ptr;
+
+    SFileCloseArchive(archive);
+    gi.MemFree(bytes);
+}
+
+TEST(wc3_slk, map_archive_w3b_parse_stores_original_and_custom_destructables) {
+    handle_t archive = NULL;
+    uint32_t size = 0;
+    handle_t bytes = gi.ReadFile("Maps\\MapOverlay.w3x", &size);
+    uint32_t saved_orig = world.info.num_originalDestructables;
+    uint32_t saved_user = world.info.num_userCreatedDestructables;
+    unitData_t *saved_orig_ptr = world.info.originalDestructables;
+    unitData_t *saved_user_ptr = world.info.userCreatedDestructables;
+
+    T_NOT_NULL(bytes);
+    T_ASSERT(SFileOpenArchiveFromMemory(bytes, size, 0, &archive));
+    world.info.num_originalDestructables = 0;
+    world.info.num_userCreatedDestructables = 0;
+    world.info.originalDestructables = NULL;
+    world.info.userCreatedDestructables = NULL;
+
+    CM_ReadDestructables(archive);
+    T_EQ(world.info.num_originalDestructables, 1);
+    T_EQ(world.info.originalDestructables[0].originalUnitID, MAKEFOURCC('L','T','0','5'));
+    T_EQ(world.info.originalDestructables[0].numbeOfModifications, 1);
+    T_EQ(world.info.originalDestructables[0].modifications[0].modID, MAKEFOURCC('b','a','r','m'));
+    T_STREQ((cstring_t)world.info.originalDestructables[0].modifications[0].data, "Wood");
+    T_EQ(world.info.num_userCreatedDestructables, 1);
+    T_EQ(world.info.userCreatedDestructables[0].newUnitID, MAKEFOURCC('x','T','0','5'));
+    T_EQ(world.info.userCreatedDestructables[0].modifications[0].modID, MAKEFOURCC('b','h','p','s'));
+    T_EQ(*(uint32_t const *)world.info.userCreatedDestructables[0].modifications[0].data, 250);
+
+    FOR_LOOP(i, world.info.num_originalDestructables) {
+        FOR_LOOP(j, world.info.originalDestructables[i].numbeOfModifications)
+            gi.MemFree(world.info.originalDestructables[i].modifications[j].data);
+        gi.MemFree(world.info.originalDestructables[i].modifications);
+    }
+    FOR_LOOP(i, world.info.num_userCreatedDestructables) {
+        FOR_LOOP(j, world.info.userCreatedDestructables[i].numbeOfModifications)
+            gi.MemFree(world.info.userCreatedDestructables[i].modifications[j].data);
+        gi.MemFree(world.info.userCreatedDestructables[i].modifications);
+    }
+    gi.MemFree(world.info.originalDestructables);
+    gi.MemFree(world.info.userCreatedDestructables);
+    world.info.num_originalDestructables = saved_orig;
+    world.info.num_userCreatedDestructables = saved_user;
+    world.info.originalDestructables = saved_orig_ptr;
+    world.info.userCreatedDestructables = saved_user_ptr;
+
+    SFileCloseArchive(archive);
+    gi.MemFree(bytes);
+}
+
+slkTestData_t *parse_slk_string(char const *slk_text) {
+    static slkField_t const schema[] = { { NULL, 0, 0 } };
+    void *rows = NULL;
+    uint32_t count = Stb_SlkLoadBuffer(slk_text, schema, &rows, sizeof(uint32_t));
+    slkTestData_t *data;
+    if (!count) return NULL;
+    FS_SLKFreeRows(schema, rows, count, sizeof(uint32_t));
+    data = calloc(1, sizeof(*data));
+    if (data) data->text = slk_text;
+    return data;
+}
+
+void free_slk_rows(slkTestData_t *data) {
+    if (!data) return;
+    free(data->rows); free(data);
+}
+
+static cstring_t find_slk_value(slkTestData_t const *data, cstring_t row, cstring_t column) {
+    typedef struct { uint32_t id; cstring_t value; } row_t;
+    slkField_t schema[] = {
+        { "", offsetof(row_t, id), STB_SLK_FOURCC },
+        { column, offsetof(row_t, value), STB_SLK_STR },
+        { NULL, 0, 0 }
+    };
+    row_t *rows = NULL;
+    uint32_t count, key;
+    static char value[1024];
+    bool has_value = false;
+    if (!data) return NULL;
+    count = Stb_SlkLoadBuffer(data->text, schema, (void **)&rows, sizeof(row_t));
+    if (!count) return NULL;
+    key = FS_SLKKey(row);
+    FOR_LOOP(i, count) {
+        if (rows[i].id == key && rows[i].value) {
+            snprintf(value, sizeof(value), "%s", rows[i].value);
+            has_value = true; break;
+        }
+    }
+    FS_SLKFreeRows(schema, rows, count, sizeof(row_t));
+    return has_value ? value : NULL;
+}
+
+/* -----------------------------------------------------------------------
+ * 1.  Typed cache lookup
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_slk, find_cell_existing_row_and_column) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"spd\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"270\"\nE\n");
+    T_STREQ(find_slk_value(rows, "hpea", "spd"), "270");
+}
+
+TEST(wc3_slk, find_cell_missing_row_returns_null) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"spd\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"270\"\nE\n");
+    T_NULL(find_slk_value(rows, "hfoo", "spd"));
+}
+
+TEST(wc3_slk, find_cell_missing_column_returns_null) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"spd\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"270\"\nE\n");
+    T_NULL(find_slk_value(rows, "hpea", "hp"));
+}
+
+TEST(wc3_slk, find_cell_case_insensitive_column) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"RealHP\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"250\"\nE\n");
+    T_STREQ(find_slk_value(rows, "hpea", "realHP"), "250");
+    T_STREQ(find_slk_value(rows, "hpea", "REALHP"), "250");
+}
+
+TEST(wc3_slk, find_cell_multiple_rows) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"spd\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"270\"\nC;Y3;X1;K\"hfoo\"\nC;Y3;X2;K\"300\"\nE\n");
+    T_STREQ(find_slk_value(rows, "hpea", "spd"), "270");
+    T_STREQ(find_slk_value(rows, "hfoo", "spd"), "300");
+}
+
+TEST(wc3_slk, find_cell_multiple_fields) {
+    slkTestData_t *rows = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"spd\"\nC;Y1;X3;K\"realHP\"\nC;Y2;X1;K\"hpea\"\nC;Y2;X2;K\"270\"\nC;Y2;X3;K\"250\"\nE\n");
+    T_STREQ(find_slk_value(rows, "hpea", "spd"), "270");
+    T_STREQ(find_slk_value(rows, "hpea", "realHP"), "250");
+}
+
+TEST(wc3_slk, find_cell_null_sheet_returns_null) {
+    T_NULL(find_slk_value(NULL, "hpea", "spd"));
+}
+
+TEST(wc3_slk, typed_strings_are_owned_and_alias_safe) {
+    typedef struct { cstring_t name; } testRow_t;
+    static slkField_t const schema[] = {
+        { "Name", offsetof(testRow_t, name), STB_SLK_STR },
+        { "name", offsetof(testRow_t, name), STB_SLK_STR },
+        { NULL, 0, 0 }
+    };
+    char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"Name\"\n"
+        "C;Y1;X3;K\"name\"\n"
+        "C;Y2;X1;K\"hfoo\"\n"
+        "C;Y2;X2;K\"Footman\"\n"
+        "C;Y2;X3;K\"Knight\"\n"
+        "E\n";
+    testRow_t *rows = NULL;
+    string_t alias = strstr(src, "Knight");
+    uint32_t count = Stb_SlkLoadBuffer(src, schema, (void **)&rows, sizeof(testRow_t));
+
+    T_ASSERT(count == 1);
+    T_NOT_NULL(alias);
+    alias[0] = 'Y';
+    T_STREQ(rows[0].name, "Knight");
+    FS_SLKFreeRows(schema, rows, count, sizeof(testRow_t));
+}
+
+TEST(wc3_slk, omitted_scalar_uses_schema_default_without_overriding_zero) {
+    typedef struct { uint32_t id; int32_t red; } row_t;
+    static slkField_t const schema[] = {
+        { "", offsetof(row_t, id), STB_SLK_FOURCC },
+        { "red", offsetof(row_t, red), STB_SLK_INT, NULL, "255" },
+        { NULL, 0, 0 },
+    };
+    static cstring_t const src =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"red\"\n"
+        "C;Y2;X1;K\"omit\"\n"
+        "C;Y3;X1;K\"zero\"\n"
+        "C;Y3;X2;K\"0\"\n"
+        "E\n";
+    row_t *rows = NULL;
+    uint32_t count = Stb_SlkLoadBuffer(src, schema, (void **)&rows, sizeof(*rows));
+
+    T_EQ(count, 2);
+    T_EQ(rows[0].red, 255);
+    T_EQ(rows[1].red, 0);
+    FS_SLKFreeRows(schema, rows, count, sizeof(*rows));
+}
+
+TEST(wc3_slk, profile_ddx_and_fourcc_metadata_share_typed_row) {
+    slkTestData_t *row = parse_slk_string("C;Y1;X1;K\"id\"\nC;Y1;X2;K\"Name\"\nC;Y1;X3;K\"Missilespeed\"\nC;Y1;X4;K\"MissileHoming\"\nC;Y2;X1;K\"hrif\"\nC;Y2;X2;K\"Rifleman\"\nC;Y2;X3;K\"900\"\nC;Y2;X4;K\"true\"\nE\n");
+    slkTestData_t *old = G_SetProfileRows(row);
+    uint32_t id = MAKEFOURCC('h','r','i','f');
+    edict_t unit = { .class_id = id };
+    G_BindEntityData(&unit);
+
+    T_STREQ(G_UnitProfile(id)->name, "Rifleman");
+    T_FEQ(G_UnitProfile(id)->attack[0].speed, 900.f, 0.01f);
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','n','a','m')), "Rifleman");
+    T_FEQ(UnitMetaReal(&unit, MAKEFOURCC('u','a','1','z')), 900.f, 0.01f);
+    T_ASSERT(UnitMetaBoolean(&unit, MAKEFOURCC('u','m','h','1')));
+    G_SetProfileRows(old);
+}
+
+/* Retail profiles list one missile element per weapon (hgyr: two arts, speeds 2000,900);
+ * a single value covers both attacks, as WarSmash's indexed field lookup does. */
+TEST(wc3_slk, profile_missile_fields_select_element_per_attack) {
+    slkTestData_t *row = parse_slk_string(
+        "C;Y1;X1;K\"id\"\nC;Y1;X2;K\"Missileart\"\nC;Y1;X3;K\"Missilespeed\"\nC;Y1;X4;K\"Missilearc\"\nC;Y1;X5;K\"MissileHoming\"\n"
+        "C;Y2;X1;K\"hgyr\"\nC;Y2;X2;K\"Impact.mdl,Missile.mdl\"\nC;Y2;X3;K\"2000,900\"\nC;Y2;X4;K\"0.1,0.35\"\nC;Y2;X5;K\"1,0\"\n"
+        "C;Y3;X1;K\"hrif\"\nC;Y3;X2;K\"Rifle.mdl\"\nC;Y3;X3;K\"1800\"\nC;Y3;X4;K\"0.15\"\nC;Y3;X5;K\"1\"\nE\n");
+    slkTestData_t *old = G_SetProfileRows(row);
+    UnitProfile_t const *gyro = G_UnitProfile(MAKEFOURCC('h','g','y','r')), *rifle = G_UnitProfile(MAKEFOURCC('h','r','i','f'));
+    edict_t unit = { .class_id = MAKEFOURCC('h','g','y','r') };
+    G_BindEntityData(&unit);
+
+    T_STREQ(gyro->attack[0].art, "Impact.mdl");
+    T_STREQ(gyro->attack[1].art, "Missile.mdl");
+    T_FEQ(gyro->attack[0].speed, 2000.f, 0.01f);
+    T_FEQ(gyro->attack[1].speed, 900.f, 0.01f);
+    T_FEQ(gyro->attack[0].arc, 0.1f, 0.001f);
+    T_FEQ(gyro->attack[1].arc, 0.35f, 0.001f);
+    T_ASSERT(gyro->attack[0].homing);
+    T_ASSERT(!gyro->attack[1].homing);
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','a','2','m')), "Missile.mdl");
+    T_FEQ(UnitMetaReal(&unit, MAKEFOURCC('u','a','2','z')), 900.f, 0.01f);
+    T_STREQ(rifle->attack[0].art, "Rifle.mdl");
+    T_STREQ(rifle->attack[1].art, "Rifle.mdl");
+    T_FEQ(rifle->attack[1].speed, 1800.f, 0.01f);
+    T_ASSERT(rifle->attack[1].homing);
+    G_SetProfileRows(old);
+}
+
+/* The same selection applies to INI-decoded rows, which is how production loads *Func.txt. */
+TEST(wc3_slk, ini_decode_selects_list_element_by_schema_index) {
+    typedef struct { uint32_t id; string_t first; string_t second; string_t third; float speed2; } row_t;
+    static slkField_t const schema[] = {
+        { "",      offsetof(row_t, id),     STB_SLK_FOURCC },
+        { "Art",   offsetof(row_t, first),  STB_SLK_STR,   NULL, NULL, 1 },
+        { "Art",   offsetof(row_t, second), STB_SLK_STR,   NULL, NULL, 2 },
+        { "Art",   offsetof(row_t, third),  STB_SLK_STR,   NULL, NULL, 3 },
+        { "Speed", offsetof(row_t, speed2), STB_SLK_FLOAT, NULL, NULL, 2 },
+        { 0 }
+    };
+    stbIniCache_t cache = { 0 };
+    row_t *rows = NULL;
+    uint32_t count;
+
+    T_ASSERT(Stb_IniCacheLoadBuffer(&cache, "[echm]\nArt=Acid.mdl,Lightning.mdl\nSpeed=1200,1500\n"));
+    count = Stb_IniDecode(&cache, schema, (void **)&rows, sizeof(*rows));
+    T_EQ(count, 1);
+    T_STREQ(rows[0].first, "Acid.mdl");
+    T_STREQ(rows[0].second, "Lightning.mdl");
+    T_STREQ(rows[0].third, "Lightning.mdl");
+    T_FEQ(rows[0].speed2, 1500.f, 0.01f);
+    FS_SLKFreeRows(schema, rows, count, sizeof(*rows));
+    Stb_IniCacheFree(&cache);
+}
+
+TEST(wc3_slk, unitabilities_default_active_ability_is_fourcc) {
+    static char const slk[] =
+        "ID;PWXL;N;E\n"
+        "B;X4;Y2;D0\n"
+        "C;X1;Y1;K\"unitAbilID\"\n"
+        "C;X2;K\"abilList\"\n"
+        "C;X3;K\"heroAbilList\"\n"
+        "C;X4;K\"auto\"\n"
+        "C;X1;Y2;K\"uA01\"\n"
+        "C;X2;K\"Aren\"\n"
+        "C;X4;K\"Aren\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *old = G_SetSLKRows("UnitAbilities", rows);
+    uint32_t const unit_id = MAKEFOURCC('u','A','0','1');
+    edict_t unit = { .class_id = unit_id };
+
+    G_BindEntityData(&unit);
+    T_EQ(G_UnitAbil(unit_id)->defaultActiveAbility, MAKEFOURCC('A','r','e','n'));
+    T_EQ(UnitMetaInteger(&unit, MAKEFOURCC('u','d','a','a')), MAKEFOURCC('A','r','e','n'));
+
+    G_SetSLKRows("UnitAbilities", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_unit_default_active_ability_override_inherits_to_custom_unit) {
+    static char const slk[] =
+        "ID;PWXL;N;E\nB;X3;Y2;D0\n"
+        "C;X1;Y1;K\"unitAbilID\"\nC;X2;K\"abilList\"\nC;X3;K\"auto\"\n"
+        "C;X1;Y2;K\"hfoo\"\nC;X2;K\"Arep\"\nC;X3;K\"Adef\"\nE\n";
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('u','A','0','1');
+    uint32_t default_active = MAKEFOURCC('A','r','e','p');
+    unitModification_t mod = {
+        .modID = MAKEFOURCC('u','d','a','a'), .type = mod_int, .data = &default_active
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 1, .modifications = &mod
+    };
+    unitData_t custom = { .originalUnitID = base_id, .newUnitID = custom_id };
+    mapInfo_t mapinfo = {
+        .num_originalUnits = 1, .originalUnits = &original,
+        .num_userCreatedUnits = 1, .userCreatedUnits = &custom
+    };
+    mapInfo_t const *saved_mapinfo;
+    slkTestData_t *rows = parse_slk_string(slk), *old_rows;
+    edict_t unit = { .class_id = custom_id };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    old_rows = G_SetSLKRows("UnitAbilities", rows);
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_UnitAbil(base_id)->defaultActiveAbility, default_active);
+    T_EQ(G_UnitAbil(custom_id)->defaultActiveAbility, default_active);
+    G_BindEntityData(&unit);
+    T_EQ(unit.data.UnitAbilities->defaultActiveAbility, default_active);
+    T_EQ((uint32_t)UnitMetaInteger(&unit, MAKEFOURCC('u','d','a','a')), default_active);
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+    G_SetSLKRows("UnitAbilities", old_rows);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_unit_name_resolves_wts_override) {
+    static const char profile_slk[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"Name\"\n"
+        "C;Y2;X1;K\"hfoo\"\n"
+        "C;Y2;X2;K\"Footman\"\n"
+        "E\n";
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('x','f','o','o');
+    mapTrigStr_t string = { .id = 28, .text = "Plagued Male Villager" };
+    unitModification_t name = {
+        .modID = MAKEFOURCC('u','n','a','m'), .type = mod_string,
+        .data = (handle_t)"TRIGSTR_028"
+    };
+    entityState_t state = { 0 };
+    edict_t ent = {
+        .inuse = true, .class_id = custom_id, .svflags = SVF_MONSTER,
+        .s = { .class_id = custom_id, .player = 0 }
+    };
+    unitData_t custom = {
+        .originalUnitID = base_id, .newUnitID = custom_id,
+        .numbeOfModifications = 1, .modifications = &name
+    };
+    mapInfo_t mapinfo = {
+        .strings = &string, .num_userCreatedUnits = 1, .userCreatedUnits = &custom
+    };
+    slkTestData_t *rows = parse_slk_string(profile_slk);
+    slkTestData_t *saved_rows;
+    mapInfo_t const *saved_mapinfo;
+    cstring_t pool;
+    uint32_t slot;
+
+    setup_test_world();
+    ent.health.value = 100.0f;
+    saved_rows = G_SetProfileRows(rows);
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_STREQ(G_UnitProfile(custom_id)->name, "TRIGSTR_028");
+    T_STREQ(G_UnitName(custom_id), "Plagued Male Villager");
+    T_STREQ(G_UnitName(base_id), "Footman");
+
+    globals.CustomizeEntity(0, &ent, &state);
+    T_ASSERT(state.name != 0);
+    slot = (state.name - 1) / ENT_NAMES_PER_CS;
+    pool = gi.GetConfigstring(CS_GENERAL + slot);
+    T_NOT_NULL(pool);
+    if (pool)
+        T_ASSERT(entity_name_slot_equals(pool + ((state.name - 1) % ENT_NAMES_PER_CS) * ENT_NAME_SLOT_SIZE, "Plagued Male Villager"));
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+    G_SetProfileRows(saved_rows);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, slk_fourcc_metadata_reads_typed_row) {
+    uint32_t id = MAKEFOURCC('h','p','e','a');
+    edict_t unit = { .class_id = id };
+    G_BindEntityData(&unit);
+    T_FEQ(UnitMetaReal(&unit, MAKEFOURCC('u','m','v','s')), unit.data.UnitBalance->speed, 0.01f);
+}
+
+TEST(wc3_slk, fourcc_metadata_reads_rows_cached_on_edict) {
+    UnitProfile_t profile = { .name = "Cached Unit" };
+    UnitBalance_t balance = { .level = 17, .speed = 321.5f };
+    UnitUI_t ui = { .hideHeroBar = true };
+    edict_t unit = { .data.UnitProfile = &profile, .data.UnitBalance = &balance, .data.UnitUI = &ui };
+
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','n','a','m')), "Cached Unit");
+    T_EQ(UnitMetaInteger(&unit, MAKEFOURCC('u','l','e','v')), 17);
+    T_FEQ(UnitMetaReal(&unit, MAKEFOURCC('u','m','v','s')), 321.5f, 0.01f);
+    T_ASSERT(UnitMetaBoolean(&unit, MAKEFOURCC('u','h','h','b')));
+}
+
+/* ua2m is the second weapon's missile art; it must not alias attack 1 (ua1m). */
+TEST(wc3_slk, fourcc_metadata_maps_each_attack_missile_art) {
+    UnitProfile_t profile = { .attack = { { .art = "Abilities\\Weapons\\RifleImpact\\RifleImpact.mdl" }, { .art = "Abilities\\Weapons\\Cannonball\\Cannonball.mdl" } } };
+    edict_t unit = { .data.UnitProfile = &profile };
+
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','a','1','m')), profile.attack[0].art);
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','a','2','m')), profile.attack[1].art);
+}
+
+/* -----------------------------------------------------------------------
+ * 2.  In-memory SLK parsing (parse_slk_string)
+ * --------------------------------------------------------------------- */
+
+static const char slk_two_units[] =
+    "ID;PWXL;N;EBB;Y3;X4\n"
+    "C;Y1;X1;K\"unitBalanceID\"\n"
+    "C;Y1;X2;K\"spd\"\n"
+    "C;Y1;X3;K\"realHP\"\n"
+    "C;Y1;X4;K\"bldtm\"\n"
+    "C;Y2;X1;K\"hpea\"\n"
+    "C;Y2;X2;K\"270\"\n"
+    "C;Y2;X3;K\"250\"\n"
+    "C;Y2;X4;K\"45\"\n"
+    "C;Y3;X1;K\"hfoo\"\n"
+    "C;Y3;X2;K\"270\"\n"
+    "C;Y3;X3;K\"420\"\n"
+    "C;Y3;X4;K\"60\"\n"
+    "E\n";
+
+TEST(wc3_slk, parse_returns_non_null) {
+    slkTestData_t *rows = parse_slk_string(slk_two_units);
+    T_NOT_NULL(rows);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, parse_row_names) {
+    slkTestData_t *rows = parse_slk_string(slk_two_units);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "hpea", "spd"), "270");
+    T_STREQ(find_slk_value(rows, "hfoo", "spd"), "270");
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, parse_field_values) {
+    slkTestData_t *rows = parse_slk_string(slk_two_units);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "hpea", "spd"),    "270");
+    T_STREQ(find_slk_value(rows, "hpea", "realHP"), "250");
+    T_STREQ(find_slk_value(rows, "hpea", "bldtm"),  "45");
+    T_STREQ(find_slk_value(rows, "hfoo", "realHP"), "420");
+    T_STREQ(find_slk_value(rows, "hfoo", "bldtm"),  "60");
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, parse_missing_cell_returns_null) {
+    slkTestData_t *rows = parse_slk_string(slk_two_units);
+    T_NOT_NULL(rows);
+    T_NULL(find_slk_value(rows, "hkni", "spd"));
+    T_NULL(find_slk_value(rows, "hpea", "armor"));
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, parse_empty_string_returns_null) {
+    slkTestData_t *rows = parse_slk_string("ID;PWXL\nE\n");
+    T_NULL(rows);
+}
+
+/* -----------------------------------------------------------------------
+ * 3.  Unit stat accessors — real archive data
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_slk, unit_speed_peasant) {
+    setup_test_world();
+    float speed = G_UnitBalance(MAKEFOURCC('h','p','e','a'))->speed;
+    T_ASSERT(speed == 190.0f || speed == 270.0f); /* TFT / ROC */
+}
+
+TEST(wc3_slk, unit_speed_footman) {
+    T_EQ(G_UnitBalance(MAKEFOURCC('h','f','o','o'))->id, MAKEFOURCC('h','f','o','o'));
+    T_FEQ(G_UnitBalance(MAKEFOURCC('h','f','o','o'))->speed, 270.0f, 0.01f);
+}
+
+TEST(wc3_slk, unit_hp_peasant) {
+    float hp = G_UnitBalance(MAKEFOURCC('h','p','e','a'))->maxHealth;
+    T_ASSERT(hp == 220.0f || hp == 250.0f); /* TFT / ROC */
+}
+
+TEST(wc3_slk, unit_hp_footman) {
+    T_FEQ(G_UnitBalance(MAKEFOURCC('h','f','o','o'))->maxHealth, 420.0f, 0.01f);
+}
+
+TEST(wc3_slk, unit_build_time_peasant) {
+    int32_t build = G_UnitBalance(MAKEFOURCC('h','p','e','a'))->buildTime;
+    T_ASSERT(build == 15 || build == 45); /* TFT / ROC */
+}
+
+TEST(wc3_slk, unit_build_time_footman) {
+    int32_t build = G_UnitBalance(MAKEFOURCC('h','f','o','o'))->buildTime;
+    T_ASSERT(build == 20 || build == 60); /* TFT / ROC */
+}
+
+TEST(wc3_slk, unit_collision_peasant) {
+    T_EQ(G_UnitCollision(MAKEFOURCC('h','p','e','a')), 16);
+}
+
+TEST(wc3_slk, global_array_backs_spawned_unit) {
+    edict_t ent = { .class_id = MAKEFOURCC('h','f','o','o') };
+    T_NOT_NULL(g_UnitBalance);
+    T_ASSERT(g_UnitBalanceCount > 0);
+    SP_CallSpawn(&ent);
+    T_ASSERT(ent.data.UnitProfile == G_UnitProfile(ent.class_id));
+    T_ASSERT(ent.data.UnitBalance == G_UnitBalance(ent.class_id));
+    T_ASSERT(ent.data.UnitData == G_UnitData(ent.class_id));
+    T_ASSERT(ent.data.UnitUI == G_UnitUI(ent.class_id));
+    T_ASSERT(ent.data.UnitWeapons == G_UnitWeapons(ent.class_id));
+    T_ASSERT(ent.data.UnitAbilities == G_UnitAbil(ent.class_id));
+}
+
+TEST(wc3_slk, unit_model_filename_preserves_authored_extension) {
+    PATHSTR path;
+
+    G_NormalizeModelFilename("Units\\Campaign\\Hero\\Hero.mdl", path, sizeof(path));
+    T_STREQ(path, "Units\\Campaign\\Hero\\Hero.mdl");
+    G_NormalizeModelFilename("war3mapImported/CustomHero.mdx", path, sizeof(path));
+    T_STREQ(path, "war3mapImported/CustomHero.mdx");
+}
+
+TEST(wc3_slk, unit_model_filename_adds_mdx_to_base_slk_stem) {
+    PATHSTR path;
+
+    G_NormalizeModelFilename("Units\\Human\\Footman\\Footman", path, sizeof(path));
+    T_STREQ(path, "Units\\Human\\Footman\\Footman.mdx");
+}
+
+TEST(wc3_slk, map_unit_balance_overrides_stock_fields_and_custom_inheritance) {
+    uint32_t const base_id = MAKEFOURCC('n','m','e','r');
+    uint32_t const custom_id = MAKEFOURCC('x','m','e','r');
+    uint32_t stock_max = 1, stock_regen = 7, stock_start = 0, gold = 321;
+    mapInfo_t const *saved_mapinfo;
+    UnitBalance_t const *base;
+    int32_t saved_stock_max, saved_stock_regen, saved_stock_start, saved_gold;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('u','s','m','a'), .type = mod_int, .data = &stock_max },
+        { .modID = MAKEFOURCC('u','s','r','g'), .type = mod_int, .data = &stock_regen },
+        { .modID = MAKEFOURCC('u','s','s','t'), .type = mod_int, .data = &stock_start },
+        { .modID = MAKEFOURCC('u','g','o','l'), .type = mod_int, .data = &gold },
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 4, .modifications = mods
+    };
+    unitData_t custom = { .originalUnitID = base_id, .newUnitID = custom_id };
+    mapInfo_t mapinfo = {
+        .num_originalUnits = 1, .originalUnits = &original,
+        .num_userCreatedUnits = 1, .userCreatedUnits = &custom
+    };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    base = G_UnitBalance(base_id);
+    saved_stock_max = base->stockMax;
+    saved_stock_regen = base->stockRegen;
+    saved_stock_start = base->stockStart;
+    saved_gold = base->goldCost;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_UnitBalance(base_id)->stockMax, 1);
+    T_EQ(G_UnitBalance(base_id)->stockRegen, 7);
+    T_EQ(G_UnitBalance(base_id)->stockStart, 0);
+    T_EQ(G_UnitBalance(base_id)->goldCost, 321);
+    T_EQ(G_UnitBalance(custom_id)->stockMax, 1);
+    T_EQ(G_UnitBalance(custom_id)->stockRegen, 7);
+    T_EQ(G_UnitBalance(custom_id)->stockStart, 0);
+    T_EQ(G_UnitBalance(custom_id)->goldCost, 321);
+    {
+        edict_t unit = { .class_id = custom_id };
+        G_BindEntityData(&unit);
+        T_ASSERT(unit.data.UnitBalance == G_UnitBalance(custom_id));
+        T_EQ(UnitMetaInteger(&unit, MAKEFOURCC('u','s','s','t')), 0);
+    }
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+    T_EQ(G_UnitBalance(base_id)->stockMax, saved_stock_max);
+    T_EQ(G_UnitBalance(base_id)->stockRegen, saved_stock_regen);
+    T_EQ(G_UnitBalance(base_id)->stockStart, saved_stock_start);
+    T_EQ(G_UnitBalance(base_id)->goldCost, saved_gold);
+}
+
+TEST(wc3_slk, map_item_data_overrides_stock_fields_and_custom_inheritance) {
+    uint32_t const base_id = MAKEFOURCC('s','p','r','o');
+    uint32_t const custom_id = MAKEFOURCC('x','p','r','o');
+    uint32_t stock_max = 1, stock_regen = 7, stock_start = 3, gold = 321;
+    mapInfo_t const *saved_mapinfo;
+    ItemData_t const *base;
+    int32_t saved_stock_max, saved_stock_regen, saved_stock_start, saved_gold;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('i','s','t','o'), .type = mod_int, .data = &stock_max },
+        { .modID = MAKEFOURCC('i','s','t','r'), .type = mod_int, .data = &stock_regen },
+        { .modID = MAKEFOURCC('i','s','s','t'), .type = mod_int, .data = &stock_start },
+        { .modID = MAKEFOURCC('i','g','o','l'), .type = mod_int, .data = &gold },
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 4, .modifications = mods
+    };
+    unitData_t custom = { .originalUnitID = base_id, .newUnitID = custom_id };
+    mapInfo_t mapinfo = {
+        .num_originalItems = 1, .originalItems = &original,
+        .num_userCreatedItems = 1, .userCreatedItems = &custom
+    };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    base = G_ItemData(base_id);
+    saved_stock_max = base->stockMax;
+    saved_stock_regen = base->stockRegen;
+    saved_stock_start = base->stockStart;
+    saved_gold = base->goldcost;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_ItemData(base_id)->stockMax, 1);
+    T_EQ(G_ItemData(base_id)->stockRegen, 7);
+    T_EQ(G_ItemData(base_id)->stockStart, 3);
+    T_EQ(G_ItemData(base_id)->goldcost, 321);
+    T_EQ(G_ItemData(custom_id)->id, custom_id);
+    T_EQ(G_ItemData(custom_id)->stockMax, 1);
+    T_EQ(G_ItemData(custom_id)->stockRegen, 7);
+    T_EQ(G_ItemData(custom_id)->stockStart, 3);
+    T_EQ(G_ItemData(custom_id)->goldcost, 321);
+    {
+        edict_t item = { .class_id = custom_id };
+        G_BindEntityData(&item);
+        T_ASSERT(item.data.ItemData == G_ItemData(custom_id));
+        T_EQ(item.data.ItemData->stockStart, 3);
+    }
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+    T_EQ(G_ItemData(base_id)->stockMax, saved_stock_max);
+    T_EQ(G_ItemData(base_id)->stockRegen, saved_stock_regen);
+    T_EQ(G_ItemData(base_id)->stockStart, saved_stock_start);
+    T_EQ(G_ItemData(base_id)->goldcost, saved_gold);
+}
+
+TEST(wc3_slk, map_destructable_overrides_inherit_and_normalize_armor) {
+    static cstring_t const dest_slk[] = {
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\nC;Y1;X2;K\"armor\"\nC;Y1;X3;K\"HP\"\nC;Y1;X4;K\"name\"\n"
+        "C;Y2;X1;K\"LT05\"\nC;Y2;X2;K\"None\"\nC;Y2;X3;K100\nC;Y2;X4;K\"ROC base\"\nE\n",
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\nC;Y1;X2;K\"armor\"\nC;Y1;X3;K\"HP\"\nC;Y1;X4;K\"Name\"\n"
+        "C;Y2;X1;K\"LT05\"\nC;Y2;X2;K\"None\"\nC;Y2;X3;K100\nC;Y2;X4;K\"TFT base\"\nE\n"
+    };
+    uint32_t const base_id = MAKEFOURCC('L','T','0','5');
+    uint32_t const custom_id = MAKEFOURCC('x','T','0','5');
+    uint32_t health = 250;
+    cstring_t const material = "Stone";
+    unitModification_t original_mod = {
+        .modID = MAKEFOURCC('b','a','r','m'), .type = mod_string, .data = (handle_t)"Wood"
+    };
+    unitModification_t custom_mods[] = {
+        { .modID = MAKEFOURCC('b','h','p','s'), .type = mod_int, .data = &health },
+        { .modID = MAKEFOURCC('b','a','r','m'), .type = mod_string, .data = (handle_t)material },
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 1, .modifications = &original_mod
+    };
+    unitData_t custom = {
+        .originalUnitID = base_id, .newUnitID = custom_id,
+        .numbeOfModifications = 2, .modifications = custom_mods
+    };
+    mapInfo_t mapinfo = {
+        .num_originalDestructables = 1, .originalDestructables = &original,
+        .num_userCreatedDestructables = 1, .userCreatedDestructables = &custom
+    };
+    slkTestData_t *rows;
+    slkTestData_t *saved_rows;
+    mapInfo_t const *saved_mapinfo;
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    FOR_LOOP(edition, sizeof(dest_slk) / sizeof(dest_slk[0])) {
+        rows = parse_slk_string(dest_slk[edition]);
+        saved_rows = G_SetSLKRows("DestructableData", rows);
+        G_SetMapUnitOverrides(&mapinfo);
+
+        T_EQ(G_DestructableData(base_id)->armor, 3);
+        T_STREQ(G_DestructableData(base_id)->armorSoundType, "Wood");
+        T_EQ(G_DestructableData(custom_id)->armor, 5);
+        T_STREQ(G_DestructableData(custom_id)->armorSoundType, "Stone");
+        T_EQ(G_DestructableData(custom_id)->maxHealth, 250);
+        T_STREQ(G_DestructableData(custom_id)->displayName, edition ? "TFT base" : "ROC base");
+
+        G_SetMapUnitOverrides(NULL);
+        G_SetSLKRows("DestructableData", saved_rows);
+        free_slk_rows(rows);
+    }
+    level.mapinfo = saved_mapinfo;
+}
+
+/* The pathing/occlusion fields use the DestructableMetaData.slk IDs boch, bflh, bwal, bonw and bonc. */
+TEST(wc3_slk, map_destructable_overrides_apply_pathing_and_occlusion_fields) {
+    static cstring_t const dest_slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\nC;Y1;X2;K\"occH\"\nC;Y1;X3;K\"flyH\"\nC;Y1;X4;K\"walkable\"\nC;Y1;X5;K\"onWater\"\nC;Y1;X6;K\"onCliffs\"\n"
+        "C;Y2;X1;K\"LTbr\"\nC;Y2;X2;K0\nC;Y2;X3;K0\nC;Y2;X4;K0\nC;Y2;X5;K0\nC;Y2;X6;K0\nE\n";
+    uint32_t const base_id = MAKEFOURCC('L','T','b','r');
+    float occluder_height = 150.0f;
+    float fly_height = 32.0f;
+    uint32_t enabled = 1;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('b','o','c','h'), .type = mod_real, .data = &occluder_height },
+        { .modID = MAKEFOURCC('b','f','l','h'), .type = mod_real, .data = &fly_height },
+        { .modID = MAKEFOURCC('b','w','a','l'), .type = mod_int, .data = &enabled },
+        { .modID = MAKEFOURCC('b','o','n','w'), .type = mod_int, .data = &enabled },
+        { .modID = MAKEFOURCC('b','o','n','c'), .type = mod_int, .data = &enabled },
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 5, .modifications = mods
+    };
+    mapInfo_t mapinfo = { .num_originalDestructables = 1, .originalDestructables = &original };
+    slkTestData_t *rows;
+    slkTestData_t *saved_rows;
+    mapInfo_t const *saved_mapinfo;
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    rows = parse_slk_string(dest_slk);
+    saved_rows = G_SetSLKRows("DestructableData", rows);
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_DestructableData(base_id)->occluderHeight, 150.0f);
+    T_EQ(G_DestructableData(base_id)->flyHeight, 32.0f);
+    T_ASSERT(G_DestructableData(base_id)->walkable);
+    T_ASSERT(G_DestructableData(base_id)->onWater);
+    T_ASSERT(G_DestructableData(base_id)->onCliffs);
+
+    G_SetMapUnitOverrides(NULL);
+    G_SetSLKRows("DestructableData", saved_rows);
+    free_slk_rows(rows);
+    level.mapinfo = saved_mapinfo;
+}
+
+TEST(wc3_slk, map_custom_unit_ui_overrides_model_and_scale) {
+    static const char slk_ui[] =
+        "C;Y1;X1;K\"unitUIID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"modelScale\"\n"
+        "C;Y2;X1;K\"hfoo\"\n"
+        "C;Y2;X2;K\"Units\\Human\\Footman\\Footman\"\n"
+        "C;Y2;X3;K\"1.0\"\n"
+        "E\n";
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('x','f','o','o');
+    mapInfo_t const *saved_mapinfo;
+    slkTestData_t *rows = parse_slk_string(slk_ui);
+    slkTestData_t *saved_ui;
+    slkTestData_t *replaced_ui;
+    UnitUI_t const *base;
+    float scale = 1.75f;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('u','m','d','l'), .type = mod_string, .data = (handle_t)"Units\\Campaign\\CorrectHero\\CorrectHero" },
+        { .modID = MAKEFOURCC('u','s','c','a'), .type = mod_real, .data = &scale },
+    };
+    unitData_t custom = {
+        .originalUnitID = base_id, .newUnitID = custom_id,
+        .numbeOfModifications = 2, .modifications = mods
+    };
+    mapInfo_t mapinfo = { .num_userCreatedUnits = 1, .userCreatedUnits = &custom };
+
+    setup_test_world();
+    T_NOT_NULL(rows);
+    saved_ui = G_SetSLKRows("UnitUI", rows);
+    T_NOT_NULL(saved_ui);
+    saved_mapinfo = level.mapinfo;
+    base = G_UnitUI(base_id);
+    T_STREQ(base->modelFile, "Units\\Human\\Footman\\Footman");
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_UnitUI(custom_id)->id, custom_id);
+    T_STREQ(G_UnitUI(custom_id)->modelFile, "Units\\Campaign\\CorrectHero\\CorrectHero");
+    T_FEQ(G_UnitUI(custom_id)->modelScale, 1.75f, 0.001f);
+    T_STREQ(G_UnitUI(base_id)->modelFile, base->modelFile);
+    {
+        edict_t unit = { .class_id = custom_id };
+        G_BindEntityData(&unit);
+        T_ASSERT(unit.data.UnitUI == G_UnitUI(custom_id));
+        T_STREQ(unit.data.UnitUI->modelFile, "Units\\Campaign\\CorrectHero\\CorrectHero");
+    }
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+    replaced_ui = G_SetSLKRows("UnitUI", saved_ui);
+    free_slk_rows(replaced_ui);
+    free_slk_rows(saved_ui);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_original_unit_ui_override_is_custom_inheritance_source) {
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('x','f','o','o');
+    mapInfo_t const *saved_mapinfo;
+    unitModification_t model = {
+        .modID = MAKEFOURCC('u','m','d','l'), .type = mod_string,
+        .data = (handle_t)"Units\\Campaign\\OriginalOverride\\OriginalOverride"
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 1, .modifications = &model
+    };
+    unitData_t custom = { .originalUnitID = base_id, .newUnitID = custom_id };
+    mapInfo_t mapinfo = {
+        .num_originalUnits = 1, .originalUnits = &original,
+        .num_userCreatedUnits = 1, .userCreatedUnits = &custom
+    };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_STREQ(G_UnitUI(base_id)->modelFile, "Units\\Campaign\\OriginalOverride\\OriginalOverride");
+    T_STREQ(G_UnitUI(custom_id)->modelFile, "Units\\Campaign\\OriginalOverride\\OriginalOverride");
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+}
+
+TEST(wc3_slk, map_custom_unit_ui_rows_are_stable_per_unit) {
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const first_id = MAKEFOURCC('x','f','o','1');
+    uint32_t const second_id = MAKEFOURCC('x','f','o','2');
+    mapInfo_t const *saved_mapinfo;
+    unitModification_t models[] = {
+        { .modID = MAKEFOURCC('u','m','d','l'), .type = mod_string, .data = (handle_t)"Units\\Campaign\\First\\First" },
+        { .modID = MAKEFOURCC('u','m','d','l'), .type = mod_string, .data = (handle_t)"Units\\Campaign\\Second\\Second" },
+    };
+    unitData_t custom[] = {
+        { .originalUnitID = base_id, .newUnitID = first_id, .numbeOfModifications = 1, .modifications = &models[0] },
+        { .originalUnitID = base_id, .newUnitID = second_id, .numbeOfModifications = 1, .modifications = &models[1] },
+    };
+    mapInfo_t mapinfo = { .num_userCreatedUnits = 2, .userCreatedUnits = custom };
+    UnitUI_t const *first;
+    UnitUI_t const *second;
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+    first = G_UnitUI(first_id);
+    second = G_UnitUI(second_id);
+
+    T_ASSERT(first != second);
+    T_STREQ(first->modelFile, "Units\\Campaign\\First\\First");
+    T_STREQ(second->modelFile, "Units\\Campaign\\Second\\Second");
+    T_STREQ(first->modelFile, "Units\\Campaign\\First\\First");
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+}
+
+
+TEST(wc3_slk, required_animation_names_select_matching_alternate_sequence) {
+    animation_t animations[] = {
+        { .name = "Stand" },
+        { .name = "Stand Alternate" },
+        { .name = "Walk" },
+        { .name = "Walk Alternate" },
+    };
+    animation_t const *selected;
+
+    selected = G_SelectAnimationForProperties(animations, 4, "stand", "alternate");
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Stand Alternate");
+
+    selected = G_SelectAnimationForProperties(animations, 4, "walk", "alternate");
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Walk Alternate");
+
+    selected = G_SelectAnimationForProperties(animations, 4, "stand", "");
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Stand");
+}
+
+TEST(wc3_slk, randomized_walk_variants_keep_the_selected_tag_set) {
+    animation_t animations[] = {
+        { .name = "Walk - 1", .syncpoint = 17 },
+        { .name = "Walk - 2", .syncpoint = 17 },
+        { .name = "Walk - 1 Alternate", .syncpoint = 17 },
+        { .name = "Walk - 2 Alternate", .syncpoint = 17 },
+        { .name = "Stand - 1", .syncpoint = 17 },
+    };
+
+    srand(1);
+    for (int i = 0; i < 64; i++) {
+        animation_t const *generic = G_SelectAnimationVariantForProperties(animations, 5, "walk", "", true);
+        animation_t const *alternate = G_SelectAnimationVariantForProperties(animations, 5, "walk", "alternate", true);
+        T_NOT_NULL(generic);
+        T_NOT_NULL(alternate);
+        if (generic) T_ASSERT(!strncmp(generic->name, "Walk", 4) && strstr(generic->name, "Alternate") == NULL);
+        if (alternate) T_ASSERT(!strncmp(alternate->name, "Walk", 4) && strstr(alternate->name, "Alternate") != NULL);
+    }
+}
+
+TEST(wc3_slk, required_animation_names_alternateex_falls_back_to_alternate_sequences) {
+    animation_t animations[] = {
+        { .name = "Stand" },
+        { .name = "Stand Alternate" },
+        { .name = "Walk" },
+        { .name = "Walk Alternate" },
+    };
+    animation_t const *selected;
+
+    selected = G_SelectAnimationForProperties(animations, 4, "stand", "alternateex");
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Stand Alternate");
+
+    selected = G_SelectAnimationForProperties(animations, 4, "walk", "alternateex");
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Walk Alternate");
+}
+
+TEST(wc3_slk, required_animation_names_alternateex_prefers_real_alternateex_sequence) {
+    animation_t animations[] = {
+        { .name = "Stand" },
+        { .name = "Stand Alternate" },
+        { .name = "Stand AlternateEx" },
+    };
+    animation_t const *selected = G_SelectAnimationForProperties(animations, 3, "stand", "alternateex");
+
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Stand AlternateEx");
+}
+
+TEST(wc3_slk, required_animation_names_combine_order_tags_with_unit_tags) {
+    animation_t animations[] = {
+        { .name = "Stand Ready" },
+        { .name = "Stand Alternate" },
+        { .name = "Stand Ready Alternate" },
+    };
+    animation_t const *selected = G_SelectAnimationForProperties(animations, 3, "stand ready", "alternate");
+
+    T_NOT_NULL(selected);
+    if (selected) T_STREQ(selected->name, "Stand Ready Alternate");
+}
+
+TEST(wc3_slk, decay_secondary_tag_falls_back_within_decay_family) {
+    animation_t animations[] = {
+        { .name = "Stand" },
+        { .name = "Decay" },
+        { .name = "Death" },
+    };
+    animation_t const *flesh = G_SelectAnimationForProperties(animations, 3, "decay flesh", NULL);
+    animation_t const *bone = G_SelectAnimationForProperties(animations, 3, "decay bone", NULL);
+
+    T_NOT_NULL(flesh);
+    T_NOT_NULL(bone);
+    if (flesh) T_STREQ(flesh->name, "Decay");
+    if (bone) T_STREQ(bone->name, "Decay");
+}
+
+TEST(wc3_slk, unit_animation_properties_add_and_remove_persistent_tags) {
+    UnitProfile_t profile = { .animProps = "alternate" };
+    edict_t unit = { .class_id = MAKEFOURCC('n','m','d','m'), .data.UnitProfile = &profile };
+
+    G_ResetUnitAnimationProperties(&unit);
+    T_STREQ(unit.animation_props, "alternate");
+
+    G_AddUnitAnimationProperties(&unit, "work", true);
+    T_STREQ(unit.animation_props, "alternate,work");
+    G_AddUnitAnimationProperties(&unit, "alternate", false);
+    T_STREQ(unit.animation_props, "work");
+}
+
+TEST(wc3_slk, map_original_required_animation_names_feed_custom_inheritance) {
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('x','f','o','b');
+    mapInfo_t const *saved_mapinfo;
+    unitModification_t anim_props = {
+        .modID = MAKEFOURCC('u','a','n','i'), .type = mod_string, .data = (handle_t)"alternate"
+    };
+    unitData_t original = {
+        .originalUnitID = base_id, .numbeOfModifications = 1, .modifications = &anim_props
+    };
+    unitData_t custom = { .originalUnitID = base_id, .newUnitID = custom_id };
+    mapInfo_t mapinfo = {
+        .num_originalUnits = 1, .originalUnits = &original,
+        .num_userCreatedUnits = 1, .userCreatedUnits = &custom
+    };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_STREQ(G_UnitProfile(base_id)->animProps, "alternate");
+    T_STREQ(G_UnitProfile(custom_id)->animProps, "alternate");
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+}
+
+TEST(wc3_slk, map_custom_unit_profile_overrides_required_animation_names) {
+    uint32_t const base_id = MAKEFOURCC('h','f','o','o');
+    uint32_t const custom_id = MAKEFOURCC('x','f','o','a');
+    mapInfo_t const *saved_mapinfo;
+    unitModification_t anim_props = {
+        .modID = MAKEFOURCC('u','a','n','i'), .type = mod_string, .data = (handle_t)"alternate"
+    };
+    unitData_t custom = {
+        .originalUnitID = base_id, .newUnitID = custom_id,
+        .numbeOfModifications = 1, .modifications = &anim_props
+    };
+    mapInfo_t mapinfo = { .num_userCreatedUnits = 1, .userCreatedUnits = &custom };
+    edict_t unit = { .class_id = custom_id };
+
+    setup_test_world();
+    saved_mapinfo = level.mapinfo;
+    level.mapinfo = &mapinfo;
+    G_SetMapUnitOverrides(&mapinfo);
+
+    T_EQ(G_UnitProfile(custom_id)->id, custom_id);
+    T_STREQ(G_UnitProfile(custom_id)->animProps, "alternate");
+    G_BindEntityData(&unit);
+    T_STREQ(UnitMetaString(&unit, MAKEFOURCC('u','a','n','i')), "alternate");
+    G_ResetUnitAnimationProperties(&unit);
+    T_STREQ(unit.animation_props, "alternate");
+
+    G_SetMapUnitOverrides(NULL);
+    level.mapinfo = saved_mapinfo;
+}
+
+TEST(wc3_slk, weapon_columns_decode_into_attack_records) {
+    cstring_t slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"unitWeaponID\"\nC;Y1;X2;K\"dmgplus1\"\nC;Y1;X3;K\"dmgplus2\"\n"
+        "C;Y1;X4;K\"rangeN1\"\nC;Y1;X5;K\"rangeN2\"\n"
+        "C;Y2;X1;K\"hfoo\"\nC;Y2;X2;K12\nC;Y2;X3;K34\nC;Y2;X4;K90\nC;Y2;X5;K600\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("UnitWeapons", rows);
+    UnitWeapons_t const *weapons = G_UnitWeapons(MAKEFOURCC('h','f','o','o'));
+    T_ASSERT(weapons == g_UnitWeapons);
+    T_EQ(weapons->attack1.damageBase, 12); T_EQ(weapons->attack2.damageBase, 34);
+    T_FEQ(weapons->attack1.range, 90.0f, 0.01f); T_FEQ(weapons->attack2.range, 600.0f, 0.01f);
+    G_SetSLKRows("UnitWeapons", saved); free_slk_rows(rows);
+}
+
+TEST(wc3_slk, optional_tables_tolerate_absent_files) {
+    T_ASSERT(G_SLKStoreOptional("AbilityBuffData")); /* expansion-only: War3x.mpq, hidden when fs_expansion==0 */
+    T_ASSERT(G_SLKStoreOptional("AbilitySounds"));
+    T_ASSERT(G_SLKStoreOptional("AmbienceSounds"));
+    T_ASSERT(G_SLKStoreOptional("AnimSounds"));
+    T_ASSERT(G_SLKStoreOptional("DialogSounds"));
+    T_ASSERT(G_SLKStoreOptional("Music")); /* never shipped; Warsmash loads it optionally */
+    T_ASSERT(!G_SLKStoreOptional("UnitBalance"));
+    T_ASSERT(!G_SLKStoreOptional("NoSuchTable"));
+    T_EQ(G_AbilityBuffData(MAKEFOURCC('x','x','x','x'))->id, 0); /* unknown keys return the static zero row */
+    T_NULL(G_MusicData("NoSuchMusic")->FileNames);
+}
+
+TEST(wc3_slk, ability_buff_ui_columns_decode) {
+    AbilityBuffData_t const *buff = G_AbilityBuffData(MAKEFOURCC('B','i','m','l'));
+    T_EQ(buff->id, MAKEFOURCC('B','i','m','l'));
+    T_STREQ(buff->buffArt, "ReplaceableTextures\\CommandButtons\\BTNImmolationOn.blp");
+    T_STREQ(buff->buffTip, "Immolation");
+    T_STREQ(buff->targetArt, "TestUI\\Models\\anim_pulse.mdx");
+    T_STREQ(buff->specialArt, "TestUI\\Models\\panel_sprite.mdx");
+    T_STREQ(buff->effectArt, "TestUI\\Models\\quad_sprite.mdx");
+    T_STREQ(buff->missileArt, "TestUI\\Models\\ui_panel.mdx");
+}
+
+TEST(wc3_slk, upgrade_class_column_decodes) {
+    UpgradeData_t const *upgrade = G_UpgradeData(MAKEFOURCC('R','h','m','e'));
+    T_EQ(upgrade->id, MAKEFOURCC('R','h','m','e'));
+    T_STREQ(upgrade->upgradeClass, "melee");
+}
+
+TEST(wc3_slk, unit_unknown_id_returns_zero) {
+    T_FEQ(G_UnitBalance(MAKEFOURCC('x','x','x','x'))->speed,      0.0f, 0.01f);
+    T_FEQ(G_UnitBalance(MAKEFOURCC('x','x','x','x'))->maxHealth,  0.0f, 0.01f);
+    T_EQ  (G_UnitBalance(MAKEFOURCC('x','x','x','x'))->buildTime, 0);
+}
+
+/* -----------------------------------------------------------------------
+ * 4.  Mana / armor edge cases via typed table replacement
+ * --------------------------------------------------------------------- */
+
+TEST(wc3_slk, mana_uses_realM_not_manaN) {
+    static const char slk_mana[] =
+        "ID;PWXL;N;EBB;Y3;X4\n"
+        "C;Y1;X1;K\"unitBalanceID\"\n"
+        "C;Y1;X2;K\"manaN\"\n"
+        "C;Y1;X3;K\"realM\"\n"
+        "C;Y1;X4;K\"mana0\"\n"
+        "C;Y2;X1;K\"Ewar\"\n"
+        "C;Y2;X2;K\"0\"\n"
+        "C;Y2;X3;K\"225\"\n"
+        "C;Y2;X4;K\"100\"\n"
+        "C;Y3;X1;K\"hsor\"\n"
+        "C;Y3;X2;K\"200\"\n"
+        "C;Y3;X3;K\"200\"\n"
+        "C;Y3;X4;K\"75\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk_mana);
+    T_NOT_NULL(rows);
+    slkTestData_t *saved_mana = G_SetSLKRows("UnitBalance", rows);
+
+    T_FEQ(G_UnitBalance(MAKEFOURCC('E','w','a','r'))->maxMana, 225.0f, 0.01f);
+    T_FEQ(G_UnitBalance(MAKEFOURCC('E','w','a','r'))->initialMana, 100.0f, 0.01f);
+    T_FEQ(G_UnitBalance(MAKEFOURCC('h','s','o','r'))->maxMana, 200.0f, 0.01f);
+    T_FEQ(G_UnitBalance(MAKEFOURCC('h','s','o','r'))->initialMana, 75.0f, 0.01f);
+
+    /* Restore the archive table before freeing the temporary rows; later suites share this metadata. */
+    G_SetSLKRows("UnitBalance", saved_mana);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, armor_uses_realdef_not_def) {
+    static const char slk_armor[] =
+        "ID;PWXL;N;EBB;Y3;X4\n"
+        "C;Y1;X1;K\"unitBalanceID\"\n"
+        "C;Y1;X2;K\"def\"\n"
+        "C;Y1;X3;K\"realdef\"\n"
+        "C;Y1;X4;K\"spd\"\n"
+        "C;Y2;X1;K\"Ewar\"\n"
+        "C;Y2;X2;K\"0\"\n"
+        "C;Y2;X3;K\"4\"\n"
+        "C;Y2;X4;K\"270\"\n"
+        "C;Y3;X1;K\"hfoo\"\n"
+        "C;Y3;X2;K\"2\"\n"
+        "C;Y3;X3;K\"2\"\n"
+        "C;Y3;X4;K\"270\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk_armor);
+    T_NOT_NULL(rows);
+    slkTestData_t *saved_arm = G_SetSLKRows("UnitBalance", rows);
+
+    T_FEQ(G_UnitBalance(MAKEFOURCC('E','w','a','r'))->armor, 4.0f, 0.01f);
+    T_FEQ(G_UnitBalance(MAKEFOURCC('h','f','o','o'))->armor, 2.0f, 0.01f);
+
+    G_SetSLKRows("UnitBalance", saved_arm);
+    free_slk_rows(rows);
+}
+
+
+static PATHSTR spawn_tex;
+static PATHSTR spawn_model;
+static uint32_t spawn_images;
+static int capture_spawn_image(cstring_t name) {
+    snprintf(spawn_tex, sizeof(spawn_tex), "%s", name); spawn_images++; return 42;
+}
+static int capture_spawn_model(cstring_t name) {
+    snprintf(spawn_model, sizeof(spawn_model), "%s", name); return 43;
+}
+
+static cstring_t doodad_model_probe_existing;
+
+static bool doodad_model_probe_exists(cstring_t name) {
+    return doodad_model_probe_existing && !strcmp(name, doodad_model_probe_existing);
+}
+
+TEST(wc3_slk, doodad_model_uses_file_stem_and_only_appends_real_variations) {
+    static cstring_t const single_slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"dir\"\n"
+        "C;Y1;X4;K\"numVar\"\n"
+        "C;Y2;X1;K\"LOo2\"\n"
+        "C;Y2;X2;K\"Doodads\\LordaeronSummer\\Props\\BannerHuman\\BannerHuman.mdx\"\n"
+        "C;Y2;X3;K\"LegacyDir\"\n"
+        "C;Y2;X4;K1\n"
+        "E\n";
+    static cstring_t const varied_slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"numVar\"\n"
+        "C;Y2;X1;K\"LOo2\"\n"
+        "C;Y2;X2;K\"Doodads\\LordaeronSummer\\Props\\BannerHuman\\BannerHuman\"\n"
+        "C;Y2;X3;K3\n"
+        "E\n";
+    slkTestData_t *single_rows = parse_slk_string(single_slk);
+    slkTestData_t *varied_rows = parse_slk_string(varied_slk);
+    slkTestData_t *saved = G_SetSLKRows("Doodads", single_rows);
+    int (*old_index)(cstring_t) = gi.ModelIndex;
+    bool (*old_exists)(cstring_t) = gi.FileExists;
+    edict_t ent = { .class_id = MAKEFOURCC('L','O','o','2'), .variation = 0 };
+
+    setup_test_world();
+    spawn_model[0] = '\0';
+    gi.ModelIndex = capture_spawn_model;
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\LordaeronSummer\\Props\\BannerHuman\\BannerHuman.mdx");
+
+    G_SetSLKRows("Doodads", varied_rows);
+    memset(&ent, 0, sizeof(ent));
+    ent.class_id = MAKEFOURCC('L','O','o','2');
+    ent.variation = 2;
+    doodad_model_probe_existing = "Doodads\\LordaeronSummer\\Props\\BannerHuman\\BannerHuman2.mdx";
+    gi.FileExists = doodad_model_probe_exists;
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\LordaeronSummer\\Props\\BannerHuman\\BannerHuman2.mdx");
+
+    G_SetSLKRows("Doodads", saved);
+    free_slk_rows(single_rows);
+    free_slk_rows(varied_rows);
+    doodad_model_probe_existing = NULL;
+    gi.FileExists = old_exists;
+    gi.ModelIndex = old_index;
+}
+
+/* W3D doodads have original-object edits and custom objects.  A Rexxar
+ * forcewall-style custom ID must inherit LOfl, then use its dfil override;
+ * base SLK entries must remain untouched when the overlay is removed. */
+TEST(wc3_slk, map_w3d_custom_forcewall_model_inherits_parent_and_clears_on_switch) {
+    static cstring_t const slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"numVar\"\n"
+        "C;Y1;X4;K\"walkable\"\n"
+        "C;Y2;X1;K\"LOfl\"\n"
+        "C;Y2;X2;K\"Doodads\\Dungeon\\Props\\Original\\Original.mdx\"\n"
+        "C;Y2;X3;K1\n"
+        "C;Y2;X4;K1\n"
+        "E\n";
+    char original_file[] = "Doodads\\Dungeon\\Props\\OriginalEdited\\OriginalEdited.mdl";
+    char forcewall_file[] = "Doodads\\Dungeon\\Props\\Forcewall\\Forcewall.mdl";
+    int32_t variants = 1;
+    unitModification_t orig_mod = {
+        .modID = MAKEFOURCC('d','f','i','l'), .type = mod_string, .data = original_file
+    };
+    unitModification_t custom_mods[] = {
+        { .modID = MAKEFOURCC('d','f','i','l'), .type = mod_string, .data = forcewall_file },
+        { .modID = MAKEFOURCC('d','v','a','r'), .type = mod_int, .data = &variants },
+    };
+    unitData_t originals[] = { {
+        .originalUnitID = MAKEFOURCC('L','O','f','l'),
+        .numbeOfModifications = 1, .modifications = &orig_mod
+    } };
+    unitData_t customs[] = { {
+        .originalUnitID = MAKEFOURCC('L','O','f','l'),
+        .newUnitID = MAKEFOURCC('D','0','0','E'),
+        .numbeOfModifications = 2, .modifications = custom_mods
+    } };
+    mapInfo_t mapinfo = {
+        .num_originalDoodads = 1, .originalDoodads = originals,
+        .num_userCreatedDoodads = 1, .userCreatedDoodads = customs
+    };
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *old;
+    int (*old_model)(cstring_t) = gi.ModelIndex;
+    edict_t ent = { .class_id = MAKEFOURCC('D','0','0','E') };
+
+    setup_test_world();
+    old = G_SetSLKRows("Doodads", rows);
+    gi.ModelIndex = capture_spawn_model;
+    G_SetMapUnitOverrides(&mapinfo);
+    T_STREQ(G_Doodad(MAKEFOURCC('L','O','f','l'))->file, original_file);
+    T_STREQ(G_Doodad(ent.class_id)->file, forcewall_file);
+    T_ASSERT(G_Doodad(ent.class_id)->walkable);
+    T_EQ(G_Doodad(ent.class_id)->numVar, 1);
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\Dungeon\\Props\\Forcewall\\Forcewall.mdx");
+
+    G_SetMapUnitOverrides(NULL);
+    T_EQ(G_Doodad(ent.class_id)->id, 0);
+    T_STREQ(G_Doodad(MAKEFOURCC('L','O','f','l'))->file,
+            "Doodads\\Dungeon\\Props\\Original\\Original.mdx");
+    gi.ModelIndex = old_model;
+    G_SetSLKRows("Doodads", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, map_w3d_original_variations_and_custom_inheritance) {
+    static cstring_t const slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"numVar\"\n"
+        "C;Y2;X1;K\"LOfl\"\n"
+        "C;Y2;X2;K\"Doodads\\Original\\Original\"\n"
+        "C;Y2;X3;K1\nE\n";
+    int32_t variants = 3;
+    unitModification_t mod = {
+        .modID = MAKEFOURCC('d','v','a','r'), .type = mod_int,
+        .level = 0, .data = &variants
+    };
+    unitData_t original = {
+        .originalUnitID = MAKEFOURCC('L','O','f','l'),
+        .numbeOfModifications = 1, .modifications = &mod
+    };
+    unitData_t custom = {
+        .originalUnitID = MAKEFOURCC('L','O','f','l'),
+        .newUnitID = MAKEFOURCC('D','0','0','1')
+    };
+    mapInfo_t info = {
+        .num_originalDoodads = 1, .originalDoodads = &original,
+        .num_userCreatedDoodads = 1, .userCreatedDoodads = &custom
+    };
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *old;
+    int (*old_model)(cstring_t) = gi.ModelIndex;
+    bool (*old_exists)(cstring_t) = gi.FileExists;
+    edict_t ent = { .class_id = MAKEFOURCC('D','0','0','1'), .variation = 2 };
+
+    setup_test_world();
+    old = G_SetSLKRows("Doodads", rows);
+    G_SetMapUnitOverrides(&info);
+    T_EQ(G_Doodad(ent.class_id)->numVar, 3);
+    gi.ModelIndex = capture_spawn_model;
+    gi.FileExists = doodad_model_probe_exists;
+    doodad_model_probe_existing = "Doodads\\Original\\Original2.mdx";
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\Original\\Original2.mdx");
+
+    doodad_model_probe_existing = NULL;
+    gi.FileExists = old_exists;
+    gi.ModelIndex = old_model;
+    G_SetMapUnitOverrides(NULL);
+    G_SetSLKRows("Doodads", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, roc_doodad_short_file_uses_dir_and_model_folder) {
+    static cstring_t const slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"dir\"\n"
+        "C;Y1;X3;K\"file\"\n"
+        "C;Y1;X4;K\"numVar\"\n"
+        "C;Y2;X1;K\"LPwh\"\n"
+        "C;Y2;X2;K\"Doodads\\LordaeronSummer\\Plants\"\n"
+        "C;Y2;X3;K\"Wheat\"\n"
+        "C;Y2;X4;K1\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("Doodads", rows);
+    int (*old_index)(cstring_t) = gi.ModelIndex;
+    edict_t ent = { .class_id = MAKEFOURCC('L','P','w','h') };
+
+    setup_test_world();
+    spawn_model[0] = '\0';
+    gi.ModelIndex = capture_spawn_model;
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\LordaeronSummer\\Plants\\Wheat\\Wheat.mdx");
+
+    gi.ModelIndex = old_index;
+    G_SetSLKRows("Doodads", saved);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, doodad_model_missing_variation_falls_back_to_unsuffixed_asset) {
+    static cstring_t const slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"numVar\"\n"
+        "C;Y2;X1;K\"LOo2\"\n"
+        "C;Y2;X2;K\"Doodads\\Props\\Banner\\Banner\"\n"
+        "C;Y2;X3;K3\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("Doodads", rows);
+    int (*old_index)(cstring_t) = gi.ModelIndex;
+    bool (*old_exists)(cstring_t) = gi.FileExists;
+    edict_t ent = { .class_id = MAKEFOURCC('L','O','o','2'), .variation = 2 };
+
+    setup_test_world();
+    spawn_model[0] = '\0';
+    gi.ModelIndex = capture_spawn_model;
+    doodad_model_probe_existing = "Doodads\\Props\\Banner\\Banner.mdx";
+    gi.FileExists = doodad_model_probe_exists;
+    SP_CallSpawn(&ent);
+    T_STREQ(spawn_model, "Doodads\\Props\\Banner\\Banner.mdx");
+
+    doodad_model_probe_existing = NULL;
+    gi.FileExists = old_exists;
+    gi.ModelIndex = old_index;
+    G_SetSLKRows("Doodads", saved);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, single_variation_bridge_registers_authoritative_unsuffixed_model) {
+    static cstring_t const slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"file\"\n"
+        "C;Y1;X3;K\"numVar\"\n"
+        "C;Y1;X4;K\"targType\"\n"
+        "C;Y2;X1;K\"LT05\"\n"
+        "C;Y2;X2;K\"Doodads\\Terrain\\WoodBridgeLarge45\\WoodBridgeLarge45.mdx\"\n"
+        "C;Y2;X3;K1\n"
+        "C;Y2;X4;K\"debris\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("DestructableData", rows);
+    int (*old_index)(cstring_t) = gi.ModelIndex;
+    edict_t ent = { .class_id = MAKEFOURCC('L','T','0','5'), .variation = 0 };
+
+    setup_test_world();
+    spawn_model[0] = '\0';
+    gi.ModelIndex = capture_spawn_model;
+    SP_CallSpawn(&ent);
+
+    T_STREQ(spawn_model, "Doodads\\Terrain\\WoodBridgeLarge45\\WoodBridgeLarge45.mdx");
+    G_SetSLKRows("DestructableData", saved);
+    free_slk_rows(rows);
+    gi.ModelIndex = old_index;
+}
+
+/* Drive the real spawn path with SLK texFile values: no replacement, extensionless art, and a source TGA name. */
+TEST(wc3_slk, destructable_texture_preserves_extension_and_absent_sentinel) {
+    static cstring_t const names[] = { "_", "", "ReplaceableTextures\\Cliff\\Cliff0.tga",
+                                   "ReplaceableTextures\\LordaeronTree\\LordaeronSummerTree" };
+    slkTestData_t *saved = NULL;
+    int (*old_index)(cstring_t) = gi.ImageIndex;
+    setup_test_world();
+    gi.ImageIndex = capture_spawn_image;
+    FOR_LOOP(i, sizeof(names) / sizeof(names[0])) {
+        char slk[1024];
+        snprintf(slk, sizeof(slk), "ID;PWXL;N;E\nC;Y1;X1;K\"ID\"\nC;Y1;X2;K\"file\"\nC;Y1;X3;K\"texFile\"\nC;Y1;X4;K\"targType\"\nC;Y2;X1;K\"LT05\"\nC;Y2;X2;K\"Cliff\"\nC;Y2;X3;K\"%s\"\nC;Y2;X4;K\"debris\"\nE\n", names[i]);
+        slkTestData_t *rows = parse_slk_string(slk);
+        if (!saved) saved = G_SetSLKRows("DestructableData", rows);
+        else G_SetSLKRows("DestructableData", rows);
+        edict_t ent = { .class_id = MAKEFOURCC('L','T','0','5') };
+        spawn_images = 0;
+        SP_CallSpawn(&ent);
+        T_EQ(ent.s.image, i < 2 ? 0 : 42);
+        T_EQ(spawn_images, i < 2 ? 0 : 1);
+        if (i >= 2) T_STREQ(spawn_tex, names[i]);
+        G_SetSLKRows("DestructableData", saved);
+        free_slk_rows(rows);
+    }
+    gi.ImageIndex = old_index;
+}
+
+TEST(wc3_slk, armor_material_tokens_normalize_for_combat_sound_lookup) {
+    static cstring_t const ui_slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"unitUIID\"\n"
+        "C;Y1;X2;K\"armor\"\n"
+        "C;Y2;X1;K\"hfoo\"\n"
+        "C;Y2;X2;K\"Flesh\"\n"
+        "E\n";
+    static cstring_t const dest_slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"ID\"\n"
+        "C;Y1;X2;K\"armor\"\n"
+        "C;Y2;X1;K\"LT05\"\n"
+        "C;Y2;X2;K\"Stone\"\n"
+        "E\n";
+    slkTestData_t *ui_rows = parse_slk_string(ui_slk);
+    slkTestData_t *dest_rows = parse_slk_string(dest_slk);
+    slkTestData_t *old_ui = G_SetSLKRows("UnitUI", ui_rows);
+    slkTestData_t *old_dest = G_SetSLKRows("DestructableData", dest_rows);
+
+    T_EQ(G_UnitUI(MAKEFOURCC('h','f','o','o'))->armorType, 1);
+    T_STREQ(G_UnitUI(MAKEFOURCC('h','f','o','o'))->armorSoundType, "Flesh");
+    T_EQ(G_DestructableData(MAKEFOURCC('L','T','0','5'))->armor, 5);
+    T_STREQ(G_DestructableData(MAKEFOURCC('L','T','0','5'))->armorSoundType, "Stone");
+
+    G_SetSLKRows("DestructableData", old_dest); free_slk_rows(dest_rows);
+    G_SetSLKRows("UnitUI", old_ui); free_slk_rows(ui_rows);
+}
+
+TEST(wc3_slk, unit_weapon_target_lists_decode_to_targetflag_mask) {
+    cstring_t slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"unitWeapID\"\n"
+        "C;Y1;X2;K\"targs1\"\n"
+        "C;Y1;X3;K\"targs2\"\n"
+        "C;Y2;X1;K\"hfoo\"\n"
+        "C;Y2;X2;K\"ground,structure,debris,item,ward\"\n"
+        "C;Y2;X3;K\"air,bridge\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("UnitWeapons", rows);
+
+    T_EQ(g_UnitWeaponsCount, 1);
+    T_EQ(g_UnitWeapons[0].attack1.targetsAllowed, 2u | 8u | 16u | 32u | 256u);
+    T_EQ(g_UnitWeapons[0].attack2.targetsAllowed, 4u | 1024u);
+
+    G_SetSLKRows("UnitWeapons", saved);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_slk, doodad_fields_use_typed_row) {
+    cstring_t slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"doodID\"\nC;Y1;X2;K\"dir\"\nC;Y1;X3;K\"file\"\n"
+        "C;Y2;X1;K\"LTlt\"\nC;Y2;X2;K\"Doodads\\Terrain\"\nC;Y2;X3;K\"Tree\"\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("Doodads", rows);
+    Doodads_t const *row = G_Doodad(MAKEFOURCC('L','T','l','t'));
+    T_EQ(row->id, MAKEFOURCC('L','T','l','t'));
+    T_STREQ(row->dir, "Doodads\\Terrain"); T_STREQ(row->file, "Tree");
+    G_SetSLKRows("Doodads", saved); free_slk_rows(rows);
+}
+
+TEST(wc3_slk, uber_splat_fields_use_typed_row) {
+    cstring_t slk =
+        "ID;PWXL;N;E\n"
+        "C;Y1;X1;K\"Name\"\nC;Y1;X2;K\"Dir\"\nC;Y1;X3;K\"file\"\nC;Y1;X4;K\"Scale\"\n"
+        "C;Y2;X1;K\"HMtp\"\nC;Y2;X2;K\"Splats\"\nC;Y2;X3;K\"TownHall\"\nC;Y2;X4;K4\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk);
+    slkTestData_t *saved = G_SetSLKRows("UberSplatData", rows);
+    UberSplatData_t const *row = G_UberSplat(MAKEFOURCC('H','M','t','p'));
+    T_STREQ(row->Dir, "Splats"); T_STREQ(row->file, "TownHall"); T_FEQ(row->Scale, 4.0f, 0.01f);
+    G_SetSLKRows("UberSplatData", saved); free_slk_rows(rows);
+}
+
+/* -----------------------------------------------------------------------
+ * 5.  Production SLK buffer parser through Stb_SlkLoadBuffer
+ * --------------------------------------------------------------------- */
+
+/* Omitted Y uses stateful current row; ROC tables rely on this heavily. */
+TEST(wc3_slk, prod_stateful_y) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"HP\"\n"
+        "C;Y2;X1;K\"hero\"\n"
+        "C;X2;K\"500\"\n"   /* Y omitted: Y=2 carries from previous C */
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "hero", "HP"), "500");
+}
+
+/* Multiple columns populated using only omitted Y (stateful row context). */
+TEST(wc3_slk, prod_stateful_xy) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"HP\"\n"
+        "C;Y1;X3;K\"MP\"\n"
+        "C;Y2;X1;K\"mage\"\n"
+        "C;X2;K\"500\"\n"   /* Y=2 carries; X=2: HP */
+        "C;X3;K\"200\"\n"   /* Y=2 carries; X=3: MP */
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "mage", "HP"), "500");
+    T_STREQ(find_slk_value(rows, "mage", "MP"), "200");
+}
+
+/* F record advances X without creating a cell; next C inherits the updated X. */
+TEST(wc3_slk, prod_f_advances_x) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"HP\"\n"
+        "C;Y2;X1;K\"mage\"\n"
+        "F;X2\n"            /* advance X to 2, no K → no cell */
+        "C;Y2;K\"400\"\n"   /* X=2 from F, Y=2 explicit: HP=400 */
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "mage", "HP"), "400");
+}
+
+/* B record dimension bounds are advisory; wrong values must not corrupt output. */
+TEST(wc3_slk, prod_b_record_advisory) {
+    static const char src[] =
+        "B;Y999;X999\n"     /* wildly overstated bounds, must be ignored */
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"HP\"\n"
+        "C;Y2;X1;K\"unit\"\n"
+        "C;Y2;X2;K\"300\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "unit", "HP"), "300");
+}
+
+/* Semicolons inside a quoted K value must not split the field. */
+TEST(wc3_slk, prod_quoted_semicolon) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"path\"\n"
+        "C;Y2;X1;K\"itm1\"\n"
+        "C;Y2;X2;K\"foo;bar\"\n"  /* semicolon inside quotes */
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "itm1", "path"), "foo;bar");
+}
+
+/* "" inside a quoted K value decodes to a single literal double-quote. */
+TEST(wc3_slk, prod_quote_escape) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"note\"\n"
+        "C;Y2;X1;K\"obj1\"\n"
+        "C;Y2;X2;K\"foo\"\"bar\"\n"  /* SLK: K"foo""bar" → foo"bar */
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "obj1", "note"), "foo\"bar");
+}
+
+/* Cells with Y=0 must be skipped; valid rows below must still parse. */
+TEST(wc3_slk, prod_zero_y_ignored) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"HP\"\n"
+        "C;Y0;X2;K\"BAD\"\n"    /* invalid Y=0, must be skipped */
+        "C;Y2;X1;K\"unit\"\n"
+        "C;Y2;X2;K\"100\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "unit", "HP"), "100");
+    T_NULL(find_slk_value(rows, "BAD", "HP"));
+}
+
+/* File without an ID;PWXL magic line is parsed without error. */
+TEST(wc3_slk, prod_no_magic_line) {
+    static const char src[] =
+        "C;Y1;X1;K\"id\"\n"
+        "C;Y1;X2;K\"spd\"\n"
+        "C;Y2;X1;K\"foo\"\n"
+        "C;Y2;X2;K\"270\"\n"
+        "E\n";
+    slkTestData_t *rows = parse_slk_string(src);
+    T_NOT_NULL(rows);
+    T_STREQ(find_slk_value(rows, "foo", "spd"), "270");
+}
+
+/* ROC uses row-major Data11..Data34 names; rawcode and numeric consumers must see the same columns as TFT. */
+TEST(wc3_slk, roc_ability_data_preserves_object_ids_and_numbers) {
+    slkTestData_t *rows = parse_slk_string(
+        "ID;PWXL;N;EBB;Y2;X6\n"
+        "C;Y1;X1;K\"alias\"\nC;X2;K\"Data11\"\nC;X3;K\"Data13\"\n"
+        "C;X4;K\"Data21\"\nC;X5;K\"Data34\"\nC;X6;K\"UnitID1\"\n"
+        "C;Y2;X1;K\"Amrf\"\nC;X2;K\"nmed\"\nC;X3;K1.5\n"
+        "C;X4;K\"edot\"\nC;X5;K\"edtm\"\nC;X6;K\"nmdm\"\nE\n");
+    slkTestData_t *old = G_SetSLKRows("AbilityData", rows);
+    AbilityData_t const *row = G_AbilityData(MAKEFOURCC('A','m','r','f'));
+    T_EQ(row->level[0].data[0].id, MAKEFOURCC('n','m','e','d'));
+    T_FEQ(row->level[0].data[2].number, 1.5f, 0.001f);
+    T_EQ(row->level[1].data[0].id, MAKEFOURCC('e','d','o','t'));
+    T_EQ(row->level[2].data[3].id, MAKEFOURCC('e','d','t','m'));
+    T_EQ(row->level[0].unitID, MAKEFOURCC('n','m','d','m'));
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+#endif /* BZ_TESTS */

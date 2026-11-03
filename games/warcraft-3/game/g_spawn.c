@@ -1,0 +1,1423 @@
+#include "g_local.h"
+#include "common/map_load_debug.h"
+#include "games/warcraft-3/common/difficulty.h"
+#include "jass/jass.h"
+
+#define MAX_SPAWN_ITERATIONS 10
+#define MAX_REPOSITION_BLOCKERS 256 // entities; bounded broad-phase results, any hit rejects the point
+
+extern jassModule_t jass_funcs[];
+static edict_t *reposition_unit;
+static vec2_t const *reposition_point;
+
+static bool G_TutorialFlowDebugEnabledForMapSource(void) {
+    return WC3_TUTORIAL_DEBUG_ENABLED();
+}
+
+/* Keep generated war3map.j as the authoritative source for preplaced units and items. */
+static bool G_LoadMapUnitData(void) {
+    return atoi(gi.CvarString("wc3_load_units_from_map_data", "0")) != 0;
+}
+
+/* Unit/item placements are duplicated by the generated CreateAllUnits/CreateAllItems functions. */
+static bool G_MapObjectCreatedByMapScript(uint32_t id) {
+    if (id == MAKEFOURCC('s', 'l', 'o', 'c') || G_Doodad(id)->id || G_DestructableData(id)->file)
+        return false;
+    return G_UnitUI(id)->modelFile || G_ItemData(id)->file;
+}
+
+static char *G_Orc07SkipScriptSpace(char *cursor, char *end) {
+    while (cursor < end && (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n')) cursor++;
+    return cursor;
+}
+
+static bool G_Orc07TakeScriptToken(char **cursor, char *end, cstring_t token) {
+    size_t length = strlen(token);
+    size_t i;
+    bool identifier = true;
+    char *at = G_Orc07SkipScriptSpace(*cursor, end);
+
+    if (length > (size_t)(end - at) || strncmp(at, token, length)) return false;
+    for (i = 0; i < length; i++)
+        if (!((token[i] >= 'a' && token[i] <= 'z') || (token[i] >= 'A' && token[i] <= 'Z') ||
+              (token[i] >= '0' && token[i] <= '9') || token[i] == '_')) identifier = false;
+    if (identifier && at + length < end) {
+        char next = at[length];
+        if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') ||
+            (next >= '0' && next <= '9') || next == '_') return false;
+    }
+    *cursor = at + length;
+    return true;
+}
+
+/* HACK: The shipped Orc07 trigger asks the BJ last-created global for a
+ * destructable max life even though its map initializer only calls the native
+ * CreateDestructable. Rewrite that getter in the named bridge's restore call;
+ * changing BJ last-created semantics would affect unrelated maps, and the
+ * mounted campaign MPQ is read-only. */
+static bool G_FixOrc07BridgeRestoreScript(char *script) {
+    static cstring_t const function = "function Trig_GemstoneReturned_Actions takes";
+    static cstring_t const ending = "endfunction";
+    static cstring_t const restore = "DestructableRestoreLife";
+    static cstring_t const max_life = "GetDestructableMaxLife";
+    static cstring_t const last_created = "GetLastCreatedDestructable";
+    static cstring_t const bridge = "gg_dest_DTsb_0099";
+    char *start, *end, *cursor, *restore_call, *getter, *getter_end;
+    size_t old_size, new_size = strlen(bridge);
+
+    if (!script || !(start = strstr(script, function))) return false;
+    end = strstr(start, ending);
+    restore_call = strstr(start, restore);
+    if (!end || !restore_call || restore_call >= end) goto unsupported;
+
+    cursor = restore_call;
+    if (!G_Orc07TakeScriptToken(&cursor, end, restore) ||
+        !G_Orc07TakeScriptToken(&cursor, end, "(") ||
+        !G_Orc07TakeScriptToken(&cursor, end, bridge) ||
+        !G_Orc07TakeScriptToken(&cursor, end, ",") ||
+        !G_Orc07TakeScriptToken(&cursor, end, max_life) ||
+        !G_Orc07TakeScriptToken(&cursor, end, "(")) goto unsupported;
+
+    getter = G_Orc07SkipScriptSpace(cursor, end);
+    cursor = getter;
+    if (G_Orc07TakeScriptToken(&cursor, end, bridge) &&
+        G_Orc07TakeScriptToken(&cursor, end, ")")) return true;
+
+    cursor = getter;
+    if (!G_Orc07TakeScriptToken(&cursor, end, last_created) ||
+        !G_Orc07TakeScriptToken(&cursor, end, "(") ||
+        !G_Orc07TakeScriptToken(&cursor, end, ")")) goto unsupported;
+    getter_end = cursor;
+    old_size = (size_t)(getter_end - getter);
+    if (new_size > old_size) goto unsupported;
+    memcpy(getter, bridge, new_size);
+    memset(getter + new_size, ' ', old_size - new_size);
+    return true;
+
+unsupported:
+    fprintf(stderr, "G_SpawnEntities: Orc07 gemstone restore trigger has an unsupported script form\n");
+    return false;
+}
+
+#ifdef BZ_TESTS
+bool G_TestMapObjectCreatedByMapScript(uint32_t id) { return G_MapObjectCreatedByMapScript(id); }
+bool G_TestFixOrc07BridgeRestoreScript(char *script) { return G_FixOrc07BridgeRestoreScript(script); }
+#endif
+
+static void G_JassCoroutineTrace(jass_t *vm, handle_t coroutine, handle_t trigger_handle,
+                                 cstring_t function, cstring_t phase, uint32_t now,
+                                 uint32_t wake_time, bool yielded, bool done) {
+    trigger_t *trigger = trigger_handle;
+    int32_t ordinal;
+    G_BOT_TRACE_COROUTINE(vm, coroutine, function, phase, now, wake_time, yielded, done);
+    if (!G_TutorialFlowDebugEnabledForMapSource() || !trigger ||
+        trigger < level.triggers || trigger >= level.triggers + level.num_triggers) {
+        return;
+    }
+    ordinal = (int32_t)(trigger - level.triggers);
+    if (ordinal < 120 || ordinal > 165) return;
+    fprintf(stderr,
+            "WC3_TUTORIAL_COROUTINE phase=%s trigger=%ld function=\"%s\" now=%u wake=%u yielded=%d done=%d\n",
+            phase ? phase : "unknown", (long)ordinal,
+            function ? function : "(none)", (unsigned)now, (unsigned)wake_time,
+            (int)yielded, (int)done);
+}
+
+static void G_JassFunctionTrace(jass_t *vm, handle_t coroutine, cstring_t function, cstring_t phase) {
+#ifdef WC3_TRACE_AI
+    bot_t *bot = NULL;
+    jass_t *root = jass_getroot(vm);
+    FOR_LOOP(player, MAX_PLAYERS) if (level.bots[player].vm == root) { bot = level.bots + player; break; }
+    if (!bot) return;
+    fprintf(stderr, "WC3_AI_TRACE time=%u player=%u script=\"%s\" event=function_%s name=%s coroutine=%p\n",
+            (unsigned)G_Time(), PLAYER_NUM(bot->player), bot->script,
+            phase ? phase : "unknown", function ? function : "(unknown)", coroutine);
+#else
+    (void)vm; (void)coroutine; (void)function; (void)phase;
+#endif
+}
+
+void G_InitJassHost(void) {
+    jass_sethost(&MAKE(jassHost_t,
+        .MemAlloc = gi.MemAlloc,
+        .MemFree = gi.MemFree,
+        .GetTime = gi.GetTime,
+        .ReadFile = gi.ReadFile,
+        .natives = jass_funcs,
+        .GetPlayerByNumber = G_GetPlayerByNumber,
+        .TimerCoroutineValid = G_TimerCoroutineValid,
+        .SaveHandle = G_SaveJassHandle,
+        .LoadHandle = G_LoadJassHandle,
+        .CoroutineTrace = G_JassCoroutineTrace,
+        .FunctionTrace = G_JassFunctionTrace,
+        .VariableChanged = G_JassVariableChanged,
+    ));
+}
+
+static cstring_t G_FindJassMapFunction(cstring_t script, cstring_t name, cstring_t *finish) {
+    char needle[192];
+    cstring_t start, end;
+    if (finish) *finish = NULL;
+    if (!script || !name || !*name) return NULL;
+    snprintf(needle, sizeof(needle), "function %s takes", name);
+    start = strstr(script, needle);
+    if (!start) return NULL;
+    end = strstr(start, "endfunction");
+    if (!end) return start;
+    end += strlen("endfunction");
+    while (*end == '\r' || *end == '\n') end++;
+    if (finish) *finish = end;
+    return start;
+}
+
+static void G_DumpTutorialJassFunction(cstring_t script, cstring_t name) {
+    cstring_t start, finish;
+    size_t length;
+    start = G_FindJassMapFunction(script, name, &finish);
+    if (!start) {
+        fprintf(stdout, "WC3_TUTORIAL_SOURCE missing function=\"%s\"\n", name);
+        return;
+    }
+    if (!finish) {
+        fprintf(stdout, "WC3_TUTORIAL_SOURCE unterminated function=\"%s\"\n", name);
+        return;
+    }
+    length = (size_t)(finish - start);
+    fprintf(stdout, "WC3_TUTORIAL_SOURCE begin function=\"%s\"\n%.*s", name, (int)length, start);
+    if (!length || start[length - 1] != '\n') fputc('\n', stdout);
+    fprintf(stdout, "WC3_TUTORIAL_SOURCE end function=\"%s\"\n", name);
+}
+
+static bool G_JassRangeContains(cstring_t start, cstring_t finish, cstring_t needle) {
+    cstring_t hit;
+    if (!start || !finish || !needle || start >= finish) return false;
+    hit = strstr(start, needle);
+    return hit && hit < finish;
+}
+
+static void G_DumpTutorialJassFunctionsReferencing(cstring_t script, cstring_t needle) {
+    cstring_t cursor = script;
+    char function_name[160];
+    if (!script || !needle || !*needle) return;
+    while ((cursor = strstr(cursor, "function ")) != NULL) {
+        cstring_t name_start = cursor + strlen("function ");
+        cstring_t name_end = strstr(name_start, " takes");
+        cstring_t finish = strstr(name_start, "endfunction");
+        size_t name_len;
+        if (!name_end || !finish) break;
+        finish += strlen("endfunction");
+        if (G_JassRangeContains(cursor, finish, needle)) {
+            name_len = (size_t)(name_end - name_start);
+            if (name_len > 0 && name_len < sizeof(function_name)) {
+                memcpy(function_name, name_start, name_len);
+                function_name[name_len] = '\0';
+                fprintf(stdout,
+                        "WC3_TUTORIAL_SOURCE reference token=\"%s\" function=\"%s\"\n",
+                        needle, function_name);
+                G_DumpTutorialJassFunction(script, function_name);
+            }
+        }
+        cursor = finish;
+    }
+}
+
+static void G_DumpReferencedTutorialTriggers(cstring_t script, cstring_t start, cstring_t finish) {
+    cstring_t cursor = start;
+    char seen[16][96] = {{0}};
+    uint32_t seen_count = 0;
+    while (cursor && cursor < finish && seen_count < 16) {
+        cstring_t ref = strstr(cursor, "gg_trg_");
+        size_t len;
+        bool duplicate = false;
+        char suffix[96];
+        char function_name[160];
+        if (!ref || ref >= finish) break;
+        ref += strlen("gg_trg_");
+        len = 0;
+        while (ref + len < finish &&
+               ((ref[len] >= 'A' && ref[len] <= 'Z') ||
+                (ref[len] >= 'a' && ref[len] <= 'z') ||
+                (ref[len] >= '0' && ref[len] <= '9') || ref[len] == '_')) {
+            len++;
+        }
+        if (!len || len >= sizeof(suffix)) { cursor = ref + (len ? len : 1); continue; }
+        memcpy(suffix, ref, len);
+        suffix[len] = '\0';
+        FOR_LOOP(i, seen_count) if (!strcmp(seen[i], suffix)) duplicate = true;
+        if (!duplicate) {
+            snprintf(seen[seen_count++], sizeof(seen[0]), "%s", suffix);
+            fprintf(stdout, "WC3_TUTORIAL_SOURCE reference trigger=\"gg_trg_%s\"\n", suffix);
+            snprintf(function_name, sizeof(function_name), "Trig_%s_Conditions", suffix);
+            G_DumpTutorialJassFunction(script, function_name);
+            snprintf(function_name, sizeof(function_name), "Trig_%s_Actions", suffix);
+            G_DumpTutorialJassFunction(script, function_name);
+            snprintf(function_name, sizeof(function_name), "InitTrig_%s", suffix);
+            G_DumpTutorialJassFunction(script, function_name);
+        }
+        cursor = ref + len;
+    }
+}
+
+static void G_DumpPrologue02BurrowHandoffSource(cstring_t script) {
+    static cstring_t const root_names[] = {
+        "Trig_W2_BurrowComplete_Q_Func002001",
+        "Trig_W2_BurrowComplete_Q_Func007001",
+        "Trig_W2_BurrowComplete_Q_Conditions",
+        "Trig_W2_BurrowComplete_Q_Actions",
+        "InitTrig_W2_BurrowComplete_Q",
+        "Trig_W2_BurrowComplete_Abort_Conditions",
+        "Trig_W2_BurrowComplete_Abort_Actions",
+        "InitTrig_W2_BurrowComplete_Abort",
+        "Trig_W_Burrow_Check_Conditions",
+        "Trig_W_Burrow_Check_Actions",
+        "InitTrig_W_Burrow_Check",
+        "Trig_Done_Burrows_Q_Conditions",
+        "Trig_Done_Burrows_Q_Actions",
+        "InitTrig_Done_Burrows_Q",
+        "Trig_U1_SelectWarMill_Q_Conditions",
+        "Trig_U1_SelectWarMill_Q_Actions",
+        "InitTrig_U1_SelectWarMill_Q",
+    };
+    cstring_t action_start, action_finish;
+    if (!G_TutorialFlowDebugEnabledForMapSource()) return;
+    FOR_LOOP(i, sizeof(root_names) / sizeof(root_names[0]))
+        G_DumpTutorialJassFunction(script, root_names[i]);
+    action_start = G_FindJassMapFunction(script, "Trig_W2_BurrowComplete_Q_Actions", &action_finish);
+    if (action_start && action_finish)
+        G_DumpReferencedTutorialTriggers(script, action_start, action_finish);
+    G_DumpTutorialJassFunctionsReferencing(script, "gg_snd_T02Narrator031");
+    G_DumpTutorialJassFunctionsReferencing(script, "gg_snd_T02Narrator032");
+    G_DumpTutorialJassFunctionsReferencing(script, "gg_snd_T02Narrator033");
+    G_DumpTutorialJassFunctionsReferencing(script, "gg_snd_T02Narrator034");
+    G_DumpTutorialJassFunctionsReferencing(script, "gg_snd_T02Narrator035");
+}
+
+static uint32_t G_NormalizeMapObjectPlayer(uint32_t player) {
+    if (player < MAX_PLAYERS) {
+        return player;
+    }
+    return PLAYER_NEUTRAL_PASSIVE;
+}
+
+cstring_t targs[] = {
+    "none", // NONE
+    "air",  // AIR
+    "aliv", // ALIVE
+    "alli", // ALLIES
+    "dead", // DEAD
+    "debr", // DEBRIS
+    "enem", // ENEMIES
+    "grou", // GROUND
+    "hero", // HERO
+    "invu", // INVULNERABLE
+    "item", // ITEM
+    "mech", // MECHANICAL
+    "neut", // NEUTRAL
+    "nonh", // NONHERO
+    "nons", // NONSAPPER
+    "nots", // NOTSELF
+    "orga", // ORGANIC
+    "play", // PLAYERUNITS
+    "sapp", // SAPPER
+    "self", // SELF
+    "stru", // STRUCTURE
+    "terr", // TERRAIN
+    "tree", // TREE
+    "vuln", // VULNERABLE
+    "wall", // WALL
+    "ward", // WARD
+    "anci", // ANCIENT
+    "nona", // NONANCIENT
+    "frie", // FRIEND
+    "brid", // BRIDGE
+    "deco", // DECORATION
+};
+
+/* Convert an internal target category to the authored UnitWeapons targetflag bit. */
+uint32_t G_TargetFlagForType(TARGTYPE type) {
+    switch (type) {
+    case TARG_GROUND:     return WC3_TARGET_FLAG_GROUND;
+    case TARG_AIR:        return WC3_TARGET_FLAG_AIR;
+    case TARG_STRUCTURE:  return WC3_TARGET_FLAG_STRUCTURE;
+    case TARG_WARD:       return WC3_TARGET_FLAG_WARD;
+    case TARG_ITEM:       return WC3_TARGET_FLAG_ITEM;
+    case TARG_TREE:       return WC3_TARGET_FLAG_TREE;
+    case TARG_WALL:       return WC3_TARGET_FLAG_WALL;
+    case TARG_DEBRIS:     return WC3_TARGET_FLAG_DEBRIS;
+    case TARG_DECORATION: return WC3_TARGET_FLAG_DECORATION;
+    case TARG_BRIDGE:     return WC3_TARGET_FLAG_BRIDGE;
+    default:              return 0u;
+    }
+}
+
+TARGTYPE G_GetTargetType(cstring_t str) {
+    /* Missing target metadata means no target flags; strlen(NULL) previously crashed sparse unit transforms. */
+    if (!str || !*str) return TARG_NONE;
+    uint32_t const len = (uint32_t)strlen(str);
+    if (len < 3) return TARG_NONE;
+    char buf[64] = { 0 };
+    FOR_LOOP(c, len) buf[c] = tolower(str[c]);
+    FOR_LOOP(i, sizeof(targs)/sizeof(*targs)) {
+        if (*(uint32_t *)buf == *(uint32_t *)targs[i])
+            return i;
+    }
+    return TARG_NONE;
+}
+
+//struct spawn {
+//    cstring_t name;
+//    void (*func)(edict_t *edict);
+//};
+
+//static struct spawn spawns[] = {
+//    { "opeo", SP_monster_unit },
+//    { NULL, NULL }
+//};
+
+void SP_monster_unit(edict_t *edict);
+void SP_monster_tree(edict_t *edict);
+
+static void G_InitEdict(edict_t *e) {
+    memset(e, 0, sizeof(edict_t));
+    e->inuse = true;
+    e->s.scale = 1;
+    e->animation_speed = 1.0f;
+    e->s.number = (int)(e - g_edicts);
+    /*Issued-order state is kept outside edict_t for JASS/current-order
+     *compatibility. Clear it whenever an edict slot begins a new lifetime so
+     *recycled slots cannot inherit an old raw/JASS order. */
+    G_ClearIssuedOrderState(e);
+}
+
+edict_t *G_Spawn(void) {
+    for (uint32_t i = game.max_clients; i < globals.num_edicts; i++) {
+        edict_t *e = &g_edicts[i];
+        if (!e->inuse && e->freetime + 1000 < level.time) {
+            G_InitEdict(e);
+            return e;
+        }
+    }
+    if (globals.num_edicts >= globals.max_edicts) {
+        gi.error("G_Spawn: no free edicts (%d max)\n", globals.max_edicts);
+        return NULL;
+    }
+    edict_t *edict = &g_edicts[globals.num_edicts++];
+    G_InitEdict(edict);
+    return edict;
+}
+
+/* Probe authored variations through the engine VFS without reading model contents. */
+static bool SP_DoodadModelExists(cstring_t filename) {
+    return filename && *filename && gi.FileExists(filename);
+}
+
+/* Resolve an authored doodad model and only use a variation file that exists. */
+static void SP_DoodadModelFilename(Doodads_t const *row, uint32_t variation,
+                                   string_t out, size_t out_size) {
+    PATHSTR stem = { 0 };
+    PATHSTR varied = { 0 };
+    cstring_t file;
+    char *dot;
+
+    if (!out || !out_size) return;
+    out[0] = '\0';
+    if (!row || !(file = row->file) || !*file) return;
+
+    /* RoC rows pair dir with a short file name; newer rows can store a full path. */
+    if (strchr(file, '\\') || strchr(file, '/'))
+        strlcpy(stem, file, sizeof(stem));
+    else if (row->dir && *row->dir)
+        snprintf(stem, sizeof(stem), "%s\\%s\\%s", row->dir, file, file);
+    else
+        strlcpy(stem, file, sizeof(stem));
+    dot = strrchr(stem, '.');
+    if (dot && (!strcasecmp(dot, ".mdx") || !strcasecmp(dot, ".mdl")))
+        *dot = '\0';
+
+    if (row->numVar > 1) {
+        uint32_t const max_variation = (uint32_t)row->numVar - 1;
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), "%u.mdx", MIN(variation, max_variation));
+        if (strlen(stem) + strlen(suffix) >= sizeof(varied)) {
+            fprintf(stderr, "WC3 doodad model path is too long for '%.4s': %s%s\n",
+                    (cstring_t)&row->id, stem, suffix);
+            return;
+        }
+        strlcpy(varied, stem, sizeof(varied));
+        strlcat(varied, suffix, sizeof(varied));
+        if (SP_DoodadModelExists(varied)) {
+            strlcpy(out, varied, out_size);
+            return;
+        }
+        /* Some SLK rows advertise multiple variations even when a particular
+         * suffixed file is absent.  Warcraft/Warsmash fall back to the base
+         * model rather than registering a path that cannot be loaded. */
+    }
+    snprintf(out, out_size, "%s.mdx", stem);
+}
+
+static void SP_SpawnDoodad(edict_t *edict) {
+    Doodads_t const *row = edict->data.Doodads;
+    PATHSTR buffer;
+
+    SP_DoodadModelFilename(row, edict->variation, buffer, sizeof(buffer));
+    edict->s.model = G_RegisterModel(buffer);
+    edict->movetype = MOVETYPE_NONE;
+    edict->svflags |= SVF_STATIC_SCENERY;
+    /* Frame zero may show portrait-only geometry. Start the authored world sequence. */
+    G_DoodadSetAnimation(edict, "stand", false);
+}
+
+/* DestructableData may provide either a complete model stem (TFT/current
+ * data) or the older dir + short file pair. As in Warsmash, a variation
+ * suffix exists only when numVar > 1; appending "0" to a single-variation
+ * bridge points the game-side animation loader at a file that is not in
+ * War3.mpq even though the renderer can recover by stripping that digit. */
+static void SP_DestructableModelFilename(DestructableData_t const *row,
+                                         uint32_t variation,
+                                         string_t out,
+                                         size_t out_size) {
+    PATHSTR stem = { 0 };
+    cstring_t file;
+    char *dot;
+
+    if (!out || !out_size) return;
+    out[0] = '\0';
+    if (!row || !(file = row->file) || !*file) return;
+
+    if (strchr(file, '\\') || strchr(file, '/'))
+        strlcpy(stem, file, sizeof(stem));
+    else if (row->dir && *row->dir)
+        snprintf(stem, sizeof(stem), "%s\\%s\\%s", row->dir, file, file);
+    else
+        strlcpy(stem, file, sizeof(stem));
+
+    dot = strrchr(stem, '.');
+    if (dot && (!strcasecmp(dot, ".mdx") || !strcasecmp(dot, ".mdl")))
+        *dot = '\0';
+
+    if (row->numVar > 1) {
+        uint32_t const max_variation = (uint32_t)row->numVar - 1;
+        snprintf(out, out_size, "%s%u.mdx", stem, MIN(variation, max_variation));
+    } else {
+        snprintf(out, out_size, "%s.mdx", stem);
+    }
+}
+
+static void SP_SpawnDestructable(edict_t *edict) {
+    DestructableData_t const *row = edict->data.DestructableData;
+    cstring_t path_tex = row->pathingTexture;
+    float radius = row->radius;
+    float selection_radius = row->selcircsize > 0.0f ? row->selcircsize * 0.5f : radius;
+    PATHSTR buffer;
+    cstring_t tex = row->textureFile;
+    /* texFile may include an extension; "_" means the model has no replacement texture. */
+    edict->s.image = tex && *tex && strcmp(tex, "_") ? gi.ImageIndex(tex) : 0;
+    SP_DestructableModelFilename(row, edict->variation, buffer, sizeof(buffer));
+    edict->s.model = G_RegisterModel(buffer);
+    if (!edict->destructable) edict->destructable = G_AllocDestructable();
+    assert(edict->destructable);
+    edict->destructable->occluder_height = row->occluderHeight;
+    edict->destructable->alive_pathtex = M_LoadPathTex(path_tex);
+    edict->destructable->death_pathtex = M_LoadPathTex(row->deathPathingTexture);
+    edict->pathtex = edict->destructable->alive_pathtex;
+    /* selcircsize is an authored diameter for the selection circle. The
+     * destructable radius remains the gameplay collision footprint below. */
+    edict->s.radius = selection_radius > 0.0f ? selection_radius : 50.0f;
+    /* WC3 trees have collisionSize 0 and block solely via their baked pathing
+     * footprint; only destructables with a real radius (bridges, gates) get a
+     * collision circle.  Fabricating a 50-unit circle on every tree was a prime
+     * cause of units sticking on trunks. */
+    edict->collision = radius > 0.0f ? radius : 0.0f;
+    edict->destructable->alive_collision = edict->collision;
+    edict->destructable->dead = false;
+    edict->destructable->item_table = (uint32_t)-1;
+    edict->destructable->placement_solid = true;
+    edict->destructable->pathing_active = edict->pathtex || edict->collision > 0.0f;
+#ifndef USE_SHADOWMAPS
+    edict->s.shadow = G_LoadShadowTexture(row->shadow, false);
+    edict->s.shadow_rect = 0;
+#endif
+    edict->health.value = row->maxHealth;
+    edict->health.max_value = row->maxHealth;
+    edict->targtype = G_GetTargetType(row->targetType);
+    if (row->occluderHeight > 0 || edict->targtype == TARG_TREE) {
+        edict->s.flags |= EF_FOW_BLOCKER;
+        G_FowMarkBlockersDirty();
+    }
+    edict->movetype = MOVETYPE_NONE;
+    edict->svflags |= SVF_STATIC_SCENERY;
+    G_BlightInitializeDestructable(edict);
+}
+
+/* The destructable currently being visited by EnumDestructablesInRect, read
+ * back by the GetEnumDestructable native inside the enum action (mirrors the
+ * jass-lib `currentunit`/GetEnumUnit pair). */
+edict_t *currentdestructable = NULL;
+
+static bool G_ClassIdIsPrintable(uint32_t class_id) {
+    uint8_t const *id = (uint8_t const *)&class_id;
+
+    FOR_LOOP(i, 4) {
+        if (id[i] < 32 || id[i] > 126) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Bind immutable table rows after class_id is assigned and before entity-specific initialization. */
+void G_BindEntityData(edict_t *edict) {
+    edict->data.UnitProfile = G_UnitProfile(edict->class_id);
+    edict->data.UnitBalance = G_UnitBalance(edict->class_id);
+    edict->data.UnitData = G_UnitData(edict->class_id);
+    edict->data.UnitUI = G_UnitUI(edict->class_id);
+    edict->data.UnitWeapons = G_UnitWeapons(edict->class_id);
+    edict->data.UnitAbilities = G_UnitAbil(edict->class_id);
+    edict->data.Doodads = G_Doodad(edict->class_id);
+    edict->data.ItemData = G_ItemData(edict->class_id);
+    edict->data.DestructableData = G_DestructableData(edict->class_id);
+}
+
+/* Install class-owned unit/destructable lifecycle callbacks. Load restores the saved C callbacks
+ * through F_CFUNCTION; this helper is for spawn/tests that have class data but have not assigned
+ * those pointers yet. */
+void G_BindEntityRuntime(edict_t *edict) {
+    if (edict->data.DestructableData->file) {
+        edict->stand = tree_stand; edict->birth = tree_birth; edict->pain = tree_pain; edict->die = tree_die;
+        edict->think = monster_think;
+    } else if (edict->data.UnitBalance->id || edict->data.UnitUI->modelFile) {
+        edict->stand = unit_stand; edict->birth = unit_birth; edict->die = unit_die;
+        edict->think = monster_think;
+    }
+}
+
+void G_FillMapPlacedUnitMana(edict_t *ent) {
+    if (!ent || !(ent->s.flags & EF_UNIT) || ent->mana.max_value <= 0.0f) return;
+    ent->mana.value = ent->mana.max_value;
+}
+
+/* Preserve map-authored Hero progression before SP_SpawnUnit initializes it,
+ * while keeping scenery and other non-unit placements free of unit state. */
+void G_InitMapPlacementUnitState(edict_t *ent, doodad_t const *placement) {
+    if (!ent || !placement || !G_UnitBalance(placement->doodID)->id) return;
+    G_InitUnitState(ent);
+    ent->unit_state->hero = placement->hero;
+}
+
+void SP_CallSpawn(edict_t *edict) {
+    if (!edict->class_id)
+        return;
+    edict->s.class_id = edict->class_id;
+    G_BindEntityData(edict);
+    if (edict->data.Doodads->id) {
+        SP_SpawnDoodad(edict);
+    } else if (edict->data.DestructableData->file) {
+        SP_SpawnDestructable(edict);
+        SP_monster_tree(edict);
+    } else if (edict->data.UnitUI->modelFile) {
+        SP_SpawnUnit(edict);
+        SP_monster_unit(edict);
+    } else if (edict->data.ItemData->file) {
+        SP_SpawnItem(edict);
+    } else if (MAKEFOURCC('s', 'l', 'o', 'c') == edict->class_id) {
+        edict->svflags |= SVF_NOCLIENT;
+    } else {
+        if (edict->class_id == MAKEFOURCC('L', 'T', 'l', 't')) {
+            (void)G_DestructableData(edict->class_id)->file; /* TODO: use model path */
+        }
+        edict->svflags |= SVF_NOCLIENT;
+        if (!G_ClassIdIsPrintable(edict->class_id)) {
+            fprintf(stderr, "Warning: Invalid map object ID %.4s\n", (char const *)&edict->class_id);
+        }
+    }
+//    for (struct spawn *s = spawns; s->func; s++) {
+//        if (*((int const *)s->name) == edict->class_id) {
+//            s->func(edict);
+//            return;
+//        }
+//    }
+}
+
+void SP_worldspawn(edict_t *ent) {
+}
+
+static uint32_t G_MapPlayerTeam(mapInfo_t const *mapinfo, uint32_t playernum) {
+    if (!mapinfo || !mapinfo->teams) {
+        return playernum;
+    }
+    FOR_LOOP(i, mapinfo->num_teams) {
+        if (mapinfo->teams[i].playerMasks & (1u << playernum)) {
+            return i;
+        }
+    }
+    return playernum;
+}
+
+static uint32_t G_LocalMapPlayerNumber(mapInfo_t const *mapinfo) {
+    if (!mapinfo) {
+        return 0;
+    }
+    FOR_LOOP(i, MAX_PLAYERS) {
+        if (mapinfo->players[i].used && mapinfo->players[i].playerType == kPlayerTypeHuman) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static uint32_t G_ClientSlotMapPlayerNumber(mapInfo_t const *mapinfo, uint32_t slot, uint32_t local_player) {
+    uint32_t count = 1;
+
+    if (slot == 0) {
+        return local_player;
+    }
+    FOR_LOOP(i, MAX_PLAYERS) {
+        if (i == local_player) {
+            continue;
+        }
+        if (count++ == slot) {
+            return i;
+        }
+    }
+    return slot;
+}
+
+/* JASS mapcontrol values do not match W3I playerType values after computer. */
+static uint32_t G_MapControl(mapPlayer_t const *player) {
+    if (!player) return 5;
+    switch (player->playerType) {
+        case kPlayerTypeHuman: return 0;
+        case kPlayerTypeComputer: return 1;
+        case kPlayerTypeRescuable: return 2;
+        case kPlayerTypeNeutral: return 3;
+        default: return 5;
+    }
+}
+
+/* Race preferences are bit flags, unlike the sequential W3I race enum. */
+static uint32_t G_RacePreference(mapPlayer_t const *player) {
+    if (!player) return 0;
+    switch (player->playerRace) {
+        case kPlayerRaceHuman: return 1;
+        case kPlayerRaceOrc: return 2;
+        case kPlayerRaceNightElf: return 4;
+        case kPlayerRaceUndead: return 8;
+        default: return 32;
+    }
+}
+
+static void G_InitMapPlayer(edict_t *clent, mapInfo_t const *mapinfo, uint32_t playernum) {
+    mapPlayer_t const *player = mapinfo ? mapinfo->players + playernum : NULL;
+    cstring_t name = player && player->playerName ? G_LevelString(player->playerName) : NULL;
+    player_t *ps = &clent->client->ps;
+    G_SetClientConnected(clent, false);
+    G_ResetSelectionFocus(clent->client);
+    clent->client->commands_dirty = false;
+    /* The disabled-ability list is heap-owned; release it before the JASS state reset drops the pointer. */
+    G_ClearPlayerAbilityAvailability(clent->client);
+    memset(&clent->client->jass, 0, sizeof(clent->client->jass));
+    clent->client->departed = false;
+    memset(clent->client->tech, 0, sizeof(clent->client->tech));
+    /* Score totals belong to the outgoing match, never the next loaded map. */
+    memset(&clent->client->score, 0, sizeof(clent->client->score));
+    memset(ps, 0, sizeof(player_t));
+    ps->number = playernum;
+    ps->team = G_MapPlayerTeam(mapinfo, playernum);
+    ps->color = player ? player->color : playernum;
+    if (playernum == PLAYER_NEUTRAL_PASSIVE) ps->color = WC3_PLAYER_COLOR_LIGHT_GRAY;
+    ps->race = player ? player->playerRace : kPlayerRaceNone;
+    ps->name = (string_t)name;
+    ps->start_location = player ? (int32_t)playernum : -1;
+    ps->stats[PLAYERSTATE_FOOD_CAP_CEILING] = (uint16_t)MIN(MAX(0, game.constants.foodCeiling), USHRT_MAX);
+    ps->stats[PLAYERSTATE_GOLD_UPKEEP_RATE] = 100;
+    ps->stats[PLAYERSTATE_LUMBER_UPKEEP_RATE] = 100;
+    /* Neutral Hostile awards creep bounty by default; maps may override via SetPlayerState. */
+    ps->stats[PLAYERSTATE_GIVES_BOUNTY] = (playernum == PLAYER_NEUTRAL_AGGRESSIVE);
+    ps->vieworigin = G_MakeServerOrigin(player ? player->startingPosition.x : 0.0f, player ? player->startingPosition.y : 0.0f, 0.0f);
+    {
+        gameCamera_t cam;
+        CL_GameDefaultCamera(&cam);
+        ps->viewangles = (vec3_t){ cam.pitch, 0, cam.yaw };
+        ps->distance = cam.distance;
+        player_set_lens(ps, &cam);
+        clent->client->camera.state.position = (vec2_t){ ps->vieworigin.x, ps->vieworigin.y };
+        clent->client->camera.state.viewangles = ps->viewangles;
+        clent->client->camera.state.fov = cam.fov;
+        clent->client->camera.state.target_distance = cam.distance;
+        clent->client->camera.state.z_offset = 0.0f;
+        clent->client->camera.state.near_z = cam.znear;
+        clent->client->camera.state.far_z = cam.zfar;
+    }
+    clent->client->camera.target_height = ps->vieworigin.z;
+    clent->client->camera.old_state = clent->client->camera.state;
+    clent->client->camera.target_mode = CAMERA_TARGET_FOLLOW;
+    if (mapinfo) {
+        FOR_LOOP(i, mapinfo->num_techAvailabilities) {
+            mapTechAvailability_t const *tech = mapinfo->techAvailabilities + i;
+            if (tech->playerFlags & (1u << playernum)) {
+                G_SetPlayerTechMaxAllowed(clent->client, tech->techID, 0);
+            }
+        }
+    }
+    clent->client->mapplayer = player;
+    clent->client->jass.controller = G_MapControl(player);
+    clent->client->jass.race_pref = G_RacePreference(player);
+    clent->client->jass.race_selectable = true;
+    clent->client->jass.handicap = 100.0f;
+    clent->client->jass.handicap_xp = 1.0f;
+    /* Single-player retail displays the profile name for the local human
+     * slot, rather than the W3I placeholder (often "Player 1"). JASS
+     * SetPlayerName runs later and can intentionally override this value. */
+    if (player && player->playerType == kPlayerTypeHuman &&
+        G_IsSinglePlayer() && gi.CvarString) {
+        cstring_t profile_name = gi.CvarString("name", "");
+        if (profile_name && *profile_name) name = profile_name;
+    }
+    strlcpy(clent->client->jass.name, name ? name : "", sizeof(clent->client->jass.name));
+    ps->name = clent->client->jass.name;
+}
+
+/* Special war3map.doo XY is the lower-left terrain cell of the pathing
+ * footprint. Keep its transport/collision anchor at the center's terrain Z.
+ * The WC3 renderer separately fits each mesh vertex to raw W3E height and the
+ * lowest footprint cliff layer; it does not use this rigid anchor as its base. */
+static vec3_t G_CenterSpecialDoodad(vec3_t min_corner, pathTex_t const *footprint,
+                                    box2_t bounds, float (*terrain_height)(float, float)) {
+    if (footprint) {
+        min_corner.x += (float)footprint->width * (TILE_SIZE / 8.0f);
+        min_corner.y += (float)footprint->height * (TILE_SIZE / 8.0f);
+    }
+    /* CM_GetHeightAtPoint bilinearly reads two adjacent W3E vertices. Keep
+     * both of them inside the map even for a malformed/edge-clipped footprint. */
+    float const inset = TILE_SIZE * 0.5f;
+    float const min_x = bounds.min.x + inset;
+    float const min_y = bounds.min.y + inset;
+    float const max_x = MAX(min_x, bounds.max.x - inset);
+    float const max_y = MAX(min_y, bounds.max.y - inset);
+    float const sample_x = MAX(min_x, MIN(min_corner.x, max_x));
+    float const sample_y = MAX(min_y, MIN(min_corner.y, max_y));
+    if (terrain_height) min_corner.z = terrain_height(sample_x, sample_y);
+    return min_corner;
+}
+
+#ifdef BZ_TESTS
+#include "shared/test.h"
+
+/* These mocks exercise the real spawn/shadow selection paths without retail MPQs. */
+static cstring_t spawn_probe_existing;
+static uint32_t spawn_probe_calls, spawn_probe_images;
+static bool G_TestSpawnFileExists(cstring_t path) {
+    spawn_probe_calls++;
+    return spawn_probe_existing && !strcmp(path, spawn_probe_existing);
+}
+static int G_TestSpawnImageIndex(cstring_t path) {
+    (void)path;
+    spawn_probe_images++;
+    return 71;
+}
+
+TEST(wc3_spawn, shadow_texture_probes_blp_then_optional_dds_without_full_file_reads) {
+    struct game_import const saved = gi;
+    gi.FileExists = G_TestSpawnFileExists;
+    gi.ImageIndex = G_TestSpawnImageIndex;
+
+    spawn_probe_existing = "ReplaceableTextures\\Shadows\\Shadow.blp";
+    spawn_probe_calls = spawn_probe_images = 0;
+    T_EQ(G_LoadShadowTexture("Shadow", true), 71);
+    T_EQ(spawn_probe_calls, 1);
+    T_EQ(spawn_probe_images, 1);
+
+    spawn_probe_existing = "ReplaceableTextures\\Shadows\\Shadow.dds";
+    spawn_probe_calls = spawn_probe_images = 0;
+    T_EQ(G_LoadShadowTexture("Shadow", true), 71);
+    T_EQ(spawn_probe_calls, 2);
+    T_EQ(spawn_probe_images, 1);
+
+    spawn_probe_calls = spawn_probe_images = 0;
+    T_EQ(G_LoadShadowTexture("Shadow", false), 0);
+    T_EQ(spawn_probe_calls, 1);
+    T_EQ(spawn_probe_images, 0);
+
+    spawn_probe_existing = NULL;
+    spawn_probe_calls = spawn_probe_images = 0;
+    T_EQ(G_LoadShadowTexture("Shadow", true), 0);
+    T_EQ(spawn_probe_calls, 2);
+    T_EQ(spawn_probe_images, 0);
+
+    spawn_probe_calls = spawn_probe_images = 0;
+    T_EQ(G_LoadShadowTexture("_", true), 0);
+    T_EQ(G_LoadShadowTexture("", true), 0);
+    T_EQ(G_LoadShadowTexture(NULL, true), 0);
+    T_EQ(spawn_probe_calls, 0);
+    T_EQ(spawn_probe_images, 0);
+
+    spawn_probe_existing = NULL;
+    gi = saved;
+}
+
+static vec2_t special_doodad_sample;
+static float special_doodad_test_height;
+static float G_TestSpecialDoodadHeight(float x, float y) {
+    special_doodad_sample = (vec2_t){x, y};
+    return special_doodad_test_height;
+}
+
+TEST(wc3_doodad, special_pathing_footprint_centers_model_at_terrain_height) {
+    pathTex_t footprint = { .width = 16, .height = 8 };
+    box2_t const bounds = { .min = {0, -1000}, .max = {4096, 3096} };
+    special_doodad_test_height = 128.0f;
+    vec3_t origin = G_CenterSpecialDoodad((vec3_t){1000, -400, 99}, &footprint,
+                                           bounds, G_TestSpecialDoodadHeight);
+    T_FEQ(origin.x, 1256.0f, 0.001f);
+    T_FEQ(origin.y, -272.0f, 0.001f);
+    T_FEQ(origin.z, 128.0f, 0.001f);
+    T_FEQ(special_doodad_sample.x, origin.x, 0.001f);
+    T_FEQ(special_doodad_sample.y, origin.y, 0.001f);
+
+    /* Flat, low and below-baseline maps should not acquire a constant cliff
+     * offset. Keep the original XY when no footprint is available. */
+    special_doodad_test_height = 0;
+    origin = G_CenterSpecialDoodad((vec3_t){10, 20, 30}, NULL, bounds, G_TestSpecialDoodadHeight);
+    T_FEQ(origin.x, 10.0f, 0.001f);
+    T_FEQ(origin.y, 20.0f, 0.001f);
+    T_FEQ(origin.z, 0.0f, 0.001f);
+    special_doodad_test_height = -128;
+    origin = G_CenterSpecialDoodad((vec3_t){100, 200, 0}, NULL, bounds, G_TestSpecialDoodadHeight);
+    T_FEQ(origin.z, -128.0f, 0.001f);
+}
+
+TEST(wc3_doodad, special_height_samples_remain_inside_heightmap) {
+    pathTex_t footprint = { .width = 16, .height = 8 };
+    box2_t const bounds = { .min = {-256, -256}, .max = {256, 256} };
+    special_doodad_test_height = 256;
+    vec3_t origin = G_CenterSpecialDoodad((vec3_t){256, 256, 0}, &footprint,
+                                           bounds, G_TestSpecialDoodadHeight);
+    T_FEQ(origin.x, 512, 0.001f); /* Placement is never clamped. */
+    T_FEQ(origin.y, 384, 0.001f);
+    T_FEQ(special_doodad_sample.x, 192, 0.001f);
+    T_FEQ(special_doodad_sample.y, 192, 0.001f);
+    T_FEQ(origin.z, 256, 0.001f);
+    origin = G_CenterSpecialDoodad((vec3_t){-1000, -1000, 0}, NULL,
+                                   bounds, G_TestSpecialDoodadHeight);
+    T_FEQ(special_doodad_sample.x, -192, 0.001f);
+    T_FEQ(special_doodad_sample.y, -192, 0.001f);
+}
+#endif
+
+void G_SpawnEntities(cstring_t map_path) {
+    mapInfo_t const *mapinfo = CM_GetMapInfo();
+    doodad_t const *entities = CM_GetDoodads();
+    uint32_t local_player = G_LocalMapPlayerNumber(mapinfo);
+    uint32_t difficulty, original_default;
+
+    /* Map replacement must release script roots before level pointers are cleared. */
+    G_BotShutdown();
+    if (level.vm) { jass_close(level.vm); level.vm = NULL; }
+    G_ClearSaveRegistries();
+    G_ClearJassGroupRegistry();
+    G_ClearRegionRegistry();
+    G_ClearHashtableRegistry();
+    G_FowShutdown();
+    G_BlightShutdown();
+    memset(&level, 0, sizeof(level));
+    G_ResetSelectionSoundState();
+    G_CommandErrorReset();
+    G_ResetHeroPassiveCaches();
+    FOR_LOOP(i, MAX_PLAYERS) level.player_leaderboards[i] = -1;
+    G_ResetStartingResourceCheat();
+    level.time = gi.GetTime();
+
+    level.mapinfo = mapinfo;
+    G_BlightInit();
+    G_EnvironmentFogInitMap();
+    G_WaterBaseColorInitMap();
+    G_InitPlayerAlliances(mapinfo);
+    level.setup.teams = mapinfo ? mapinfo->num_teams : 0;
+    if (mapinfo) FOR_LOOP(i, MAX_PLAYERS) level.setup.players += mapinfo->players[i].used;
+    level.setup.game_type = 4;
+    level.setup.speed = 2;
+    if (!G_TakeDifficultyTransition(map_path, &difficulty, &original_default)) {
+        difficulty = WC3_InitialGameDifficulty(map_path,
+            WC3_IsCampaignMap(map_path) && gi.CvarString
+                ? gi.CvarString(WC3_CAMPAIGN_DIFFICULTY_CVAR, WC3_CAMPAIGN_DIFFICULTY_DEFAULT)
+                : WC3_CAMPAIGN_DIFFICULTY_DEFAULT);
+        original_default = difficulty;
+    }
+    level.setup.difficulty = difficulty;
+    level.setup.default_difficulty = original_default;
+    level.setup.resource_density = level.setup.creature_density = 2;
+    if (mapinfo) {
+        strlcpy(level.setup.name, G_LevelString(mapinfo->mapName ? mapinfo->mapName : ""), sizeof(level.setup.name));
+        strlcpy(level.setup.description, G_LevelString(mapinfo->mapDescription ? mapinfo->mapDescription : ""), sizeof(level.setup.description));
+    }
+    G_FowInit();
+    G_InitJassHost();
+    level.vm = jass_newstate();
+    
+    FOR_LOOP(p, MAX_PLAYERS) {
+        gameClient_t *client = game.clients+p;
+        uint32_t playernum = G_ClientSlotMapPlayerNumber(mapinfo, p, local_player);
+        g_edicts[p].client = client;
+        G_InitMapPlayer(g_edicts+p, mapinfo, playernum);
+    }
+    if (mapinfo)
+        G_SetCameraBounds(mapinfo->cameraBounds.bounds);
+    G_WeatherInitMap();
+
+    G_PoolsReset();
+    globals.num_edicts = game.max_clients;
+    /* Quake II's body queue reserves real edicts before map entities, keeping all entity pointers in one address domain. */
+    G_InitWaypoints();
+
+    uint32_t spawn_count = 0, spawned_entities = 0, spawned_units = 0;
+    uint32_t spawned_destructables = 0, spawned_static_scenery = 0, skipped_script_owned = 0;
+    FOR_EACH_LIST(doodad_t const, doodad, entities) {
+        if ((spawn_count++ & 127u) == 0) gi.LoadingFrame();
+        if (!G_LoadMapUnitData() && G_MapObjectCreatedByMapScript(doodad->doodID)) {
+            skipped_script_owned++;
+            continue;
+        }
+//        if (doodad->doodID == MAKEFOURCC('h', 'C', '0', '2')) {
+//            int a=0;
+//            printf("%.4s", )
+//        }
+        edict_t *ent = G_Spawn();
+        if (!ent) {
+            break;
+        }
+        ent->class_id = doodad->doodID;
+        ent->variation = doodad->variation;
+        G_InitMapPlacementUnitState(ent, doodad);
+        ent->s.player = G_NormalizeMapObjectPlayer(doodad->player);
+        ent->s.origin = doodad->position;
+        ent->s.angle = doodad->angle;
+        ent->s.scale = doodad->scale.x;
+        if (doodad->specialDoodad) {
+            Doodads_t const *row = G_Doodad(doodad->doodID);
+            /* Unlike ordinary doodads, special placements store the minimum
+             * W3E tile of their pathing footprint. The pathTex is 4 pixels
+             * per terrain cell; each cell is 128 world units. */
+            pathTex_t *footprint = M_LoadPathTex(row->pathTex);
+            ent->s.origin = G_CenterSpecialDoodad(ent->s.origin, footprint,
+                                                   CM_GetWorldBounds(), CM_GetHeightAtPoint);
+            if (footprint) gi.MemFree(footprint);
+            ent->s.angle = DEG2RAD(row->fixedRot);
+            ent->s.scale = row->defScale > 0.0f ? row->defScale : 1.0f;
+        }
+        SP_CallSpawn(ent);
+        spawned_entities++;
+        if (ent->s.flags & EF_UNIT) spawned_units++;
+        if (G_IsDestructable(ent)) spawned_destructables++;
+        if (ent->svflags & SVF_STATIC_SCENERY) spawned_static_scenery++;
+        G_FillMapPlacedUnitMana(ent);
+        if (ent->s.flags & EF_UNIT) {
+            G_PlayerScoreUnitTrained(ent); /* preplaced map units count */
+        }
+        if ((S_GoldMineIsMine(ent) || S_GoldMineIsOverlay(ent)) && doodad->goldAmount != (uint32_t)-1)
+            ent->resources = doodad->goldAmount;
+        if (ent->svflags & SVF_MONSTER) G_ApplyMapUnitTeamColor(ent, doodad);
+        if (G_IsDestructable(ent)) {
+            G_InitializeDestructablePlacement(ent, doodad);
+            G_RegisterGroundSurface(ent);
+        }
+        gi.LinkEntity(ent);
+    }
+    S_MineOverlayBindPreplaced();
+    SP_worldspawn(NULL);
+    /* Every W3I participant has its own preplaced army, including computer
+     * factions without network connections. Seed authoritative food peaks
+     * before map JASS starts; the later ClientBegin pass is delta-idempotent. */
+    FOR_LOOP(i, MAX_PLAYERS) {
+        gameClient_t *client = game.clients + i;
+        if (client->mapplayer && client->mapplayer->used)
+            G_AccumulatePlayerFood(client);
+    }
+    
+    jass_dofile(level.vm, "Scripts\\common.j");
+    gi.LoadingFrame();
+    jass_dofile(level.vm, "Scripts\\Blizzard.j");
+    gi.LoadingFrame();
+//    jass_dofilenative(level.vm, "/Users/igor/Desktop/war3map.j");
+    G_DumpPrologue02BurrowHandoffSource(level.mapinfo->mapscript);
+    if (level.mapinfo->mapscript) {
+        G_FixOrc07BridgeRestoreScript(level.mapinfo->mapscript);
+        jass_dobuffer(level.vm, level.mapinfo->mapscript);
+    } else
+        fprintf(stderr, "G_SpawnEntities: missing mapscript; skipping jass_dobuffer\n");
+    gi.LoadingFrame();
+
+    /* Warcraft executes config before main; this phase owns authored player colors, teams, and slots. */
+    if (!level.scriptsConfigured && level.mapinfo && level.mapinfo->mapscript &&
+        strstr(level.mapinfo->mapscript, "function config")) {
+        jass_callbyname(level.vm, "config", false);
+        if (!jass_rterror_pending(level.vm)) level.scriptsConfigured = true;
+    }
+
+    UI_Init();
+    CM_BakeStaticObstacles();
+    /* Start simulation from the map load itself so dedicated and listen-server restores share one lifecycle. */
+    level.started = true;
+    MAP_LOAD_LOG("map=%s phase=spawn-counts placements=%u spawned=%u units=%u destructables=%u static-scenery=%u skipped-script-owned=%u\n",
+                     map_path, spawn_count, spawned_entities, spawned_units, spawned_destructables,
+                     spawned_static_scenery, skipped_script_owned);
+}
+ 
+/* Spawn a unit at a point while allowing map-restoration paths to skip presentation-only birth. */
+static edict_t *SP_SpawnAtLocationInternal(uint32_t class_id, uint32_t player, vec2_t const *location, bool play_birth) {
+    edict_t *ent = G_Spawn();
+    gameClient_t *client;
+    if (!ent) {
+        return NULL;
+    }
+    G_InitUnitOrders(ent);
+    G_InitUnitState(ent);
+    ent->class_id = class_id;
+    ent->s.class_id = class_id;
+    ent->spawn_time = G_Time();
+    ent->s.origin2 = *location;
+    ent->s.origin.x = location->x;
+    ent->s.origin.y = location->y;
+    ent->s.origin.z = CM_GetHeightAtPoint(location->x, location->y);
+    ent->s.scale = 1;
+    ent->s.angle = -M_PI / 2;
+    ent->s.player = player;
+    SP_CallSpawn(ent);
+    /* SP_SpawnUnit fills collision and the server broad-phase bounds depend on
+     * that value. Link only after the class-owned spawn initializer runs. */
+    gi.LinkEntity(ent);
+    /* Dynamic unit creation must establish Hero progression independently of
+     * presentation data.  SP_SpawnUnit already initializes normal Heroes, but
+     * custom/minimal data may omit UnitUI/model rows while still defining Hero
+     * attributes in UnitBalance.  The helper is idempotent, so applying it here
+     * also keeps CreateUnit/training at Level 1 with one initial skill point. */
+    if (G_UnitIsHero(ent)) {
+        G_HeroInitializeProgression(ent);
+    }
+    if (play_birth && ent->birth) {
+        ent->birth(ent);
+    }
+    client = G_GetPlayerClientByNumber(player);
+    if ((ent->svflags & SVF_MONSTER) && client && client->ps.number == player) {
+        G_InvalidateCommands(client);
+        G_InvalidateUnitShortcutsForUnit(ent);
+    }
+    return ent;
+}
+
+edict_t *SP_SpawnAtLocation(uint32_t class_id, uint32_t player, vec2_t const *location) {
+    return SP_SpawnAtLocationInternal(class_id, player, location, true);
+}
+
+edict_t *SP_SpawnAtLocationNoBirth(uint32_t class_id, uint32_t player, vec2_t const *location) {
+    return SP_SpawnAtLocationInternal(class_id, player, location, false);
+}
+
+static bool bind_map_destructables = false;
+
+void G_SetDestructableScriptBinding(bool enabled) {
+    bind_map_destructables = enabled;
+}
+
+/* Runtime (JASS CreateDestructable) spawn of a destructable.  Mirrors the
+ * map-doodad spawn loop in G_SpawnEntities: set class_id/variation/origin/
+ * facing/scale, then route through SP_CallSpawn (which sends a destructable
+ * class_id to SP_SpawnDestructable + SP_monster_tree, giving it a model, life,
+ * collision and the core destructable lifecycle; tree_die remains a legacy
+ * callback entry point, but death does not depend on that callback).
+ * Destructables are neutral-passive, like the map-placed ones.  facing is in
+ * radians (the native converts from JASS degrees).
+ *
+ * Parity note (Ghidra): the original CreateDestructable (FUN_003f80b0 ->
+ * worker FUN_00621d90) always creates a fresh instance — its hash lookup
+ * resolves the destructable *type* by objectid, not an existing entity by
+ * position.  We diverge with find-or-create because OUR engine already spawns
+ * every war3map.doo destructable in G_SpawnEntities, and the map's generated
+ * CreateAllDestructables then "creates" the 13 named ones again to bind their
+ * gg_dest_* handles + death triggers.  Reusing the pre-placed entity (like
+ * unit_createorfind does for CreateUnit) yields the same observable result as
+ * the original — one crate/gate carrying the trigger — instead of a stacked
+ * duplicate.  Match a same-type destructable within 10 units of the spot. */
+/* HACK: Positional binding is required until the map parser exposes the
+ * generated script variable's editor creation ID. */
+edict_t *G_CreateDestructable(uint32_t class_id, float x, float y, float z, float facing, float scale, uint32_t variation) {
+    if (bind_map_destructables) {
+        edict_t *best = NULL;
+        float best_distance = 10.0f;
+
+        FOR_LOOP(i, globals.num_edicts) {
+            edict_t *existing = &g_edicts[i];
+            float distance;
+
+            if (!existing->inuse ||
+                existing->class_id != class_id ||
+                !G_IsDestructable(existing) ||
+                !existing->destructable->map_placed ||
+                existing->destructable->script_bound) {
+                continue;
+            }
+
+            distance = Vector2_distance(
+                &MAKE(vec2_t, x, y),
+                &existing->s.origin2);
+
+            if (distance >= best_distance) {
+                continue;
+            }
+
+            best = existing;
+            best_distance = distance;
+        }
+
+        if (best) {
+            best->destructable->script_bound = true;
+
+            G_ActivateScriptedDestructable(best,
+                                           x,
+                                           y,
+                                           z,
+                                           facing,
+                                           scale,
+                                           variation);
+
+            CM_BakeStaticObstacles();
+            return best;
+        }
+    }
+    edict_t *ent = G_Spawn();
+    if (!ent) return NULL;
+    ent->class_id = class_id;
+    ent->variation = variation;
+    ent->s.player = PLAYER_NEUTRAL_PASSIVE;
+    ent->s.origin = MAKE(vec3_t, x, y, z);
+    ent->s.angle = facing;
+    ent->s.scale = scale;
+    ent->spawn_time = G_Time();
+    SP_CallSpawn(ent);
+    G_RegisterGroundSurface(ent);
+    gi.LinkEntity(ent);
+    if (G_IsDestructable(ent)) G_BakeStaticObstaclesSoon();
+    return ent;
+}
+
+/* While the map script's main() runs, every scripted destructable used to rebake the whole
+ * pathing grid (thousands of trees on the Frontline maps: minutes of load time). Bakes asked
+ * for inside that window collapse into one when it closes. */
+static bool obstacle_bake_deferred, obstacle_bake_pending;
+void G_BakeStaticObstaclesSoon(void) {
+    if (obstacle_bake_deferred) obstacle_bake_pending = true;
+    else CM_BakeStaticObstacles();
+}
+void G_DeferObstacleBakes(bool defer) {
+    obstacle_bake_deferred = defer;
+    if (!defer && obstacle_bake_pending) { obstacle_bake_pending = false; CM_BakeStaticObstacles(); }
+}
+
+edict_t *G_CreateDeadDestructable(uint32_t class_id,
+                                 float x,
+                                 float y,
+                                 float z,
+                                 float facing,
+                                 float scale,
+                                 uint32_t variation) {
+    edict_t *ent = G_CreateDestructable(class_id, x, y, z, facing, scale, variation);
+
+    if (ent) {
+        G_SetDestructableDeadState(ent, false);
+    }
+    return ent;
+}
+
+bool SP_FindEmptySpaceAround(edict_t *townhall, uint32_t class_id, vec2_t *out, float *angle) {
+    float const colsize = G_UnitUI(class_id)->selectionScale * SEL_SCALE / 2;
+    float const start_angle = M_PI * 1.25f;
+    FOR_LOOP(i, MAX_SPAWN_ITERATIONS) {
+        float const radius = townhall->s.radius + colsize * (i * 2 + 1);
+        float const num_points = M_PI * radius / colsize;
+        FOR_LOOP(j, num_points) {
+            *angle = start_angle + 2 * M_PI * j / num_points;
+            *out = MAKE(vec2_t,
+                townhall->s.origin2.x + cosf(*angle) * radius,
+                townhall->s.origin2.y + sinf(*angle) * radius,
+            );
+            if (M_CheckCollision(out, colsize))
+                continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SP_CanPlaceUnitAt(edict_t *unit, vec2_t const *point) {
+    uint8_t const blocked_flags = M_UnitStaticPathingFlags(unit);
+    if (!unit || !point) {
+        return false;
+    }
+    if (!CM_PointIsPathableForRadiusFlags(point, unit->collision, blocked_flags)) {
+        return false;
+    }
+
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *other = &globals.edicts[i];
+        vec2_t delta;
+
+        if (other == unit || IS_HOLLOW(other) || other->movetype == MOVETYPE_NONE || other->collision <= 0.0f) {
+            continue;
+        }
+        if (!M_UnitsShareCollisionDomain(other, unit)) {
+            continue;
+        }
+        delta = Vector2_sub(&other->s.origin2, point);
+        if (Vector2_len(&delta) < unit->collision + other->collision) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The old per-candidate full edict scan made crowded CreateUnit spawns costly.
+ * BoxEdicts bounds include each linked entity's collision radius; keep the
+ * same precise circle/layer rules while querying only nearby units. */
+static bool G_RepositionBlocker(edict_t const *other) {
+    float dx, dy, reach;
+    edict_t *unit = reposition_unit;
+    if (other == unit || (G_IsItem(unit) && other == unit->item->carrier) ||
+        IS_HOLLOW(other) || other->collision <= 0.0f ||
+        !M_UnitsShareCollisionDomain(other, unit)) return false;
+    dx = other->s.origin2.x - reposition_point->x;
+    dy = other->s.origin2.y - reposition_point->y;
+    reach = unit->collision + other->collision;
+    return dx * dx + dy * dy < reach * reach;
+}
+
+static bool G_CanRepositionUnitAt(edict_t *unit, vec2_t const *point) {
+    edict_t *blockers[MAX_REPOSITION_BLOCKERS];
+    float radius;
+    box2_t area;
+    if (!unit || !point) return false;
+    /* A movement-disabled unit (every retail building and scenery row) is legal wherever the script puts it;
+     * testing it against walkability nudged authored pedestals off their spot. */
+    if (M_UnitMoveDisabled(unit)) return true;
+    if (!CM_PointIsPathableForRadiusFlags(point, unit->collision, M_UnitStaticPathingFlags(unit))) return false;
+    radius = MAX(0.0f, unit->collision);
+    area = MAKE(box2_t, .min = { point->x - radius, point->y - radius },
+                      .max = { point->x + radius, point->y + radius });
+    reposition_unit = unit; reposition_point = point;
+    return gi.BoxEdicts(&area, blockers, MAX_REPOSITION_BLOCKERS, G_RepositionBlocker) == 0;
+}
+
+/* Warcraft III SetUnitPosition is not the raw X/Y setter. Warsmash models the
+ * native through CUnit.setPointAndCheckUnstuck(): test the requested point,
+ * then walk a deterministic 64-world-unit square spiral for at most 300
+ * candidates. Keep the requested point as the fallback when no candidate is
+ * legal, matching Warsmash's outputX/outputY initialization. */
+bool G_FindUnitPlacement(edict_t *unit, unitPlacement_t const *placement, vec2_t *out) {
+    int check_x = 0, check_y = 0;
+    vec2_t const *requested = placement ? &placement->origin : NULL;
+
+    if (!unit || !requested || !out) {
+        return false;
+    }
+    *out = *requested;
+    for (int i = 0; i < 300; i++) {
+        vec2_t const candidate = {
+            requested->x + check_x * 64.0f,
+            requested->y + check_y * 64.0f,
+        };
+        int const phase = ((int)floor(sqrt((double)(4 * i + 1)))) % 4;
+
+        /* A square spiral visits a far corner before the near face of a ring.
+         * Filter candidates during the search so a nearby beach is not rejected
+         * merely because the first unrestricted candidate was farther away. */
+        if ((placement->max_distance <= 0 || Vector2_distance(requested, &candidate) <= placement->max_distance) && G_CanRepositionUnitAt(unit, &candidate)) {
+            *out = candidate;
+            return true;
+        }
+
+        /* Equivalent to Warsmash's cardinal cos/sin update, without relying
+         * on floating-point truncation around PI/2 and 3*PI/2. */
+        switch (phase) {
+        case 0: check_x--; break;
+        case 1: check_y--; break;
+        case 2: check_x++; break;
+        default: check_y++; break;
+        }
+    }
+    return false;
+}
+
+/* SetUnitPosition retains the original unrestricted unstuck search contract. */
+bool G_FindUnitUnstuckPosition(edict_t *unit, vec2_t const *requested, vec2_t *out) {
+    if (!requested) return false;
+    return G_FindUnitPlacement(unit, &(unitPlacement_t){.origin = *requested}, out);
+}
+
+typedef struct {
+    edict_t *producer;
+    edict_t *unit;
+    float     spacing;
+    vec2_t *out;
+    float    *angle;
+} unitExitCtx_t;
+
+static bool SP_TryUnitExitCandidate(unitExitCtx_t const *ctx, int grid_x, int grid_y) {
+    vec2_t const candidate = {
+        ctx->producer->s.origin2.x + (float)grid_x * ctx->spacing,
+        ctx->producer->s.origin2.y + (float)grid_y * ctx->spacing,
+    };
+
+    /* MOVETYPE_NONE buildings are omitted from the dynamic collision scan;
+     * their authored pathing footprint still owns the space the new unit
+     * must clear before it becomes visible. */
+    if (CM_DistanceToPathingFootprint(ctx->producer, &candidate) < ctx->unit->collision)
+        return false;
+    /* Custom producers may use a collision circle instead of a path texture.
+     * Their grid stamp extends to the cell edge; spawning inside that stamp
+     * stranded the first workers when matches began with only an HQ. */
+    if (!ctx->producer->pathtex &&
+        Vector2_distance(&ctx->producer->s.origin2, &candidate) <
+            ctx->producer->collision + ctx->unit->collision + CM_PathCellWorldSize())
+        return false;
+    if (!SP_CanPlaceUnitAt(ctx->unit, &candidate)) {
+        return false;
+    }
+    *ctx->out = candidate;
+    *ctx->angle = atan2f(candidate.y - ctx->producer->s.origin2.y,
+                         candidate.x - ctx->producer->s.origin2.x);
+    return true;
+}
+
+/* Trained units are created at their producer and remain hidden until a legal
+ * exit point is found. Search deterministic 64-world-unit square rings, using
+ * the trained unit's real collision radius against both the baked static
+ * pathmap and dynamic unit circles. */
+bool SP_FindUnitExitPosition(edict_t *producer, edict_t *unit, vec2_t *out, float *angle) {
+    uint32_t const max_candidates = 300;
+    uint32_t tested = 0;
+    unitExitCtx_t ctx;
+
+    if (!producer || !unit || !out || !angle) {
+        return false;
+    }
+
+    ctx = (unitExitCtx_t){ producer, unit, 64.0f, out, angle };
+
+    for (int ring = 1; tested < max_candidates; ring++) {
+        int const lo = -ring;
+        int const hi = ring;
+
+        for (int x = lo; x <= hi && tested < max_candidates; x++, tested++) {
+            if (SP_TryUnitExitCandidate(&ctx, x, lo)) return true;
+        }
+        for (int y = lo + 1; y <= hi && tested < max_candidates; y++, tested++) {
+            if (SP_TryUnitExitCandidate(&ctx, hi, y)) return true;
+        }
+        for (int x = hi - 1; x >= lo && tested < max_candidates; x--, tested++) {
+            if (SP_TryUnitExitCandidate(&ctx, x, hi)) return true;
+        }
+        for (int y = hi - 1; y > lo && tested < max_candidates; y--, tested++) {
+            if (SP_TryUnitExitCandidate(&ctx, lo, y)) return true;
+        }
+    }
+    return false;
+}

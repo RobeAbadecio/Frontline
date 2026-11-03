@@ -1,0 +1,309 @@
+#ifdef BZ_TESTS
+#include "test.h"
+#include "../skills/s_skills.h"
+
+#define BZ_ASPL MAKEFOURCC('A', 's', 'p', 'l') // rawcode; Spirit Link
+#define BZ_ASPP MAKEFOURCC('A', 's', 'p', 'p') // Rune of Spirit Link
+#define BZ_BSPL MAKEFOURCC('B', 's', 'p', 'l') // rawcode; Spirit Link buff
+
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void reset_entities(void);
+void setup_test_world(void);
+slkTestData_t *parse_slk_string(char const *text);
+void free_slk_rows(slkTestData_t *rows);
+
+/* Non-stock DataA=0.25 / DataB=3 / Cost=40 so tests cannot pass on retail 0.5/4/75. */
+#define SPL_SLK \
+	"ID;PWXL;N;EBB;Y3;X14\n" \
+	"C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n" \
+	"C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n" \
+	"C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n" \
+	"C;Y1;X10;K\"Area1\"\nC;Y1;X11;K\"DataA1\"\nC;Y1;X12;K\"DataB1\"\n" \
+	"C;Y1;X13;K\"BuffID1\"\nC;Y1;X14;K\"DataC1\"\n" \
+	"C;Y2;X1;K\"Aspl\"\nC;Y2;X2;K\"Aspl\"\nC;Y2;X3;K\"1\"\n" \
+	"C;Y2;X4;K\"air,ground,friend,self,organic\"\n" \
+	"C;Y2;X5;K\"40\"\nC;Y2;X6;K\"0\"\nC;Y2;X7;K\"750\"\n" \
+	"C;Y2;X8;K\"20\"\nC;Y2;X9;K\"20\"\nC;Y2;X10;K\"300\"\n" \
+	"C;Y2;X11;K\"0.25\"\nC;Y2;X12;K\"3\"\nC;Y2;X13;K\"Bspl\"\nC;Y2;X14;K\"0\"\n" \
+    "C;Y3;X1;K\"Aspp\"\nC;Y3;X2;K\"Aspl\"\nC;Y3;X3;K\"1\"\n" \
+    "C;Y3;X4;K\"air,ground,friend,self,organic\"\n" \
+    "C;Y3;X5;K\"0\"\nC;Y3;X6;K\"0\"\nC;Y3;X7;K\"0\"\n" \
+    "C;Y3;X8;K\"15\"\nC;Y3;X9;K\"15\"\nC;Y3;X10;K\"100\"\n" \
+    "C;Y3;X11;K\"0.4\"\nC;Y3;X12;K\"2\"\nC;Y3;X13;K\"Bspl\"\nC;Y3;X14;K\"0\"\nE\n"
+
+typedef struct {
+	slkTestData_t *rows, *old;
+	edict_t *caster, *a, *b, *c, *d, *enemy;
+} splFix_t;
+
+/* Fill caller in place; no UnitBalance pointers required. */
+static void spl_setup(splFix_t *fix) {
+	reset_entities(); setup_test_world(); level.time = 1000;
+	((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+	((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+	memset(level.alliances, 0, sizeof(level.alliances));
+	fix->rows = parse_slk_string(SPL_SLK); fix->old = G_SetSLKRows("AbilityData", fix->rows);
+	/* Caster within Rng=750 but outside Area=300 of A so DataB picks A/B/C, not the walker. */
+	fix->caster = alloc_test_unit(MAKEFOURCC('o', 's', 'h', 'm'), -500, 0);
+	fix->a = alloc_test_unit(MAKEFOURCC('o', 'g', 'r', 'u'), 0, 0);
+	fix->b = alloc_test_unit(MAKEFOURCC('o', 'g', 'r', 'u'), 32, 0);
+	fix->c = alloc_test_unit(MAKEFOURCC('o', 'g', 'r', 'u'), 64, 0);
+	fix->d = alloc_test_unit(MAKEFOURCC('o', 'g', 'r', 'u'), 400, 0); /* outside Area=300 from a */
+	fix->enemy = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 48, 0);
+	fix->caster->s.player = fix->a->s.player = fix->b->s.player = fix->c->s.player = fix->d->s.player = 0;
+	fix->enemy->s.player = 1;
+	fix->caster->svflags |= SVF_MONSTER; fix->a->svflags |= SVF_MONSTER; fix->b->svflags |= SVF_MONSTER;
+	fix->c->svflags |= SVF_MONSTER; fix->d->svflags |= SVF_MONSTER; fix->enemy->svflags |= SVF_MONSTER;
+	fix->caster->targtype = fix->a->targtype = fix->b->targtype = fix->c->targtype =
+		fix->d->targtype = fix->enemy->targtype = TARG_GROUND;
+	fix->caster->unit_state->ranks[0] = MAKE(heroability_t, .code = BZ_ASPL, .level = 1);
+	fix->caster->mana.value = fix->caster->mana.max_value = 100;
+	fix->a->health.value = fix->a->health.max_value = 500;
+	fix->b->health.value = fix->b->health.max_value = 500;
+	fix->c->health.value = fix->c->health.max_value = 500;
+	fix->d->health.value = fix->d->health.max_value = 500;
+	fix->enemy->health.value = fix->enemy->health.max_value = 500;
+}
+
+static void spl_done(splFix_t *fix) { G_SetSLKRows("AbilityData", fix->old); free_slk_rows(fix->rows); }
+
+TEST(wc3_spell, spirit_link_procedure_lookup) {
+	T_EQ(S_AbilityItem(BZ_ASPL).ability->proc, CAbilitySpiritLink);
+}
+
+/* Cast on A links nearest DataB=3 allies in Area (A,B,C); D outside area stays unlinked. */
+TEST(wc3_spell, spirit_link_links_datab_nearest_in_area) {
+	splFix_t fix; spl_setup(&fix);
+	T_ASSERT(S_SpellAllowsTarget(BZ_ASPL, fix.caster, fix.a));
+	T_ASSERT(!S_SpellAllowsTarget(BZ_ASPL, fix.caster, fix.enemy));
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	T_FEQ(fix.caster->mana.value, 60, 0.001f);
+	T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 1);
+	T_EQ(G_UnitStatusLevel(fix.b, BZ_BSPL), 1);
+	T_EQ(G_UnitStatusLevel(fix.c, BZ_BSPL), 1);
+	T_EQ(G_UnitStatusLevel(fix.d, BZ_BSPL), 0);
+	T_EQ(G_UnitStatusLevel(fix.enemy, BZ_BSPL), 0);
+	spl_done(&fix);
+}
+
+/* DataA=0.25 with 3 linked: 100 dmg -> shared 25 / 3 each; primary keeps 75+portion. */
+TEST(wc3_spell, spirit_link_splits_authored_damage_among_linked) {
+	splFix_t fix; spl_setup(&fix);
+	int portion, primary;
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	T_Damage(fix.a, fix.enemy, 100);
+	portion = 25 / 3;
+	primary = 75 + portion;
+	T_FEQ(fix.a->health.value, 500 - primary, 0.001f);
+	T_FEQ(fix.b->health.value, 500 - portion, 0.001f);
+	T_FEQ(fix.c->health.value, 500 - portion, 0.001f);
+	T_FEQ(fix.d->health.value, 500, 0.001f);
+	T_FEQ(fix.enemy->health.value, 500, 0.001f);
+	spl_done(&fix);
+}
+
+/* Unlinked unit takes full T_Damage; linked group is untouched. */
+TEST(wc3_spell, spirit_link_unlinked_unit_takes_full_damage) {
+	splFix_t fix; spl_setup(&fix);
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	T_Damage(fix.d, fix.enemy, 40);
+	T_FEQ(fix.d->health.value, 460, 0.001f);
+	T_FEQ(fix.a->health.value, 500, 0.001f);
+	T_FEQ(fix.b->health.value, 500, 0.001f);
+	spl_done(&fix);
+}
+
+/* After Dur expiry, damage no longer redirects. */
+TEST(wc3_spell, spirit_link_expires_and_stops_redirect) {
+	splFix_t fix; spl_setup(&fix);
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	level.time += 20000; unit_updatestatuses(fix.a); unit_updatestatuses(fix.b); unit_updatestatuses(fix.c);
+	T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 0);
+	T_Damage(fix.a, fix.enemy, 50);
+	T_FEQ(fix.a->health.value, 450, 0.001f);
+	T_FEQ(fix.b->health.value, 500, 0.001f);
+	spl_done(&fix);
+}
+
+/* Recast refreshes Bspl duration on the newly gathered group. */
+TEST(wc3_spell, spirit_link_recast_refreshes_group) {
+	splFix_t fix; spl_setup(&fix);
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	level.time += 10000; unit_updatestatuses(fix.a);
+	T_ASSERT(G_UnitStatusLevel(fix.a, BZ_BSPL) == 1);
+	fix.caster->mana.value = 100;
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	level.time += 10000; unit_updatestatuses(fix.a); unit_updatestatuses(fix.b);
+	T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 1);
+	T_EQ(G_UnitStatusLevel(fix.b, BZ_BSPL), 1);
+	level.time += 20000; unit_updatestatuses(fix.a); unit_updatestatuses(fix.b);
+	T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 0);
+	spl_done(&fix);
+}
+
+/* Redirected share that would kill clamps to 1 HP and clears Bspl. */
+TEST(wc3_spell, spirit_link_redirect_never_fatal) {
+	splFix_t fix; spl_setup(&fix);
+	T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+	fix.b->health.value = 5;
+	T_Damage(fix.a, fix.enemy, 100);
+	T_ASSERT(fix.b->health.value >= 1.0f);
+	T_ASSERT(!M_IsDead(fix.b));
+	T_EQ(G_UnitStatusLevel(fix.b, BZ_BSPL), 0);
+	spl_done(&fix);
+}
+
+#endif
+
+#ifdef BZ_TESTS
+/* More eligible allies than the old 64-entry gather cap: the clicked target
+ * must still receive the buff (repro from #476). */
+TEST(wc3_spell, spirit_link_clicked_target_linked_in_crowd) {
+    splFix_t fix;
+    edict_t *selected;
+    spl_setup(&fix);
+    FOR_LOOP(i, 65) {
+        edict_t *unit = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 100, 0);
+        unit->s.player = 0; unit->svflags |= SVF_MONSTER; unit->targtype = TARG_GROUND;
+        unit->health.value = unit->health.max_value = 500;
+    }
+    selected = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 200, 0);
+    selected->s.player = 0; selected->svflags |= SVF_MONSTER; selected->targtype = TARG_GROUND;
+    selected->health.value = selected->health.max_value = 500;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, selected));
+    T_EQ(G_UnitStatusLevel(selected, BZ_BSPL), 1);
+    spl_done(&fix);
+}
+
+/* Closer later-created allies displace farther earlier-created ones. */
+TEST(wc3_spell, spirit_link_prefers_closer_late_allies) {
+    splFix_t fix;
+    edict_t *click, *near1, *near2;
+    uint32_t linked = 0;
+    spl_setup(&fix);
+    click = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 200, 0);
+    click->s.player = 0; click->svflags |= SVF_MONSTER; click->targtype = TARG_GROUND;
+    click->health.value = click->health.max_value = 500;
+    FOR_LOOP(i, 70) {
+        edict_t *unit = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 450, 0);
+        unit->s.player = 0; unit->svflags |= SVF_MONSTER; unit->targtype = TARG_GROUND;
+        unit->health.value = unit->health.max_value = 500;
+    }
+    near1 = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 220, 0);
+    near2 = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 240, 0);
+    near1->s.player = near2->s.player = 0;
+    near1->svflags |= SVF_MONSTER; near2->svflags |= SVF_MONSTER;
+    near1->targtype = near2->targtype = TARG_GROUND;
+    near1->health.value = near1->health.max_value = 500;
+    near2->health.value = near2->health.max_value = 500;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, click));
+    T_EQ(G_UnitStatusLevel(click, BZ_BSPL), 1);
+    T_EQ(G_UnitStatusLevel(near1, BZ_BSPL), 1);
+    T_EQ(G_UnitStatusLevel(near2, BZ_BSPL), 1);
+    FILTER_EDICTS(ent, G_UnitStatusLevel(ent, BZ_BSPL)) linked++;
+    T_EQ(linked, 3);
+    spl_done(&fix);
+}
+
+/* Allocation order does not change the nearest-target outcome. */
+TEST(wc3_spell, spirit_link_order_independent_nearest) {
+    splFix_t fix;
+    edict_t *first_far, *second_near;
+    spl_setup(&fix);
+    first_far = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 290, 0);
+    second_near = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 10, 0);
+    first_far->s.player = second_near->s.player = 0;
+    first_far->svflags |= SVF_MONSTER; second_near->svflags |= SVF_MONSTER;
+    first_far->targtype = second_near->targtype = TARG_GROUND;
+    first_far->health.value = first_far->health.max_value = 500;
+    second_near->health.value = second_near->health.max_value = 500;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+    T_EQ(G_UnitStatusLevel(second_near, BZ_BSPL), 1);
+    T_EQ(G_UnitStatusLevel(first_far, BZ_BSPL), 0);
+    spl_done(&fix);
+}
+
+/* Exactly DataB units buffed; dead and out-of-area units excluded. */
+TEST(wc3_spell, spirit_link_exact_count_excludes_dead_and_far) {
+    splFix_t fix;
+    edict_t *dead;
+    uint32_t linked = 0;
+    spl_setup(&fix);
+    dead = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 20, 0);
+    dead->s.player = 0; dead->svflags |= SVF_MONSTER; dead->targtype = TARG_GROUND;
+    dead->health.value = 0; dead->health.max_value = 500;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+    FILTER_EDICTS(ent, G_UnitStatusLevel(ent, BZ_BSPL)) linked++;
+    T_EQ(linked, 3);
+    T_EQ(G_UnitStatusLevel(dead, BZ_BSPL), 0);
+    T_EQ(G_UnitStatusLevel(fix.d, BZ_BSPL), 0);
+    T_EQ(G_UnitStatusLevel(fix.enemy, BZ_BSPL), 0);
+    spl_done(&fix);
+}
+
+/* Zero DataB links nothing; one DataB links only the click target. */
+TEST(wc3_spell, spirit_link_zero_and_single_target_counts) {
+    const char slk_zero[] =
+        "ID;PWXL;N;EBB;Y2;X14\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n"
+        "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n"
+        "C;Y1;X10;K\"Area1\"\nC;Y1;X11;K\"DataA1\"\nC;Y1;X12;K\"DataB1\"\n"
+        "C;Y1;X13;K\"BuffID1\"\nC;Y1;X14;K\"DataC1\"\n"
+        "C;Y2;X1;K\"Aspl\"\nC;Y2;X2;K\"Aspl\"\nC;Y2;X3;K\"1\"\n"
+        "C;Y2;X4;K\"air,ground,friend,self,organic\"\n"
+        "C;Y2;X5;K\"40\"\nC;Y2;X6;K\"0\"\nC;Y2;X7;K\"750\"\n"
+        "C;Y2;X8;K\"20\"\nC;Y2;X9;K\"20\"\nC;Y2;X10;K\"300\"\n"
+        "C;Y2;X11;K\"0.25\"\nC;Y2;X12;K\"0\"\nC;Y2;X13;K\"Bspl\"\nC;Y2;X14;K\"0\"\nE\n";
+    const char slk_one[] =
+        "ID;PWXL;N;EBB;Y2;X14\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n"
+        "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n"
+        "C;Y1;X10;K\"Area1\"\nC;Y1;X11;K\"DataA1\"\nC;Y1;X12;K\"DataB1\"\n"
+        "C;Y1;X13;K\"BuffID1\"\nC;Y1;X14;K\"DataC1\"\n"
+        "C;Y2;X1;K\"Aspl\"\nC;Y2;X2;K\"Aspl\"\nC;Y2;X3;K\"1\"\n"
+        "C;Y2;X4;K\"air,ground,friend,self,organic\"\n"
+        "C;Y2;X5;K\"40\"\nC;Y2;X6;K\"0\"\nC;Y2;X7;K\"750\"\n"
+        "C;Y2;X8;K\"20\"\nC;Y2;X9;K\"20\"\nC;Y2;X10;K\"300\"\n"
+        "C;Y2;X11;K\"0.25\"\nC;Y2;X12;K\"1\"\nC;Y2;X13;K\"Bspl\"\nC;Y2;X14;K\"0\"\nE\n";
+    splFix_t fix;
+    uint32_t linked;
+    spl_setup(&fix);
+    G_SetSLKRows("AbilityData", fix.old); free_slk_rows(fix.rows);
+    fix.rows = parse_slk_string(slk_zero); fix.old = G_SetSLKRows("AbilityData", fix.rows);
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+    linked = 0;
+    FILTER_EDICTS(ent, G_UnitStatusLevel(ent, BZ_BSPL)) linked++;
+    T_EQ(linked, 0);
+    G_SetSLKRows("AbilityData", fix.old); free_slk_rows(fix.rows);
+    fix.rows = parse_slk_string(slk_one); fix.old = G_SetSLKRows("AbilityData", fix.rows);
+    fix.caster->mana.value = 100;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_ASPL, fix.a));
+    linked = 0;
+    FILTER_EDICTS(ent, G_UnitStatusLevel(ent, BZ_BSPL)) linked++;
+    T_EQ(linked, 1);
+    T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 1);
+    spl_done(&fix);
+}
+#endif
+
+#ifdef BZ_TESTS
+/* Authored non-stock rune data: DataB=2, Area=100, unlike the Spirit Walker
+ * spell's DataB=3 / Area=300. Pickup uses the actual collector without mana. */
+TEST(wc3_spell, spirit_link_rune_powerup_uses_authored_count_and_area) {
+    splFix_t fix;
+    abilityitem_t item;
+    abilityCall_t call;
+    spl_setup(&fix);
+    T_EQ(S_AbilityItem(BZ_ASPP).ability->proc, CAbilityItemSpiritLink);
+    item = S_AbilityItem(BZ_ASPP);
+    call = MAKE(abilityCall_t, .item = &item);
+    T_ASSERT(S_AbilityMessage(fix.a, A_ITEM_USE, &call));
+    T_EQ(G_UnitStatusLevel(fix.a, BZ_BSPL), 1);
+    T_EQ(G_UnitStatusLevel(fix.b, BZ_BSPL), 1);
+    T_EQ(G_UnitStatusLevel(fix.c, BZ_BSPL), 0);
+    T_EQ(G_UnitStatusLevel(fix.enemy, BZ_BSPL), 0);
+    spl_done(&fix);
+}
+#endif

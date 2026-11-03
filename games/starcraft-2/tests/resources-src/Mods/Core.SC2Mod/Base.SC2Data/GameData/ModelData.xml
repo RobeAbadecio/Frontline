@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<Catalog>
+    <CModel id="Doodad">
+        <Model value="Assets\Doodads\##id##\##id##.m3"/>
+    </CModel>
+    <CModel id="Unit">
+        <Model value="Assets\Units\##Race##\##id##\##id##.m3"/>
+    </CModel>
+    <CModel id="MarineCatalogModel" parent="Unit" Race="Terran">
+        <Occlusion value="Show"/>
+    </CModel>
+    <CModel id="MarineCoreModel" parent="Unit" Race="Protoss">
+        <Occlusion value="Hide"/>
+    </CModel>
+    <CModel id="SupplyDepotCoreModel" Race="Protoss">
+        <Model value="Assets\Buildings\Protoss\SupplyDepotCoreModel\SupplyDepotCoreModel.m3"/>
+    </CModel>
+    <CModel id="BillboardTall" parent="Doodad">
+        <VariationCount value="4"/>
+    </CModel>
+    <CModel id="AnimalCorpse" parent="Doodad">
+        <VariationCount value="9"/>
+    </CModel>
+    <CModel id="VariantChild" parent="BillboardTall"/>
+    <CModel id="VariantZero" parent="BillboardTall"><VariationCount value="0"/></CModel>
+<CModel id="PortraitBase"><Model value="Assets/Portraits/##id##.m3"/><Image value="Assets/Textures/##id##_Static.dds"/></CModel><CModel id="MarinePortrait" parent="PortraitBase"/></Catalog>

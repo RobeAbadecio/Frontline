@@ -1,0 +1,1036 @@
+#include <stdlib.h> // atoi()
+
+#include "client.h"
+#include "sound/s_local.h"
+#include "tr_public.h"
+#include "common/map_load_debug.h"
+#ifdef DEBUG_MAP_LOAD
+extern void CL_ResetModelLoadDebug(void);
+extern void CL_ReportModelLoadDebug(cstring_t phase, cstring_t map);
+#endif
+
+static struct {
+    renderEntity_t entities[MAX_CLIENT_ENTITIES];
+    renderDecal_t decals[MAX_RENDER_DECALS];
+    renderSplatRect_t splat_rects[MAX_RENDER_SPLAT_RECTS];
+    int num_entities;
+    int num_decals;
+    int num_splat_rects;
+} view_state;
+
+/* cl_debug_entities prints paused construction's render inputs once per second,
+ * even when no entity delta arrives. This distinguishes a moving server frame
+ * from renderer animation that advances with fixed entity frames. */
+static int debug_paused_building_time[MAX_CLIENT_ENTITIES];
+
+static bool world_loaded = false;
+static bool begin_sent = false;
+static double client_map_load_debug_start;
+
+void CL_MapLoadDebugBegin(void) {
+    client_map_load_debug_start = MAP_LOAD_NOW();
+}
+
+/* Optional CS_MODELS indices become handles here. Games that do not publish
+ * CS_TERRAIN_LIGHT_MODEL / CS_ENTITY_LIGHT_MODEL leave the slots empty. */
+static model_t const *V_ConfigLightModel(uint32_t configstring) {
+    cstring_t value;
+    char *end = NULL;
+    unsigned long index;
+
+    if (configstring >= MAX_CONFIGSTRINGS) return NULL;
+    value = cl.configstrings[configstring];
+    if (!value || !*value) return NULL;
+    index = strtoul(value, &end, 10);
+    if (end == value || !end || *end || index == 0 || index >= MAX_MODELS) return NULL;
+    return cl.models[index];
+}
+
+static model_t const *V_ConfigSkyModel(void) {
+    char *end = NULL;
+    unsigned long index = strtoul(cl.configstrings[CS_SKY], &end, 10);
+    if (!*cl.configstrings[CS_SKY] || end == cl.configstrings[CS_SKY] || *end || index == 0 || index >= MAX_MODELS)
+        return NULL;
+    return cl.models[index];
+}
+
+/* CS_SCENE_FOG is a generic server-authored distance-fog contract. Games may
+ * leave the slot empty. Positive styles share the renderer's linear start/end
+ * path until a producer proves and exposes additional equations. */
+/* CS_SCENE_WATER_COLOR is a generic server-authored water tint. Games that
+ * do not publish it keep the neutral white multiplier. */
+static void V_UpdateSceneWaterColor(viewDef_t *view, bool world) {
+    float red = 1.0f, green = 1.0f, blue = 1.0f, alpha = 1.0f;
+
+    if (!view) return;
+    view->waterBaseColor = (vec4_t){ 1.0f, 1.0f, 1.0f, 1.0f };
+    if (!world || !*cl.configstrings[CS_SCENE_WATER_COLOR]) return;
+    if (sscanf(cl.configstrings[CS_SCENE_WATER_COLOR], "%f %f %f %f",
+               &red, &green, &blue, &alpha) != 4) return;
+    view->waterBaseColor = (vec4_t){
+        MAX(0.0f, MIN(1.0f, red)),
+        MAX(0.0f, MIN(1.0f, green)),
+        MAX(0.0f, MIN(1.0f, blue)),
+        MAX(0.0f, MIN(1.0f, alpha)),
+    };
+}
+
+static void V_UpdateSceneFog(viewDef_t *view, bool world) {
+    static bool invalid_logged;
+    int style = 0;
+    float start = 0.0f, end = 0.0f, density = 0.0f;
+    float red = 0.0f, green = 0.0f, blue = 0.0f;
+
+    if (!view) return;
+    view->fogEnable = false;
+    view->fogStart = view->fogEnd = 0.0f;
+    view->fogColor = (vec3_t){0};
+    if (!world || !*cl.configstrings[CS_SCENE_FOG]) {
+        invalid_logged = false;
+        return;
+    }
+    if (sscanf(cl.configstrings[CS_SCENE_FOG], "%d %f %f %f %f %f %f",
+               &style, &start, &end, &density, &red, &green, &blue) != 7) {
+        if (!invalid_logged) fprintf(stderr, "CL: invalid scene fog configstring\n");
+        invalid_logged = true;
+        return;
+    }
+    invalid_logged = false;
+    (void)density;
+    if (style <= 0) return;
+
+    view->fogEnable = true;
+    view->fogStart = start;
+    view->fogEnd = end;
+    view->fogColor = (vec3_t){ red, green, blue };
+}
+
+/* Client copies sampling inputs and the day-phase stat. The game renderer
+ * evaluates those into viewDef.terrainLight / entityLight; this path must
+ * not include a game header or compile-guard the clock slot. */
+static void V_UpdateEnvironmentLighting(viewDef_t *view, bool world) {
+    if (!view) return;
+    view->terrainLight = (environLight_t){0};
+    view->entityLight = (environLight_t){0};
+    V_UpdateSceneFog(view, world);
+    V_UpdateSceneWaterColor(view, world);
+    if (!world) {
+        view->terrainLightModel = NULL;
+        view->entityLightModel = NULL;
+        view->skyModel = NULL;
+        view->environmentPhase = 0.0f;
+        return;
+    }
+    view->terrainLightModel = V_ConfigLightModel(CS_TERRAIN_LIGHT_MODEL);
+    view->entityLightModel = V_ConfigLightModel(CS_ENTITY_LIGHT_MODEL);
+    view->skyModel = V_ConfigSkyModel();
+    view->environmentPhase =
+        (float)cl.playerstate.stats[UI_PLAYERSTAT_ENV_PHASE] / (float)USHRT_MAX;
+}
+
+vec3_t lightAngles = {-40,0,60};
+
+/* A reconnect receives a fresh configstring table; reset only the refresh
+ * lifecycle flags so CL_PrepRefresh performs one registration pass. */
+void CL_RestartRefresh(void) {
+    world_loaded = false;
+    begin_sent = false;
+    cl.loading_waiting = false;
+    cl.loading_ready_time = 0;
+    cl.refresh_prepped = false;
+}
+
+static void CL_LoadingStage(float progress) {
+    /* CL_PrepRefresh may still be entered after the first active frame.
+     * Progress is loading-screen presentation state, so ignore later passes. */
+    if (cl.playerstate.client_ui_state != CLIENT_UI_LOADING) return;
+    CL_SetLoadingProgress(progress);
+}
+
+static void CL_SendBegin(void) {
+    fprintf(stderr,
+            "CL_SendBegin: sending begin world=\"%s\" state=%d player=%u team=%u race=%u color=%u\n",
+            cl.configstrings[CS_WORLD],
+            cls.state,
+            (unsigned)cl.playerstate.number,
+            (unsigned)cl.playerstate.team,
+            (unsigned)cl.playerstate.race,
+            (unsigned)cl.playerstate.color);
+    /* The presentation class precedes begin on the same reliable channel, so ClientBegin authors the
+     * console for the window this client actually has instead of re-sending it a frame later. */
+    CL_CanvasWriteChrome();
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    MSG_WriteString(&cls.netchan.message, "begin");
+}
+
+bool CL_ContinueLoading(uint32_t timestamp) {
+    if (!cl.loading_waiting || !cl.refresh_prepped || cls.state != ca_connected ||
+        !SDL_TICKS_PASSED(timestamp, cl.loading_ready_time)) return false;
+    cl.loading_waiting = false;
+    CL_SendBegin();
+    begin_sent = true;
+    fprintf(stderr, "Loading: acknowledged, entering mission\n");
+    return true;
+}
+
+static void Matrix4_fromViewAngles(vec3_t const *target, vec3_t const *angles, float distance, mat4_t *output) {
+    vec3_t const vieworg = Vector3_unm(target);
+    Matrix4_identity(output);
+    Matrix4_translate(output, &(vec3_t){0, 0, -distance});
+    Matrix4_rotate(output, angles, ROTATE_ZYX);
+    Matrix4_translate(output, &vieworg);
+}
+
+void Matrix4_fromViewQuat(vec3_t const *target, quaternion_t const *quat, float distance, mat4_t *output) {
+    vec3_t const vieworg = Vector3_unm(target);
+    Matrix4_identity(output);
+    Matrix4_translate(output, &(vec3_t){0, 0, -distance});
+    Matrix4_rotateQuat(output, quat);
+    Matrix4_translate(output, &vieworg);
+}
+
+static void Matrix4_getLightMatrix(vec3_t const *sunangles, float scale, mat4_t *output) {
+    mat4_t proj, view, tmp1, tmp2;
+    vec3_t const target = cl.viewDef.target;
+    Matrix4_ortho(&proj, -scale, scale, -scale, scale, -1000.0, 3000.0);
+    Matrix4_identity(&tmp1);
+    Matrix4_rotate(&tmp1, &(vec3_t){0,0,45}, ROTATE_XYZ);
+    Matrix4_fromViewAngles(&target, sunangles, 1000, &tmp2);
+    Matrix4_multiply(&tmp1, &tmp2, &view);
+    Matrix4_translate(&view, &(vec3_t){0,-500,0});
+    Matrix4_multiply(&proj, &view, output);
+}
+
+static void Matrix4_getPreviewCameraMatrix(vec3_t const *target, mat4_t *output) {
+    mat4_t proj, view;
+    size2_t windowSize = re.GetWindowSize();
+    vec3_t eye = { 520.0f, -420.0f, 220.0f };
+    vec3_t dir = Vector3_sub(target, &eye);
+    float aspect = (float)windowSize.width / (float)windowSize.height;
+
+    Matrix4_perspective(&proj, 35.0f, aspect, 10.0f, 4000.0f);
+    Matrix4_lookAt(&view, &eye, &dir, &(vec3_t){0, 0, 1});
+    Matrix4_multiply(&proj, &view, output);
+}
+
+static void Matrix4_getPreviewLightMatrix(vec3_t const *sunangles, vec3_t const *target, float scale, mat4_t *output) {
+    mat4_t proj, view;
+    Matrix4_ortho(&proj, -scale, scale, -scale, scale, -1000.0, 3000.0);
+    Matrix4_fromViewAngles(target, sunangles, 1000, &view);
+    Matrix4_multiply(&proj, &view, output);
+}
+
+void Matrix4_getCameraMatrix(mat4_t *output) {
+    if (!world_loaded) {
+        Matrix4_identity(output);
+        return;
+    }
+    mat4_t proj, view, inverse;
+    size2_t windowSize = re.GetWindowSize();
+    viewCamera_t *a = cl.viewDef.camerastate+1;
+    viewCamera_t *b = cl.viewDef.camerastate+0;
+    vec3_t origin = Vector3_lerp(&a->origin, &b->origin, cl.viewDef.lerpfrac);
+    if (re.CameraUsesTerrainHeight()) {
+        float az = a->origin.z - re.GetHeightAtPoint(a->origin.x, a->origin.y);
+        float bz = b->origin.z - re.GetHeightAtPoint(b->origin.x, b->origin.y);
+        /* Only the authored offsets interpolate; the terrain base follows the current rendered XY. */
+        origin.z = re.GetCameraHeightAtPoint(origin.x, origin.y) + LerpNumber(az, bz, cl.viewDef.lerpfrac);
+    }
+    cl.viewDef.target = origin;
+    quaternion_t qa = Quaternion_fromEuler(&a->viewangles, ROTATE_ZYX);
+    quaternion_t qb = Quaternion_fromEuler(&b->viewangles, ROTATE_ZYX);
+    quaternion_t quat = Quaternion_slerp(&qa, &qb, cl.viewDef.lerpfrac);
+    float distance = LerpNumber(a->distance, b->distance, cl.viewDef.lerpfrac);
+    float fov = LerpNumber(a->fov, b->fov, cl.viewDef.lerpfrac);
+    float viewport_width = cl.viewDef.viewport.w * windowSize.width;
+    float viewport_height = cl.viewDef.viewport.h * windowSize.height;
+    float aspect = viewport_height > 0.0f
+        ? viewport_width / viewport_height
+        : (float)windowSize.width / (float)windowSize.height;
+    float znear = LerpNumber(a->znear, b->znear, cl.viewDef.lerpfrac);
+    float zfar = Camera_OrbitFarClip(LerpNumber(a->zfar, b->zfar, cl.viewDef.lerpfrac), distance);
+    
+    Matrix4_perspective(&proj, fov, aspect, znear, zfar);
+    Matrix4_fromViewQuat(&origin, &quat, distance, &view);
+    Matrix4_inverse(&view, &inverse);
+    cl.viewDef.camerastate[0].eye = (vec3_t){ inverse.v[12], inverse.v[13], inverse.v[14] };
+    /* The game evaluates view offsets (camera shake) once per server frame, as Quake 2 does for kick angles;
+     * the client only interpolates the two samples and re-aims, so it needs no game-specific waveform.
+     * The samples arrive at the 10 Hz server tick, so this lerp is all the motion there is: nothing faster
+     * than 5 Hz. That is the accepted cost of keeping the waveform in the game module. */
+    vec3_t viewoffset = Vector3_lerp(&a->viewoffset, &b->viewoffset, cl.viewDef.lerpfrac);
+    vec3_t eyeoffset = Vector3_lerp(&a->eyeoffset, &b->eyeoffset, cl.viewDef.lerpfrac);
+    if (Vector3_lengthsq(&viewoffset) > 0.0f || Vector3_lengthsq(&eyeoffset) > 0.0f) {
+        vec3_t target = Vector3_add(&origin, &viewoffset);
+        vec3_t eye = Vector3_add(&cl.viewDef.camerastate[0].eye, &eyeoffset);
+        vec3_t direction = Vector3_sub(&target, &eye);
+        cl.viewDef.target = target;
+        cl.viewDef.camerastate[0].eye = eye;
+        Matrix4_lookAt(&view, &eye, &direction, &(vec3_t){0, 0, 1});
+    } else if (distance > 0.0f && CL_GameCameraUsesWorldUp()) {
+        /* Some game cameras orbit a target and require a world-up basis to keep low shots upright. */
+        vec3_t direction = Vector3_sub(&origin, &cl.viewDef.camerastate[0].eye);
+        Matrix4_lookAt(&view, &cl.viewDef.camerastate[0].eye, &direction, &(vec3_t){0, 0, 1});
+    }
+    Matrix4_multiply(&proj, &view, output);
+}
+
+float LerpRotation(float a, float b, float t) {
+    if (b < 0) {
+        b = b + 2 * M_PI;
+    }
+    float apos = a + 2 * M_PI;
+    float aneg = a - 2 * M_PI;
+    if (fabs(a - b) < fabs(apos - b) && fabs(a - b) < fabs(aneg - b)) {
+        return LerpNumber(a, b, t);
+    } else if (fabs(apos - b) < fabs(aneg - b)) {
+        return LerpNumber(apos, b, t);
+    } else {
+        return LerpNumber(aneg, b, t);
+    }
+}
+
+static void V_AddClientEntity(centity_t const *ent) {
+    renderEntity_t re = { 0 };
+    if (view_state.num_entities >= MAX_CLIENT_ENTITIES) {
+        return;
+    }
+    /* model is a uint16_t and MAX_MODELS bounds the configstring lookup. */
+    re.origin = Vector3_lerp(&ent->prev.origin, &ent->current.origin, cl.viewDef.lerpfrac);
+    re.angle = LerpRotation(ent->prev.angle, ent->current.angle, cl.viewDef.lerpfrac);
+#ifdef WOW
+    re.rotation = Vector3_lerp(&ent->prev.rotation, &ent->current.rotation, cl.viewDef.lerpfrac);
+#endif
+    re.scale = LerpNumber(ent->prev.scale, ent->current.scale, cl.viewDef.lerpfrac);
+    /* Entity scale defaults to one; an omitted replacement delta must not
+     * collapse the rendered model and its collision shape to zero. */
+    re.scale = cl_normalize_entity_scale(re.scale);
+    re.frame = ent->current.frame;
+    re.owner = ent->current.player;
+    re.oldframe = ent->prev.frame;
+    re.health = ent->current.stats[ENT_HEALTH];
+    re.effect_flags = ent->current.effect_flags;
+    re.effect_model = cl.models[ent->current.effect];
+    re.model = cl.models[ent->current.model];
+    re.skin = cl.pics[ent->current.image];
+    if (ent->current.name) {
+        uint32_t i = ent->current.name - 1;
+        cstring_t cs = cl.configstrings[CS_GENERAL + i / ENT_NAMES_PER_CS];
+        re.name = cs ? cs + (i % ENT_NAMES_PER_CS) * ENT_NAME_SLOT_SIZE : NULL;
+    }
+    {
+        uint32_t const encoded_color =
+            (ent->current.effect_flags & EFX_TEAM_COLOR_MASK) >> EFX_TEAM_COLOR_SHIFT;
+        re.team = encoded_color ? encoded_color - 1 : ent->current.player;
+    }
+#ifdef WOW
+    /* WoW reuses the existing snapshot class ID for the DBC creature display ID. */
+    re.display_id = ent->current.class_id;
+    re.appearance = ent->current.appearance;
+    re.equipment = ent->current.equipment;
+#endif
+    re.flags = ent->current.renderfx;
+    if (ent->current.flags & EF_GROUND_ANCHOR) {
+        re.flags |= RF_GROUND_ANCHOR;
+    }
+    if (ent->current.flags & EF_FOW_BLOCKER) {
+        re.flags |= RF_FOW_BLOCKER;
+    }
+    if (ent->current.flags & EF_FOW_REVEALER) {
+        re.flags |= RF_FOW_REVEALER;
+    }
+    if (ent->current.flags & EF_MOUNTED) re.flags |= RF_MOUNTED;
+    if (ent->current.flags & EF_HAS_QUEST) re.flags |= RF_HAS_QUEST;
+    if (ent->current.flags & EF_QUEST_COMPLETE) re.flags |= RF_QUEST_COMPLETE;
+    if (ent->current.flags & EF_HOSTILE) re.flags |= RF_HOSTILE;
+    if (ent->current.flags & EF_NEUTRAL) re.flags |= RF_NEUTRAL;
+    if (ent->current.flags & EF_NOT_SELECTABLE) re.flags |= RF_NOT_SELECTABLE;
+    if (ent->current.flags & EF_BUILDING) re.flags |= RF_BUILDING;
+    if (ent->current.flags & EF_UNIT) re.flags |= RF_UNIT;
+    if (ent->current.flags & EF_ALLIED) re.flags |= RF_ALLIED;
+    if (ent->current.flags & EF_GROUND_CONFORM) re.flags |= RF_GROUND_CONFORM;
+    if (ent->current.flags & EF_GROUND_SURFACE) re.flags |= RF_GROUND_SURFACE;
+    if (ent->current.flags & EF_SELECTION_CIRCLE_ON_WATER) re.flags |= RF_SELECTION_CIRCLE_ON_WATER;
+    if (ent->current.flags & EF_MDX_EMISSION_PAUSED) re.flags |= RF_MDX_EMISSION_PAUSED;
+    if (ent->current.flags & EF_MDX_ANIMATION_PAUSED) re.flags |= RF_MDX_ANIMATION_PAUSED;
+    if (Cvar_Integer("cl_debug_entities", 0) &&
+        (ent->current.flags & EF_MDX_EMISSION_PAUSED) &&
+        ent->current.number < MAX_CLIENT_ENTITIES) {
+        int *last = &debug_paused_building_time[ent->current.number];
+        if (!*last || cl.time < *last || cl.time - *last >= 1000) {
+            *last = cl.time;
+            fprintf(stderr, "CL_BUILD paused-render ent=%u model=%u time=%d frame=%u oldframe=%u lerp=%.3f flags=0x%08x\n",
+                    (unsigned)ent->current.number, (unsigned)ent->current.model,
+                    cl.time, re.frame, re.oldframe, cl.viewDef.lerpfrac,
+                    ent->current.flags);
+        }
+    }
+    re.radius = ent->current.radius;
+    re.ground_offset = ent->current.ground_offset;
+    re.ground_snapshot_z = ent->current.origin.z;
+    re.ground_snapshot_valid = true;
+    re.tint_valid = ent->tint_valid;
+    re.tint = ent->tint_valid ? ent->tint : COLOR32_WHITE;
+    re.number = ent->current.number;
+    re.generation = ent->presentation_generation;
+    re.splat = cl.pics[ent->current.splat & 0xffff];
+    re.splatsize = ent->current.splat >> 16;
+#ifndef USE_SHADOWMAPS
+    re.shadow = cl.pics[ent->current.shadow];
+    re.shadow_rect = MAKE(rect_t,
+                          ShadowUnpackRectComponent((uint8_t)(ent->current.shadow_rect & 0xff)),
+                          ShadowUnpackRectComponent((uint8_t)((ent->current.shadow_rect >> 8) & 0xff)),
+                          ShadowUnpackRectComponent((uint8_t)((ent->current.shadow_rect >> 16) & 0xff)),
+                          ShadowUnpackRectComponent((uint8_t)((ent->current.shadow_rect >> 24) & 0xff)));
+#endif
+#ifdef WOW
+    /* model2 is a uint16_t; validate it against the negotiated model pool. */
+    if (ent->current.model2 > 0 && (ent->current.renderfx & RF_ATTACH_OVERHEAD))
+        re.overhead_model = cl.models[ent->current.model2];
+    else if (ent->current.model2 > 0)
+        re.attachment.model = cl.models[ent->current.model2];
+#endif
+
+    CL_ApplyIndicator(&re);
+    view_state.entities[view_state.num_entities++] = re;
+
+    if (ent->current.model2 > 0) {
+#ifdef WOW
+        if (re.attachment.model || re.overhead_model) return;
+#endif
+        if (view_state.num_entities >= MAX_CLIENT_ENTITIES) {
+            return;
+        }
+        /* model2 is a uint16_t and MAX_MODELS bounds the configstring lookup. */
+        re.model = cl.models[ent->current.model2];
+        re.skin = 0;
+        re.frame = 0;
+        re.oldframe = 0;
+        re.scale = 1;
+        re.name = NULL;
+        re.number = 0;
+        re.health = 0;
+        re.indicator = (color32_t){ 0 };
+        re.flags &= ~RF_BUILDING;
+        re.flags |= RF_NO_SHADOW;
+        if (ent->current.renderfx & RF_ATTACH_OVERHEAD) {
+            re.origin.z += re.radius * 2.5;
+        }
+        view_state.entities[view_state.num_entities++] = re;
+    }
+}
+
+static void V_ClearScene(void) {
+    view_state.num_entities = 0;
+    view_state.num_decals = 0;
+    view_state.num_splat_rects = 0;
+    cl.viewDef.num_entities = 0;
+    cl.viewDef.num_decals = 0;
+    cl.viewDef.num_splat_rects = 0;
+}
+
+static bool CL_CircleOverlapsSplatRect(entityState_t const *state, renderSplatRect_t const *rect) {
+    float const x = MAX(rect->mins.x, MIN(rect->maxs.x, state->origin.x));
+    float const y = MAX(rect->mins.y, MIN(rect->maxs.y, state->origin.y));
+    float const dx = x - state->origin.x;
+    float const dy = y - state->origin.y;
+    return dx * dx + dy * dy < state->collision * state->collision;
+}
+
+static void CL_AddBuildingPlacementGrid(vec3_t const *origin) {
+    uint32_t const width = cl.cursorEntity->pathing_width;
+    uint32_t const height = cl.cursorEntity->pathing_height;
+    uint32_t const preview = cl.cursorEntity->pathing_preview;
+    uint8_t const prevented = EntityPathingPreviewPrevented(preview);
+    uint8_t const required = EntityPathingPreviewRequired(preview);
+    uint16_t const ignore_entity = EntityPathingPreviewIgnore(preview);
+    float const cell_size = 32.0f;
+    float const half_width = width * cell_size * 0.5f;
+    float const half_height = height * cell_size * 0.5f;
+    uint32_t const first_rect = view_state.num_splat_rects;
+    uint32_t const remaining = MAX_RENDER_SPLAT_RECTS - first_rect;
+    bool const mine_blocked = CL_GameBuildCursorBlocked(origin);
+
+    /* Zero preview flags deliberately suppress build-on-target structures until
+     * the client receives enough parent-target data to colour them truthfully. */
+    if (!width || !height || (!prevented && !required) ||
+        height > remaining || width > remaining / height) {
+        return;
+    }
+
+    FOR_LOOP(x, width) {
+        FOR_LOOP(y, height) {
+            renderSplatRect_t rect;
+            vec2_t sample;
+            uint8_t pathing = 0;
+            bool blocked;
+
+            rect.mins.x = origin->x - half_width + x * cell_size;
+            rect.mins.y = origin->y - half_height + y * cell_size;
+            rect.maxs.x = rect.mins.x + cell_size;
+            rect.maxs.y = rect.mins.y + cell_size;
+            sample = (vec2_t){
+                (rect.mins.x + rect.maxs.x) * 0.5f,
+                (rect.mins.y + rect.maxs.y) * 0.5f,
+            };
+            blocked = !CM_GetPathingFlagsAt(&sample, &pathing);
+            if (!blocked) CL_GameModifyBuildPathing(&sample, &pathing);
+            blocked = blocked || CL_GameBuildPathingBlocked(&sample, pathing, prevented, required);
+            rect.color = blocked || mine_blocked
+                ? (color32_t){ 255, 0, 0, 166 }
+                : (color32_t){ 0, 255, 0, 166 };
+            view_state.splat_rects[view_state.num_splat_rects++] = rect;
+        }
+    }
+
+    if (mine_blocked) return;
+
+    /* Mark only the cells touched by each live collision circle. This mirrors
+     * the server's circle-vs-footprint rule without doing entities*cells work
+     * for every preview frame on low-end clients. */
+    FOR_LOOP(i, cl.num_active) {
+        uint32_t const number = cl.active_entities[i];
+        entityState_t const *state;
+        int32_t x0, y0, x1, y1;
+
+        if (!number || number >= MAX_CLIENT_ENTITIES ||
+            number == ignore_entity) {
+            continue;
+        }
+        state = &cl.ents[number].current;
+        if (state->collision <= 0.0f || (state->flags & EF_NOT_SELECTABLE)) {
+            continue;
+        }
+        x0 = (int32_t)floorf((state->origin.x - state->collision - (origin->x - half_width)) / cell_size);
+        y0 = (int32_t)floorf((state->origin.y - state->collision - (origin->y - half_height)) / cell_size);
+        x1 = (int32_t)floorf((state->origin.x + state->collision - (origin->x - half_width)) / cell_size);
+        y1 = (int32_t)floorf((state->origin.y + state->collision - (origin->y - half_height)) / cell_size);
+        x0 = MAX(0, x0); y0 = MAX(0, y0);
+        x1 = MIN((int32_t)width - 1, x1); y1 = MIN((int32_t)height - 1, y1);
+        if (x0 > x1 || y0 > y1) continue;
+
+        for (int32_t x = x0; x <= x1; x++) {
+            for (int32_t y = y0; y <= y1; y++) {
+                renderSplatRect_t *rect = &view_state.splat_rects[first_rect + (uint32_t)x * height + (uint32_t)y];
+                if (CL_CircleOverlapsSplatRect(state, rect)) {
+                    rect->color = (color32_t){ 255, 0, 0, 166 };
+                }
+            }
+        }
+    }
+}
+
+static void CL_AddBuilding(void) {
+    if (!cl.cursorEntity)
+        return;
+    if (view_state.num_entities >= MAX_CLIENT_ENTITIES)
+        return;
+    if (!cl.cursorEntity->model)  /* 0 = no model registered */
+        return;
+
+    renderEntity_t ent;
+    memset(&ent, 0, sizeof(renderEntity_t));
+    
+    if (!re.TraceLocation(&cl.viewDef, mouse.origin.x, mouse.origin.y, &ent.origin)) {
+        return;
+    }
+
+    if (cl.cursorEntity->pathing_width && cl.cursorEntity->pathing_height) {
+        uint32_t const path_width = cl.cursorEntity->pathing_width;
+        uint32_t const path_height = cl.cursorEntity->pathing_height;
+        ent.origin.x = floorf(ent.origin.x / 64.0f) * 64.0f;
+        ent.origin.y = floorf(ent.origin.y / 64.0f) * 64.0f;
+        if (((path_width / 2) & 1) != 0) ent.origin.x += 32.0f;
+        if (((path_height / 2) & 1) != 0) ent.origin.y += 32.0f;
+    } else {
+        ent.origin.x = floorf(ent.origin.x / 32.0f) * 32.0f;
+        ent.origin.y = floorf(ent.origin.y / 32.0f) * 32.0f;
+    }
+    ent.origin.z = CM_GetHeightAtPoint(ent.origin.x, ent.origin.y);
+    ent.scale = cl.cursorEntity->scale;
+    ent.angle = cl.cursorEntity->angle;
+    {
+        uint32_t const encoded_color =
+            (cl.cursorEntity->effect_flags & EFX_TEAM_COLOR_MASK) >> EFX_TEAM_COLOR_SHIFT;
+        ent.team = encoded_color ? encoded_color - 1u : cl.cursorEntity->player;
+    }
+    ent.frame = cl.cursorEntity->frame;
+    ent.oldframe = cl.cursorEntity->frame;
+    ent.model = cl.models[cl.cursorEntity->model];
+    ent.tint = MAKE(color32_t, 255, 255, 255, 255);
+
+    CL_AddBuildingPlacementGrid(&ent.origin);
+    view_state.entities[view_state.num_entities++] = ent;
+}
+
+static void CL_AddCursorSplat(void) {
+    renderDecal_t decal;
+    vec3_t point;
+
+    if (!cl.cursor_splat.image || cl.cursor_splat.image >= MAX_IMAGES ||
+        cl.cursor_splat.radius <= 0.0f) {
+        return;
+    }
+    if (CL_MouseOverGameplayUI()) {
+        return;
+    }
+    if (!re.TraceLocation(&cl.viewDef, mouse.origin.x, mouse.origin.y, &point)) {
+        return;
+    }
+
+    memset(&decal, 0, sizeof(decal));
+    decal.origin = (vec2_t){ point.x, point.y };
+    decal.radius = cl.cursor_splat.radius;
+    decal.texture = cl.pics[cl.cursor_splat.image];
+    decal.color = (color32_t){ 255, 255, 255, 180 };
+    V_AddDecal(&decal);
+}
+
+static void CL_AddEntities(void) {
+    S_BeginLoopingSounds();
+    FOR_LOOP(i, cl.num_active) {
+        centity_t *cent = &cl.ents[cl.active_entities[i]];
+        entityState_t const *state = &cent->current;
+        if (state->sound && !state->event && state->sound < MAX_SOUNDS &&
+            cl.configstrings[CS_SOUNDS + state->sound][0])
+            S_UpdateLoopingSound(state->number, cl.configstrings[CS_SOUNDS + state->sound],
+                                 &state->origin2, 1.0f, DEFAULT_SOUND_PACKET_ATTENUATION);
+        V_AddClientEntity(cent);
+    }
+    S_EndLoopingSounds();
+    
+    CL_AddTEnts();
+    
+    CL_AddBuilding();
+    CL_AddCursorSplat();
+
+    cl.viewDef.num_entities = view_state.num_entities;
+    cl.viewDef.entities = view_state.entities;
+    cl.viewDef.num_decals = view_state.num_decals;
+    cl.viewDef.decals = view_state.decals;
+    cl.viewDef.num_splat_rects = view_state.num_splat_rects;
+    cl.viewDef.splat_rects = view_state.splat_rects;
+}
+
+void CL_PrepRefresh(void) {
+    if (!cl.precache_ready || !cl.layout[LAYER_LOADING]) return;
+    if (!*cl.configstrings[CS_WORLD]) {
+        world_loaded = false;
+        begin_sent = false;
+        return;
+    }
+
+    bool const report_load = !cl.refresh_prepped;
+    double const refresh_start = MAP_LOAD_NOW();
+    double stage_start;
+#ifdef DEBUG_MAP_LOAD
+    if (report_load) CL_ResetModelLoadDebug();
+#endif
+    CL_LoadingStage(0.10f);
+
+    if (!world_loaded) {
+        if (!CM_IsMapLoaded(cl.configstrings[CS_WORLD])) {
+            stage_start = MAP_LOAD_NOW();
+            CM_LoadMap(cl.configstrings[CS_WORLD], CL_LoadingFrame);
+            if (report_load)
+                MAP_LOAD_LOG("map=%s phase=client-CM_LoadMap ms=%.3f\n",
+                                 cl.configstrings[CS_WORLD], MAP_LOAD_NOW() - stage_start);
+        }
+        stage_start = MAP_LOAD_NOW();
+        re.RegisterMap(cl.configstrings[CS_WORLD]);
+        CL_LoadMapLabels(cl.configstrings[CS_WORLD]);
+        if (report_load)
+            MAP_LOAD_LOG("map=%s phase=client-register-map ms=%.3f\n",
+                             cl.configstrings[CS_WORLD], MAP_LOAD_NOW() - stage_start);
+        world_loaded = true;
+    }
+    CL_LoadingStage(0.40f);
+
+    bool register_sounds = !cl.refresh_prepped;
+    if (register_sounds) S_BeginRegistration();
+
+#ifdef SC2
+    if (world_loaded && cls.state != ca_active) {
+        viewCamera_t camera = { 0 };
+        gameCamera_t defaults;
+
+        CL_GameDefaultCamera(&defaults);
+        camera.origin = defaults.target;
+        camera.viewangles = (vec3_t){ defaults.pitch, 0.0f, defaults.yaw };
+        camera.fov = defaults.fov;
+        camera.distance = defaults.distance;
+        camera.znear = defaults.znear;
+        camera.zfar = defaults.zfar;
+        cl.viewDef.camerastate[0] = camera;
+        cl.viewDef.camerastate[1] = camera;
+        cl.playerstate.vieworigin = camera.origin;
+        cl.playerstate.distance = camera.distance;
+        cl.playerstate.viewangles = camera.viewangles;
+        player_set_lens(&cl.playerstate, &defaults);
+    }
+#endif
+
+    uint32_t registered_models = 0;
+    stage_start = MAP_LOAD_NOW();
+    for (uint32_t i = 1; i < MAX_MODELS; i++) {
+        if (!*cl.configstrings[CS_MODELS + i]) continue;
+        registered_models++;
+        CL_RegisterConfigString(CS_MODELS + i);
+    }
+    CL_RegisterConfigString(CS_ORDER_MARKER);
+    if (report_load)
+        MAP_LOAD_LOG("map=%s phase=client-refresh-models count=%u ms=%.3f\n",
+                         cl.configstrings[CS_WORLD], registered_models, MAP_LOAD_NOW() - stage_start);
+#ifdef DEBUG_MAP_LOAD
+    if (report_load) CL_ReportModelLoadDebug("client-refresh-model-detail", cl.configstrings[CS_WORLD]);
+#endif
+    CL_LoadingStage(0.60f);
+
+    uint32_t registered_images = 0;
+    stage_start = MAP_LOAD_NOW();
+    for (uint32_t i = 1; i < MAX_IMAGES; i++) {
+        if (!*cl.configstrings[CS_IMAGES + i]) continue;
+        registered_images++;
+        CL_RegisterConfigString(CS_IMAGES + i);
+    }
+    if (report_load)
+        MAP_LOAD_LOG("map=%s phase=client-refresh-images count=%u ms=%.3f\n",
+                         cl.configstrings[CS_WORLD], registered_images, MAP_LOAD_NOW() - stage_start);
+    CL_LoadingStage(0.75f);
+
+    uint32_t registered_sounds = 0;
+    stage_start = MAP_LOAD_NOW();
+    if (register_sounds) {
+        for (uint32_t i = 1; i < MAX_SOUNDS; i++)
+            if (*cl.configstrings[CS_SOUNDS + i]) {
+                registered_sounds++;
+                S_RegisterSound(cl.configstrings[CS_SOUNDS + i]);
+            }
+    }
+    if (report_load)
+        MAP_LOAD_LOG("map=%s phase=client-refresh-sounds count=%u ms=%.3f\n",
+                         cl.configstrings[CS_WORLD], registered_sounds, MAP_LOAD_NOW() - stage_start);
+    CL_LoadingStage(0.87f);
+
+    uint32_t registered_fonts = 0;
+    stage_start = MAP_LOAD_NOW();
+    for (uint32_t i = 1; i < MAX_FONTSTYLES; i++) {
+        if (!*cl.configstrings[CS_FONTS + i]) continue;
+        registered_fonts++;
+        CL_RegisterConfigString(CS_FONTS + i);
+    }
+    if (report_load)
+        MAP_LOAD_LOG("map=%s phase=client-refresh-fonts count=%u ms=%.3f\n",
+                         cl.configstrings[CS_WORLD], registered_fonts, MAP_LOAD_NOW() - stage_start);
+    CL_LoadingStage(0.94f);
+
+    CL_LoadingStage(0.98f);
+
+    if (world_loaded && !cl.refresh_prepped) {
+        stage_start = MAP_LOAD_NOW();
+        S_EndRegistration();
+        if (report_load)
+            MAP_LOAD_LOG("map=%s phase=client-sound-finalize ms=%.3f\n",
+                             cl.configstrings[CS_WORLD], MAP_LOAD_NOW() - stage_start);
+        cl.refresh_prepped = true;
+    }
+    if (cl.refresh_prepped) CL_LoadingStage(1.0f);
+    if (world_loaded && !begin_sent && !cl.loading_waiting) {
+        if (Cvar_Integer("cl_loading_wait", 0) && cls.state == ca_connected) {
+            cl.loading_waiting = true;
+            cl.loading_ready_time = SDL_GetTicks();
+            /* The plaque freezes ordinary refreshes; publish the ready label now. */
+            SCR_UpdateLoadingPlaque();
+            fprintf(stderr, "Loading: ready, waiting for acknowledgement\n");
+        } else {
+            CL_SendBegin();
+            begin_sent = true;
+        }
+    }
+    if (report_load) {
+        MAP_LOAD_LOG("map=%s phase=client-refresh-total ms=%.3f\n",
+                         cl.configstrings[CS_WORLD], MAP_LOAD_NOW() - refresh_start);
+        if (client_map_load_debug_start > 0.0)
+            MAP_LOAD_LOG("map=%s phase=client-load-cycle ms=%.3f\n",
+                             cl.configstrings[CS_WORLD], MAP_LOAD_NOW() - client_map_load_debug_start);
+    }
+#ifndef DEBUG_MAP_LOAD
+    (void)stage_start;
+    (void)refresh_start;
+#endif
+}
+
+void V_RenderView(void) {
+    static uint32_t lastTime = 0;
+    bool rebuild;
+    cl.viewDef.weather_effects = cl.weather_effects;
+    cl.viewDef.num_weather_effects = cl.num_weather_effects;
+    cl.viewDef.fow_width = cl.fow.width;
+    cl.viewDef.fow_height = cl.fow.height;
+    cl.viewDef.fow_data = cl.fow.texture;
+    cl.viewDef.fow_generation = cl.fow.generation;
+    cl.viewDef.terrain_mask = cl.terrain_mask;
+    if (!world_loaded || cls.state != ca_active) {
+        vec3_t target = { 0, 0, 90 };
+        uint32_t const elapsed = lastTime && cl.time >= lastTime ? cl.time - lastTime : 0;
+
+        cl.viewDef.target = target;
+        cl.viewDef.viewport = (rect_t) { 0, 0, 1, 1 };
+        cl.viewDef.scissor = (rect_t) { 0, 0, 1, 1 };
+        cl.viewDef.time = cl.time;
+        cl.viewDef.deltaTime = elapsed;
+        cl.viewDef.rdflags = RDF_NOWORLDMODEL | RDF_NOFRUSTUMCULL | RDF_NOFOG;
+        cl.viewDef.player = cl.playerstate.number;
+        cl.viewDef.game_variant = cl.playerstate.stats[UI_PLAYERSTAT_GAME_VARIANT];
+        cl.viewDef.hover_entity = cl.hover_entity;
+
+        V_ClearScene();
+        Matrix4_getPreviewCameraMatrix(&target, &cl.viewDef.viewProjectionMatrix);
+        Matrix4_getPreviewLightMatrix(&lightAngles, &target, VIEW_SHADOW_SIZE, &cl.viewDef.lightMatrix);
+        Matrix4_identity(&cl.viewDef.textureMatrix);
+        V_UpdateEnvironmentLighting(&cl.viewDef, false);
+
+        re.RenderFrame(&cl.viewDef);
+        lastTime = cl.time;
+        return;
+    }
+
+    rebuild = V_AdvanceSceneTime(&cl.viewDef, cl.time, &lastTime, Cvar_Integer("paused", 0));
+    /* Local presentation state can change while simulation snapshots are paused. */
+    cl.viewDef.game_variant = cl.playerstate.stats[UI_PLAYERSTAT_GAME_VARIANT];
+    if (rebuild) {
+        cl.viewDef.lerpfrac = (float)(cl.time - cl.frame.servertime) / FRAMETIME;
+        cl.viewDef.lerpfrac = MAX(0.0f, MIN(1.0f, cl.viewDef.lerpfrac));
+#if defined(WOW) || defined(SC2)
+        cl.viewDef.viewport = (rect_t) { 0, 0, 1, 1 };
+        cl.viewDef.scissor = cl.viewDef.viewport;
+#else
+        /* Warcraft III's 3D world occupies the area above the command console.
+         * Use that rectangle as the real projection viewport rather than drawing a
+         * full-window camera and merely clipping it afterwards. */
+        cl.viewDef.viewport = (rect_t) { 0, 0.22, 1, 0.76 };
+        cl.viewDef.scissor = cl.viewDef.viewport;
+#endif
+        cl.viewDef.rdflags = cl.playerstate.rdflags;
+        cl.viewDef.player = cl.playerstate.number;
+        cl.viewDef.hover_entity = cl.hover_entity;
+    
+#if !defined(WOW) && !defined(SC2)
+        {
+            float yaw_rad = (float)DEG2RAD(cl.playerstate.viewangles.z);
+            vec2_t listener_origin = { cl.playerstate.vieworigin.x, cl.playerstate.vieworigin.y };
+            vec2_t listener_right = { cosf(yaw_rad), sinf(yaw_rad) };
+            S_SetListener(&listener_origin, &listener_right);
+        }
+#endif
+        Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+        Matrix4_getLightMatrix(&lightAngles, VIEW_SHADOW_SIZE, &cl.viewDef.lightMatrix);
+
+        V_ClearScene();
+        CL_AddEntities();
+    }
+
+    V_UpdateEnvironmentLighting(&cl.viewDef, true);
+    SCR_SetupViewBlend(&cl.viewDef, &cl.playerstate, cl.pics);
+    re.RenderFrame(&cl.viewDef);
+    CL_DrawMapLabels();
+    CL_DrawTEnts();
+    
+//    re.DrawPic(tex1, 0, 0);
+//    re.DrawPic(tex2, 512, 0);
+
+    if (cl.selection.in_progress) {
+        re.DrawSelectionRect(&cl.selection.rect, (color32_t){0,255,0,255});
+    }
+    
+    lastTime = cl.time;
+}
+
+void V_AddEntity(renderEntity_t *ent) {
+    if (view_state.num_entities >= MAX_CLIENT_ENTITIES) {
+        return;
+    }
+    view_state.entities[view_state.num_entities++] = *ent;
+}
+
+bool V_FindEntity(uint32_t number, renderEntity_t *out) {
+    if (!number || !out) return false;
+    FOR_LOOP(i, view_state.num_entities) {
+        if (view_state.entities[i].number != number) continue;
+        *out = view_state.entities[i];
+        return true;
+    }
+    return false;
+}
+
+void V_AddDecal(renderDecal_t *decal) {
+    if (view_state.num_decals >= MAX_RENDER_DECALS) {
+        return;
+    }
+    view_state.decals[view_state.num_decals++] = *decal;
+}
+
+void V_Shutdown(void) {
+}
+
+#ifdef BZ_TESTS
+#include "shared/test.h"
+TEST(client_loading, acknowledgement_rejects_stale_input_and_sends_begin_once) {
+    sizeBuf_t old_message = cls.netchan.message;
+    int old_state = cls.state;
+    bool old_waiting = cl.loading_waiting, old_prepped = cl.refresh_prepped, old_begin = begin_sent;
+    uint32_t old_ready = cl.loading_ready_time;
+    uint8_t bytes[128];
+    SZ_Init(&cls.netchan.message, bytes, sizeof(bytes));
+    cls.state = ca_connected;
+    cl.loading_waiting = true; cl.refresh_prepped = true; cl.loading_ready_time = 100;
+    T_ASSERT(!CL_ContinueLoading(99)); T_EQ(cls.netchan.message.cursize, 0);
+    T_ASSERT(CL_ContinueLoading(100)); T_ASSERT(!cl.loading_waiting); T_ASSERT(begin_sent);
+    uint32_t count = cls.netchan.message.cursize;
+    T_ASSERT(count > 0);
+    T_ASSERT(!CL_ContinueLoading(101)); T_EQ(cls.netchan.message.cursize, count);
+    cl.loading_waiting = true; cl.refresh_prepped = false;
+    T_ASSERT(!CL_ContinueLoading(102));
+    cl.loading_waiting = old_waiting; cl.refresh_prepped = old_prepped;
+    cl.loading_ready_time = old_ready; begin_sent = old_begin;
+    cls.state = old_state; cls.netchan.message = old_message;
+}
+
+static size2_t v_test_window(void) { return (size2_t){ 1024, 768 }; }
+static bool v_test_terrain(void) { return true; }
+static bool v_test_absolute(void) { return false; }
+static float v_test_exact(float x, float y) { (void)y; return x; }
+static float v_test_blurred(float x, float y) { (void)x; (void)y; return 50.0f; }
+
+TEST(client_entities, omitted_scale_defaults_to_one_in_render_path) {
+    model_t model = { 0 };
+    centity_t cent = { .prev = { .number = 7, .model = 1 }, .current = { .number = 7, .model = 1 } };
+    viewDef_t saved_view = cl.viewDef;
+    renderEntity_t saved_entity;
+    model_t *saved_model = cl.models[1];
+    int const saved_count = view_state.num_entities;
+    bool const had_entity = saved_count > 0;
+
+    if (had_entity) saved_entity = view_state.entities[0];
+    cl.models[1] = &model;
+    cl.viewDef.lerpfrac = 0.5f;
+    view_state.num_entities = 0;
+    V_AddClientEntity(&cent);
+    T_EQ(view_state.num_entities, 1);
+    T_FEQ(view_state.entities[0].scale, 1.0f, 0.0001f);
+
+    cent.prev.scale = cent.current.scale = -1.0f;
+    view_state.num_entities = 0;
+    V_AddClientEntity(&cent);
+    T_EQ(view_state.num_entities, 1);
+    T_FEQ(view_state.entities[0].scale, 1.0f, 0.0001f);
+
+    cent.prev.scale = cent.current.scale = 1.25f;
+    view_state.num_entities = 0;
+    V_AddClientEntity(&cent);
+    T_EQ(view_state.num_entities, 1);
+    T_FEQ(view_state.entities[0].scale, 1.25f, 0.0001f);
+
+    if (had_entity) view_state.entities[0] = saved_entity;
+    view_state.num_entities = saved_count;
+    cl.models[1] = saved_model;
+    cl.viewDef = saved_view;
+}
+
+/* Recover camera Z from the actual projection with a zero-angle, zero-distance test camera. */
+static float v_test_camera_z(void) {
+    mat4_t inv;
+    Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+    Matrix4_inverse(&cl.viewDef.viewProjectionMatrix, &inv);
+    return Matrix4_multiply_vector3(&inv, &(vec3_t){ 0, 0, -1 }).z + 1.0f;
+}
+
+/* View offsets are server samples: the client lerps them and moves the target and eye, nothing more. */
+TEST(client_camera, server_view_offsets_interpolate_onto_target_and_eye) {
+    viewDef_t saved = cl.viewDef;
+    refExport_t api = re;
+    bool loaded = world_loaded;
+    vec3_t steady_eye;
+    re.GetWindowSize = v_test_window; re.CameraUsesTerrainHeight = v_test_absolute;
+    world_loaded = true;
+    cl.viewDef = (viewDef_t){ .viewport = { 0, 0, 1, 1 } };
+    cl.viewDef.camerastate[1] = (viewCamera_t){
+        .origin = { 100, 200, 300 }, .viewangles = { -35, 0, 25 },
+        .distance = 1650, .fov = 60, .znear = 1, .zfar = 5000
+    };
+    cl.viewDef.camerastate[0] = cl.viewDef.camerastate[1];
+    cl.viewDef.lerpfrac = 0.5f;
+    Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+    steady_eye = cl.viewDef.camerastate[0].eye;
+
+    cl.viewDef.camerastate[1].viewoffset = (vec3_t){ 0, 0, 10 };
+    cl.viewDef.camerastate[0].viewoffset = (vec3_t){ 0, 0, 30 };
+    cl.viewDef.camerastate[0].eyeoffset = (vec3_t){ 8, -4, 0 };
+    Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+
+    T_FEQ(cl.viewDef.target.x, 100.0f, 0.001f);
+    T_FEQ(cl.viewDef.target.y, 200.0f, 0.001f);
+    T_FEQ(cl.viewDef.target.z, 320.0f, 0.001f);
+    T_FEQ(cl.viewDef.camerastate[0].eye.x, steady_eye.x + 4.0f, 0.01f);
+    T_FEQ(cl.viewDef.camerastate[0].eye.y, steady_eye.y - 2.0f, 0.01f);
+    T_FEQ(cl.viewDef.camerastate[0].eye.z, steady_eye.z, 0.01f);
+    cl.viewDef = saved; re = api; world_loaded = loaded;
+}
+
+/* Sky and particles consume the same interpolated eye used to build the final view. */
+TEST(client_camera, rendered_eye_tracks_orbit_distance) {
+    viewDef_t saved = cl.viewDef;
+    refExport_t api = re;
+    bool loaded = world_loaded;
+    re.GetWindowSize = v_test_window; re.CameraUsesTerrainHeight = v_test_absolute;
+    world_loaded = true;
+    cl.viewDef = (viewDef_t){ .viewport = { 0, 0, 1, 1 } };
+    cl.viewDef.camerastate[1] = (viewCamera_t){
+        .origin = { 100, 200, 300 }, .viewangles = { -35, 0, 25 },
+        .distance = 1650, .fov = 60, .znear = 1, .zfar = 5000
+    };
+    cl.viewDef.camerastate[0] = cl.viewDef.camerastate[1];
+    cl.viewDef.lerpfrac = 0.5f;
+
+    Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+
+    T_FEQ(Vector3_distance(&cl.viewDef.target, &cl.viewDef.camerastate[0].eye), 1650.0f, 0.01f);
+    cl.viewDef = saved; re = api; world_loaded = loaded;
+}
+
+/* No-world/UI views must not retain the previous map's sky handle. */
+TEST(client_environment, no_world_clears_sky_model) {
+    model_t sentinel = { 0 };
+    viewDef_t view = { .skyModel = &sentinel };
+    V_UpdateEnvironmentLighting(&view, false);
+    T_NULL(view.skyModel);
+}
+
+/* Terrain follows current XY, but authored height offsets still interpolate at render frequency. */
+TEST(client_camera, terrain_offsets_interpolate) {
+    viewDef_t saved = cl.viewDef;
+    refExport_t api = re;
+    bool loaded = world_loaded;
+    re.GetWindowSize = v_test_window; re.CameraUsesTerrainHeight = v_test_terrain;
+    re.GetHeightAtPoint = v_test_exact; re.GetCameraHeightAtPoint = v_test_blurred;
+    world_loaded = true;
+    cl.viewDef = (viewDef_t){ .viewport = { 0, 0, 1, 1 } };
+    cl.viewDef.camerastate[1] = (viewCamera_t){ .origin = { 0, 0, 20 }, .fov = 60, .znear = 1, .zfar = 1000 };
+    cl.viewDef.camerastate[0] = cl.viewDef.camerastate[1];
+    cl.viewDef.camerastate[0].origin = (vec3_t){ 100, 0, 140 };
+    FOR_LOOP(i, 3) {
+        cl.viewDef.lerpfrac = i * 0.5f;
+        T_FEQ(v_test_camera_z(), 70.0f + i * 10.0f, 0.001f);
+        T_FEQ(cl.viewDef.target.z, 70.0f + i * 10.0f, 0.001f);
+    }
+    re.CameraUsesTerrainHeight = v_test_absolute;
+    cl.viewDef.lerpfrac = 0.25f;
+    T_FEQ(v_test_camera_z(), 50.0f, 0.001f);
+    world_loaded = false;
+    Matrix4_getCameraMatrix(&cl.viewDef.viewProjectionMatrix);
+    mat4_t identity;
+    Matrix4_identity(&identity);
+    T_EQ(memcmp(&cl.viewDef.viewProjectionMatrix, &identity, sizeof(identity)), 0);
+    cl.viewDef = saved; re = api; world_loaded = loaded;
+}
+#endif

@@ -1,0 +1,2074 @@
+#include "g_local.h"
+
+#define WC3_BUILD_CELL_SIZE 32.0f
+#define WC3_BUILD_GRID_SIZE 64.0f
+#define WC3_BUILD_START_LIFE 0.10f
+#define WC3_BUILD_CANCEL_REFUND_PERCENT 75 // percent; base construction-cancel refund
+#define WC3_BUILD_DISPLACE_MARGIN_CELLS 4.0f /* retail clears the four-cell construction approach lane */
+#define WC3_BUILD_SITE_INDICATOR_ALPHA 128
+
+/* Construction Site Indicator. RoC and TFT both show a translucent copy of the
+ * normal building model while the worker travels to the accepted site. The
+ * indicator is private order presentation: only its owner receives it in
+ * snapshots. It has no collision and never bakes static pathing. Its footprint
+ * still displaces friendly mobile units at placement time; the real structure
+ * repeats that displacement when construction starts. */
+edict_t *G_CreateBuildPreview(edict_t *builder, uint32_t building_id, vec2_t const *location) {
+    edict_t *preview;
+    animation_t const *stand;
+
+    if (!builder || !location || !G_UnitIsBuilding(building_id)) return NULL;
+    preview = G_Spawn();
+    if (!preview) return NULL;
+    preview->class_id = preview->s.class_id = building_id;
+    preview->spawn_time = G_Time();
+    preview->s.origin2 = *location;
+    preview->s.origin.x = location->x;
+    preview->s.origin.y = location->y;
+    preview->s.origin.z = CM_GetHeightAtPoint(location->x, location->y);
+    preview->s.scale = 1.0f;
+    preview->s.angle = -M_PI / 2;
+    preview->s.player = builder->s.player;
+    SP_CallSpawn(preview);
+    preview->owner = builder; /* lets direct indicator removal detach accepted build intent */
+    /* Pending construction is private player feedback, unlike the real
+     * building that replaces it when construction starts. Keep the normal
+     * entity/model path, but never send this marker to allies or opponents. */
+    preview->svflags |= SVF_OWNER_ONLY;
+    preview->collision = 0.0f;
+    preview->s.collision = 0.0f;
+    preview->s.flags |= EF_NOT_SELECTABLE;
+    preview->s.renderfx |= RF_NO_UBERSPLAT;
+    gi.LinkEntity(preview);
+
+    /* Retail's Construction Site Indicator is the normal building model made
+     * translucent, not the first frame of Birth. Freeze the completed Stand
+     * presentation while the worker is still travelling to the accepted site. */
+    G_SetUnitAnimation(preview, "stand");
+    stand = preview->animation;
+    if (stand) preview->s.frame = stand->interval[0];
+    preview->aiflags |= AI_HOLD_FRAME;
+    preview->vertex_color = MAKE(color32_t, 255, 255, 255, WC3_BUILD_SITE_INDICATOR_ALPHA);
+    G_SetUnitFlag(preview, UNIT_FLAG_VERTEX_COLOR_SET, true);
+    if (!G_DisplaceBuildOccupants(builder, preview)) {
+#ifdef WC3_DEBUG_BUILD
+        fprintf(stderr, "WC3_BUILD preview-displace-incomplete worker=%ld preview=%ld id=%.4s\n",
+                (long)(builder - g_edicts), (long)(preview - g_edicts), (cstring_t)&building_id);
+#endif
+    }
+#ifdef WC3_DEBUG_BUILD
+    fprintf(stderr, "WC3_BUILD preview-create worker=%ld preview=%ld id=%.4s point=(%.1f,%.1f)\n",
+            (long)(builder - g_edicts), (long)(preview - g_edicts), (cstring_t)&building_id,
+            location->x, location->y);
+#endif
+    return preview;
+}
+
+/* The translucent construction-site marker a worker carries while walking to its site. */
+bool G_IsBuildPreview(edict_t const *ent) {
+    return ent && ent->owner && ent->owner->orders && ent->owner->orders->build_preview == ent;
+}
+
+void G_ClearBuildPreview(edict_t *builder) {
+    edict_t *preview;
+
+    if (!builder || !builder->orders || !(preview = builder->orders->build_preview)) return;
+#ifdef WC3_DEBUG_BUILD
+    fprintf(stderr, "WC3_BUILD preview-clear worker=%ld preview=%ld id=%.4s\n",
+            (long)(builder - g_edicts), (long)(preview - g_edicts), (cstring_t)&preview->class_id);
+#endif
+    builder->orders->build_preview = NULL;
+    G_FreeEdict(preview);
+}
+#define WC3_UNDEAD_BUILD_WORK_MS 2267 // milliseconds; Warsmash CBehaviorUndeadBuild summon-work window
+#define WC3_PATH_BLOCKVISION 0x10
+#define WC3_PATH_UNFLOAT     CM_PATHING_UNSWIMMABLE
+#define WC3_PATH_UNAMPH      0x80 /* placement predicate: UNWALKABLE && UNSWIMMABLE */
+#define WC3_PATH_NAGA_SHALLOW 0x01 /* preview policy: allow shallow-water UNBUILDABLE */
+#define ID_UPGRADE_EFFECT_ATTACK_DAMAGE MAKEFOURCC('r', 'a', 't', 'x')
+#define ID_UPGRADE_EFFECT_ATTACK_DICE   MAKEFOURCC('r', 'a', 't', 'd')
+#define ID_UPGRADE_EFFECT_ATTACK_RANGE  MAKEFOURCC('r', 'a', 't', 'r')
+#define ID_UPGRADE_EFFECT_ARMOR         MAKEFOURCC('r', 'a', 'r', 'm')
+#define ID_UPGRADE_EFFECT_HIT_POINTS    MAKEFOURCC('r', 'h', 'p', 'x')
+#define ID_UPGRADE_EFFECT_SPELL_LEVEL   MAKEFOURCC('r', 'l', 'e', 'v')
+#define ID_UPGRADE_EFFECT_MANA_REGEN    MAKEFOURCC('r', 'm', 'n', 'r') // fourcc; mana-regeneration upgrade effect
+
+static uint8_t G_PlacementFlags(cstring_t list) {
+    uint8_t flags = 0;
+    cstring_t p = list;
+
+    if (!list) return 0;
+    while (*p) {
+        char token[64];
+        uint32_t n = 0;
+
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        while (*p && *p != ',' && n + 1 < sizeof(token)) {
+            token[n++] = (char)tolower((unsigned char)*p++);
+        }
+        token[n] = '\0';
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+        while (n && (token[n - 1] == ' ' || token[n - 1] == '\t')) token[--n] = '\0';
+
+        if (!token[0] || !strcmp(token, "_")) continue;
+        if (!strcmp(token, "unwalkable")) {
+            flags |= WC3_PATH_UNWALKABLE;
+        } else if (!strcmp(token, "unbuildable")) {
+            flags |= WC3_PATH_UNBUILDABLE;
+        } else if (!strcmp(token, "blighted")) {
+            flags |= WC3_PATH_BLIGHTED;
+        } else if (!strcmp(token, "unflyable")) {
+            flags |= CM_PATHING_UNFLYABLE;
+        } else if (!strcmp(token, "blockvision")) {
+            flags |= WC3_PATH_BLOCKVISION;
+        } else if (!strcmp(token, "unfloat")) {
+            flags |= WC3_PATH_UNFLOAT;
+        } else if (!strcmp(token, "unamph")) {
+            flags |= WC3_PATH_UNAMPH;
+        } else {
+            /* TODO: decode the remaining Warcraft placement predicates from the
+             * authoritative unit data instead of silently treating them as no-op. */
+            fprintf(stderr, "G_PlacementFlags: unsupported placement type '%s'\n", token);
+        }
+    }
+    return flags;
+}
+
+static bool G_PlacementPathingPrevented(uint8_t pathing, uint8_t prevented, bool shallow_water) {
+    uint8_t simple = prevented & (uint8_t)~(WC3_PATH_UNAMPH | WC3_PATH_NAGA_SHALLOW);
+
+    /* Some shallow-water WPM cells carry UNBUILDABLE without the same
+     * UNWALKABLE signature. Only an actual water surface can exempt Naga
+     * placement from that authored/default bit. */
+    if ((prevented & WC3_PATH_NAGA_SHALLOW) && shallow_water) {
+        simple &= (uint8_t)~WC3_PATH_UNBUILDABLE;
+    }
+    if (pathing & simple) return true;
+    return (prevented & WC3_PATH_UNAMPH) &&
+           (pathing & CM_PATHING_UNWALKABLE) &&
+           (pathing & CM_PATHING_UNSWIMMABLE);
+}
+
+static bool G_PlacementPathingRequired(uint8_t pathing, uint8_t required) {
+    uint8_t const simple = required & (uint8_t)~WC3_PATH_UNAMPH;
+    if ((pathing & simple) != simple) return false;
+    if (!(required & WC3_PATH_UNAMPH)) return true;
+    return (pathing & CM_PATHING_UNWALKABLE) &&
+           (pathing & CM_PATHING_UNSWIMMABLE);
+}
+
+uint32_t G_CsvToken(cstring_t list, uint32_t index, string_t out, uint32_t out_size) {
+    uint32_t current = 0;
+    cstring_t p = list;
+
+    if (!out || !out_size) return 0;
+    out[0] = '\0';
+    if (!list) return 0;
+    while (*p) {
+        cstring_t start;
+        uint32_t len;
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        start = p;
+        while (*p && *p != ',') p++;
+        len = (uint32_t)(p - start);
+        while (len && (start[len - 1] == ' ' || start[len - 1] == '\t')) len--;
+        if (current++ == index) {
+            len = MIN(len, out_size - 1);
+            memcpy(out, start, len);
+            out[len] = '\0';
+            return len;
+        }
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+bool G_BuildAllEnabled(void) {
+    return atoi(gi.CvarString("wc3_build_all", "0")) != 0;
+}
+
+static int32_t G_FindTechSlot(gameClient_t *client, uint32_t techid, bool create) {
+    int32_t free_slot = -1;
+
+    if (!client || !techid) return -1;
+    FOR_LOOP(i, MAX_PLAYER_TECH_STATE) {
+        if (client->tech[i].id == techid) return (int32_t)i;
+        if (!client->tech[i].id && free_slot < 0) free_slot = (int32_t)i;
+    }
+    if (!create) return -1;
+    if (free_slot < 0) {
+        fprintf(stderr, "G_FindTechSlot: player %u tech state capacity %u exhausted for 0x%08x\n",
+                (unsigned)client->ps.number, (unsigned)MAX_PLAYER_TECH_STATE, (unsigned)techid);
+        return -1;
+    }
+    client->tech[free_slot].id = techid;
+    client->tech[free_slot].max_allowed = -1;
+    return free_slot;
+}
+
+static bool G_UnitUsesUpgrade(edict_t const *unit, uint32_t upgrade_id) {
+    char token[64];
+    cstring_t upgrades;
+
+    if (!unit || !unit->data.UnitBalance || !upgrade_id) return false;
+    upgrades = unit->data.UnitBalance->upgrades;
+    for (uint32_t i = 0; G_CsvToken(upgrades, i, token, sizeof(token)); i++) {
+        if (strlen(token) == 4 && !memcmp(token, &upgrade_id, 4)) return true;
+    }
+    return false;
+}
+
+uint32_t G_GetUnitUpgradeForClass(edict_t const *unit, cstring_t wanted_class) {
+    char token[64];
+    cstring_t upgrades;
+
+    if (!unit || !unit->data.UnitBalance || !wanted_class || !*wanted_class) return 0;
+    upgrades = unit->data.UnitBalance->upgrades;
+    for (uint32_t i = 0; G_CsvToken(upgrades, i, token, sizeof(token)); i++) {
+        uint32_t upgrade_id;
+        UpgradeData_t const *upgrade;
+
+        if (strlen(token) != 4) continue;
+        memcpy(&upgrade_id, token, sizeof(upgrade_id));
+        upgrade = G_UpgradeData(upgrade_id);
+        if (upgrade && upgrade->id == upgrade_id && upgrade->upgradeClass &&
+            !strcasecmp(upgrade->upgradeClass, wanted_class)) {
+            return upgrade_id;
+        }
+    }
+    return 0;
+}
+
+static float G_UpgradeEffectValue(UpgradeData_t const *upgrade, uint32_t effect, int32_t level_value) {
+    if (!upgrade || effect >= 4 || level_value <= 0) return 0.0f;
+    return upgrade->effectBase[effect] + upgrade->effectMod[effect] * (float)(level_value - 1);
+}
+
+typedef struct {
+    bool matched;
+    int32_t required_level;
+} abilityUpgradeRequirement_t;
+
+typedef struct {
+    uint32_t upgrade_id;
+    uint32_t ability_id;
+    int32_t required_level;
+} stockAbilityUpgradeRequirement_t;
+
+/* HACK: retail SLKs omit these stock spell-to-training links and tiers. Keep
+ * the compatibility facts explicit; do not infer them from comments. */
+static stockAbilityUpgradeRequirement_t const stock_ability_requirements[] = {
+    { MAKEFOURCC('R', 'h', 's', 't'), MAKEFOURCC('A', 'i', 'v', 's'), 1 },
+    { MAKEFOURCC('R', 'h', 's', 't'), MAKEFOURCC('A', 'p', 'l', 'y'), 2 },
+    { MAKEFOURCC('R', 'h', 'p', 't'), MAKEFOURCC('A', 'd', 'i', 's'), 1 },
+    { MAKEFOURCC('R', 'h', 'p', 't'), MAKEFOURCC('A', 'i', 'n', 'f'), 2 },
+    { MAKEFOURCC('R', 'u', 'a', 'c'), MAKEFOURCC('A', 'c', 'a', 'n'), 1 },
+};
+
+static abilityUpgradeRequirement_t G_GetAbilityUpgradeRequirement(
+    UpgradeData_t const *upgrade, AbilityData_t const *ability) {
+    abilityUpgradeRequirement_t result = { false, 0 };
+
+    if (!upgrade || !ability || !ability->id) return result;
+
+    /* rlev explicitly names the affected ability in UpgradeData.effectCode.
+     * Its first researched level is the unlock threshold; subsequent levels
+     * raise the ability rank. */
+    FOR_LOOP(i, 4) {
+        if (upgrade->effect[i] == ID_UPGRADE_EFFECT_SPELL_LEVEL &&
+            upgrade->effectCode[i] == ability->id) {
+            result.matched = true;
+            result.required_level = 1;
+            return result;
+        }
+    }
+
+    if (ability->checkDep) {
+        FOR_LOOP(i, (uint32_t)(sizeof(stock_ability_requirements) / sizeof(stock_ability_requirements[0]))) {
+            stockAbilityUpgradeRequirement_t const *stock = stock_ability_requirements + i;
+            if (upgrade->id != stock->upgrade_id || ability->id != stock->ability_id) continue;
+            result.matched = true;
+            result.required_level = stock->required_level;
+            return result;
+        }
+    }
+    return result;
+}
+
+float G_UnitUpgradeEffectBonus(edict_t const *unit, uint32_t effect) {
+    gameClient_t *owner;
+    char token[64];
+    float bonus = 0.0f;
+
+    if (!unit || !unit->data.UnitBalance || !effect || !(owner = G_GetPlayerClientByNumber(unit->s.player))) return 0.0f;
+    for (uint32_t u = 0; G_CsvToken(unit->data.UnitBalance->upgrades, u, token, sizeof(token)); u++) {
+        uint32_t upgrade_id;
+        UpgradeData_t const *upgrade;
+        int32_t level;
+        if (strlen(token) != 4) continue;
+        memcpy(&upgrade_id, token, sizeof(upgrade_id)); upgrade = G_UpgradeData(upgrade_id);
+        level = G_GetPlayerTechResearchedLevel(owner, upgrade_id);
+        if (!upgrade || upgrade->id != upgrade_id || level <= 0) continue;
+        FOR_LOOP(i, 4) if (upgrade->effect[i] == effect)
+            bonus += G_UpgradeEffectValue(upgrade, i, level);
+    }
+    return bonus;
+}
+
+/* Command abilities such as Footman Defend are authored on the unit before
+ * their research completes. UpgradeData rlev and the stock compatibility
+ * table share this gate for command visibility and direct execution. */
+static bool G_UnitAbilityResearchState(edict_t const *unit, uint32_t ability_id,
+                                      bool *visible) {
+    gameClient_t *owner;
+    AbilityData_t const *ability;
+    cstring_t upgrades;
+    char token[64];
+    bool gated = false;
+    bool researchable = false;
+    bool available = false;
+
+    if (visible) *visible = true;
+    if (!unit || !ability_id || !unit->data.UnitBalance) return true;
+    ability = G_AbilityData(ability_id);
+    if (!ability || ability->id != ability_id) return true;
+    upgrades = unit->data.UnitBalance->upgrades;
+    if (!upgrades || !*upgrades) return true;
+    owner = G_GetPlayerClientByNumber(unit->s.player);
+
+    for (uint32_t u = 0; G_CsvToken(upgrades, u, token, sizeof(token)); u++) {
+        uint32_t upgrade_id;
+        UpgradeData_t const *upgrade;
+
+        if (strlen(token) != 4) continue;
+        memcpy(&upgrade_id, token, sizeof(upgrade_id));
+        upgrade = G_UpgradeData(upgrade_id);
+        if (!upgrade || upgrade->id != upgrade_id) continue;
+
+        {
+            abilityUpgradeRequirement_t const requirement =
+                G_GetAbilityUpgradeRequirement(upgrade, ability);
+            if (!requirement.matched) continue;
+            gated = true;
+            if (!owner || owner->ps.number != unit->s.player) {
+                /* An invalid owner cannot inherit the fallback client. Keep
+                 * the command visible, while execution remains unavailable. */
+                researchable = true;
+                continue;
+            }
+            {
+                int32_t const maximum = G_GetPlayerTechMaxAllowed(owner, upgrade_id);
+                bool const allowed = maximum < 0 || maximum >= requirement.required_level;
+                if (allowed) {
+                    researchable = true;
+                    if (G_GetPlayerTechResearchedLevel(owner, upgrade_id) >= requirement.required_level)
+                        available = true;
+                }
+            }
+        }
+    }
+    if (visible) *visible = !gated || researchable;
+    return !gated || available;
+}
+
+bool G_UnitAbilityResearchAvailable(edict_t const *unit, uint32_t ability_id) {
+    return G_UnitAbilityResearchState(unit, ability_id, NULL);
+}
+
+bool G_UnitAbilityResearchVisible(edict_t const *unit, uint32_t ability_id) {
+    bool visible;
+    G_UnitAbilityResearchState(unit, ability_id, &visible);
+    return visible;
+}
+
+static void G_ApplyUpgradeLevelDelta(edict_t *unit, UpgradeData_t const *upgrade,
+                                     int32_t old_level, int32_t new_level) {
+    bool changed = false;
+
+    if (!unit || !upgrade || old_level == new_level || !G_UnitUsesUpgrade(unit, upgrade->id)) return;
+
+    FOR_LOOP(i, 4) {
+        uint32_t const effect = upgrade->effect[i];
+        if (!effect) continue;
+        if (effect == ID_UPGRADE_EFFECT_ATTACK_DAMAGE) {
+            int32_t const old_value = (int32_t)G_UpgradeEffectValue(upgrade, i, old_level);
+            int32_t const new_value = (int32_t)G_UpgradeEffectValue(upgrade, i, new_level);
+            int32_t const delta = new_value - old_value;
+
+            if (delta && (unit->unit_state->attack1.numberOfDice || unit->unit_state->attack2.numberOfDice)) {
+                G_ApplyPermanentAttackDamageBonus(unit, (float)delta);
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_ATTACK_DICE) {
+            int32_t const old_value = (int32_t)G_UpgradeEffectValue(upgrade, i, old_level);
+            int32_t const new_value = (int32_t)G_UpgradeEffectValue(upgrade, i, new_level);
+            int32_t const delta = new_value - old_value;
+
+            if (delta && unit->unit_state->attack1.numberOfDice) {
+                unit->unit_state->attack1.numberOfDice = MAX(0, (int32_t)unit->unit_state->attack1.numberOfDice + delta);
+                changed = true;
+            }
+            if (delta && unit->unit_state->attack2.numberOfDice) {
+                unit->unit_state->attack2.numberOfDice = MAX(0, (int32_t)unit->unit_state->attack2.numberOfDice + delta);
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_ATTACK_RANGE) {
+            float const delta = G_UpgradeEffectValue(upgrade, i, new_level) -
+                                G_UpgradeEffectValue(upgrade, i, old_level);
+            if (delta != 0.0f && unit->unit_state->attack1.numberOfDice) {
+                unit->unit_state->attack1.range = MAX(0.0f, unit->unit_state->attack1.range + delta);
+                changed = true;
+            }
+            if (delta != 0.0f && unit->unit_state->attack2.numberOfDice) {
+                unit->unit_state->attack2.range = MAX(0.0f, unit->unit_state->attack2.range + delta);
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_ARMOR) {
+            float const delta = unit->data.UnitBalance->armorPerUpgrade * (float)(new_level - old_level);
+            if (delta != 0.0f) {
+                G_ApplyPermanentArmorBonus(unit, delta);
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_HIT_POINTS) {
+            float const delta = G_UpgradeEffectValue(upgrade, i, new_level) -
+                                G_UpgradeEffectValue(upgrade, i, old_level);
+            if (delta != 0.0f) {
+                G_ApplyPermanentMaxHealthBonus(unit, delta);
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_SPELL_LEVEL) {
+            uint32_t const ability_id = upgrade->effectCode[i];
+            /* Warsmash's rlev contract sets the affected ability to
+             * researched-level + 1; removing the tech returns it to level 1.
+             * The base/mod numeric columns are not part of this effect. */
+            if (ability_id && G_UnitAbilityLevel(unit, ability_id) &&
+                G_UnitSetAbilityLevel(unit, ability_id, new_level > 0 ? new_level + 1 : 1)) {
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_MAX_MANA) {
+            float const delta = G_UpgradeEffectValue(upgrade, i, new_level) -
+                                G_UpgradeEffectValue(upgrade, i, old_level);
+            if (delta != 0.0f) {
+                if (G_UnitIsHero(unit)) G_RecomputeHeroStats(unit);
+                else {
+                    unit->mana.max_value = MAX(0.0f, unit->mana.max_value + delta);
+                    unit->mana.value = MAX(0.0f, MIN(unit->mana.max_value, unit->mana.value + delta));
+                }
+                changed = true;
+            }
+        } else if (effect == ID_UPGRADE_EFFECT_MANA_REGEN) {
+            unit->unit_state->mana_regen_bonus += G_UpgradeEffectValue(upgrade, i, new_level) -
+                                      G_UpgradeEffectValue(upgrade, i, old_level);
+            changed = true;
+        }
+    }
+    if (changed) G_InvalidateUnitInfoPanel(unit);
+}
+
+static void G_ApplyTechLevelToOwnedUnits(gameClient_t *client, uint32_t techid,
+                                         int32_t old_level, int32_t new_level) {
+    UpgradeData_t const *upgrade;
+    uint32_t player;
+
+    if (!client || !techid || old_level == new_level) return;
+    /* Backpack availability is a player-tech property, not a UnitBalance
+     * stat delta. Update selected inventory panels even if the upgrade has no
+     * UpgradeData effect or was granted directly by campaign JASS. */
+    G_RefreshInventoryAfterTechChange(client, techid);
+    upgrade = G_UpgradeData(techid);
+    if (!upgrade || upgrade->id != techid) return;
+    player = client->ps.number;
+    FILTER_EDICTS(unit, unit->inuse && unit->s.player == player && unit->data.UnitBalance) {
+        G_ApplyUpgradeLevelDelta(unit, upgrade, old_level, new_level);
+    }
+}
+
+void G_ApplyPlayerUpgradesToUnit(edict_t *unit) {
+    gameClient_t *client;
+    char token[64];
+    cstring_t upgrades;
+
+    if (!unit || !unit->data.UnitBalance) return;
+    client = G_GetPlayerClientByNumber(unit->s.player);
+    if (!client || client->ps.number != unit->s.player) return;
+    upgrades = unit->data.UnitBalance->upgrades;
+    for (uint32_t i = 0; G_CsvToken(upgrades, i, token, sizeof(token)); i++) {
+        uint32_t upgrade_id;
+        UpgradeData_t const *upgrade;
+        int32_t level_value;
+
+        if (strlen(token) != 4) continue;
+        memcpy(&upgrade_id, token, sizeof(upgrade_id));
+        upgrade = G_UpgradeData(upgrade_id);
+        level_value = G_GetPlayerTechResearchedLevel(client, upgrade_id);
+        if (upgrade && upgrade->id == upgrade_id && level_value > 0) {
+            G_ApplyUpgradeLevelDelta(unit, upgrade, 0, level_value);
+        }
+    }
+}
+
+void G_SetPlayerTechMaxAllowed(gameClient_t *client, uint32_t techid, int32_t maximum) {
+    int32_t slot;
+    /* The default (-1/unlimited) needs no entry; allocating one per default
+     * write exhausts the table before genuine restrictions (NightElfX02 uses
+     * 137 distinct techs) can fit. */
+    if (maximum < 0 && G_FindTechSlot(client, techid, false) < 0) return;
+    slot = G_FindTechSlot(client, techid, true);
+    if (slot < 0) return;
+    client->tech[slot].max_allowed = maximum < 0 ? -1 : maximum;
+    G_InvalidateCommands(client);
+}
+
+int32_t G_GetPlayerTechMaxAllowed(gameClient_t *client, uint32_t techid) {
+    int32_t slot = G_FindTechSlot(client, techid, false);
+    return slot < 0 ? -1 : client->tech[slot].max_allowed;
+}
+
+void G_SetPlayerTechResearched(gameClient_t *client, uint32_t techid, int32_t level_value) {
+    int32_t slot;
+    int32_t old_level;
+    int32_t new_level;
+
+    /* Researched 0 is the default; do not burn a slot recording it. */
+    if (MAX(0, level_value) == 0 && G_FindTechSlot(client, techid, false) < 0) return;
+    slot = G_FindTechSlot(client, techid, true);
+    if (slot < 0) return;
+    old_level = MAX(0, client->tech[slot].researched);
+    new_level = MAX(0, level_value);
+    client->tech[slot].researched = new_level;
+    G_ApplyTechLevelToOwnedUnits(client, techid, old_level, new_level);
+    G_InvalidateCommands(client);
+}
+
+void G_AddPlayerTechResearched(gameClient_t *client, uint32_t techid, int32_t levels) {
+    int32_t slot;
+    int32_t old_level;
+    int32_t new_level;
+
+    if (!levels) return;
+    slot = G_FindTechSlot(client, techid, false);
+    old_level = slot < 0 ? 0 : MAX(0, client->tech[slot].researched);
+    new_level = MAX(0, old_level + levels);
+    if (new_level == 0) {
+        /* Returning to the default of 0; clear the slot without allocating. */
+        if (slot >= 0) {
+            client->tech[slot].researched = 0;
+            G_ApplyTechLevelToOwnedUnits(client, techid, old_level, 0);
+            G_InvalidateCommands(client);
+        }
+        return;
+    }
+    slot = G_FindTechSlot(client, techid, true);
+    if (slot < 0) return;
+    old_level = MAX(0, client->tech[slot].researched);
+    new_level = MAX(0, old_level + levels);
+    client->tech[slot].researched = new_level;
+    G_ApplyTechLevelToOwnedUnits(client, techid, old_level, new_level);
+    G_InvalidateCommands(client);
+}
+
+int32_t G_GetPlayerTechResearchedLevel(gameClient_t *client, uint32_t techid) {
+    int32_t slot = G_FindTechSlot(client, techid, false);
+    return slot < 0 ? 0 : MAX(0, client->tech[slot].researched);
+}
+
+int32_t G_GetPlayerTechInProgress(gameClient_t *client, uint32_t techid) {
+    int32_t slot = G_FindTechSlot(client, techid, false);
+    return slot < 0 ? 0 : MAX(0, client->tech[slot].in_progress);
+}
+
+void G_AddPlayerTechInProgress(gameClient_t *client, uint32_t techid, int32_t levels) {
+    int32_t slot = G_FindTechSlot(client, techid, false);
+    int32_t in_progress = slot < 0 ? 0 : MAX(0, client->tech[slot].in_progress);
+    int32_t new_level = MAX(0, in_progress + levels);
+    if (new_level == 0) {
+        /* Returning to the default of 0; clear the existing slot without allocating. */
+        if (slot >= 0) { client->tech[slot].in_progress = 0; G_InvalidateCommands(client); }
+        return;
+    }
+    slot = G_FindTechSlot(client, techid, true);
+    if (slot < 0) return;
+    client->tech[slot].in_progress = new_level;
+    G_InvalidateCommands(client);
+}
+
+int32_t G_UpgradeGoldCost(uint32_t upgrade_id, int32_t level_value) {
+    UpgradeData_t const *upgrade = G_UpgradeData(upgrade_id);
+    if (!upgrade || upgrade->id != upgrade_id || level_value <= 0) return 0;
+    return MAX(0, upgrade->goldBase + upgrade->goldMod * (level_value - 1));
+}
+
+int32_t G_UpgradeLumberCost(uint32_t upgrade_id, int32_t level_value) {
+    UpgradeData_t const *upgrade = G_UpgradeData(upgrade_id);
+    if (!upgrade || upgrade->id != upgrade_id || level_value <= 0) return 0;
+    return MAX(0, upgrade->lumberBase + upgrade->lumberMod * (level_value - 1));
+}
+
+float G_UpgradeResearchTime(uint32_t upgrade_id, int32_t level_value) {
+    UpgradeData_t const *upgrade = G_UpgradeData(upgrade_id);
+    if (!upgrade || upgrade->id != upgrade_id || level_value <= 0) return 0.0f;
+    return (float)MAX(0, upgrade->timeBase + upgrade->timeMod * (level_value - 1));
+}
+
+int32_t G_GetPlayerTechCountValue(gameClient_t *client, uint32_t techid) {
+    int32_t count = G_GetPlayerTechResearchedLevel(client, techid);
+    uint32_t player;
+
+    if (!client || !techid) return 0;
+    player = client->ps.number;
+    /* A dead Hero still consumes its techtree/hero-limit slot.  Revival
+     * restores the same object and must not make a second unlock available. */
+    FILTER_EDICTS(ent, ent->inuse && ent->class_id == techid && ent->s.player == player &&
+                         (!(ent->svflags & SVF_DEADMONSTER) || G_UnitIsHero(ent))) {
+        count++;
+    }
+    return count;
+}
+
+bool G_ProducerContains(cstring_t list, uint32_t type_id) {
+    char token[64];
+
+    if (!list || !type_id) return false;
+    for (uint32_t i = 0; G_CsvToken(list, i, token, sizeof(token)); i++) {
+        if (strlen(token) == 4 && !memcmp(token, &type_id, 4)) return true;
+    }
+    return false;
+}
+
+/* A Build-menu folder groups a builder's structures by kind: an authored Builds
+ * entry with its own Builds list and no UnitBalance row. It is never built. */
+bool G_BuildMenuFolder(uint32_t id) {
+    UnitProfile_t const *profile = id ? G_UnitProfile(id) : NULL;
+    return profile && profile->builds && *profile->builds && G_UnitBalance(id)->id != id;
+}
+
+bool G_WorkerCanBuild(edict_t *worker, uint32_t building_id) {
+    return worker && worker->data.UnitProfile && !G_BuildMenuFolder(building_id) &&
+        G_ProducerContains(worker->data.UnitProfile->builds, building_id);
+}
+
+bool G_ProducerCanTrain(edict_t *producer, uint32_t unit_id) {
+    return producer && (!S_AncientHasRootAbility(producer) || S_AncientIsRooted(producer)) && producer->data.UnitProfile &&
+        G_ProducerContains(producer->data.UnitProfile->trains, unit_id);
+}
+
+bool G_ProducerCanResearch(edict_t *producer, uint32_t upgrade_id) {
+    return producer && (!S_AncientHasRootAbility(producer) || S_AncientIsRooted(producer)) && producer->data.UnitProfile &&
+        G_ProducerContains(producer->data.UnitProfile->researches, upgrade_id);
+}
+
+bool G_ProducerCanUpgrade(edict_t *producer, uint32_t unit_id) {
+    return producer && producer->data.UnitProfile &&
+        (!S_AncientHasRootAbility(producer) || S_AncientIsRooted(producer)) &&
+        G_UnitIsBuilding(unit_id) &&
+        G_ProducerContains(producer->data.UnitProfile->upgrade, unit_id);
+}
+
+bool G_BuildingUpgradeActive(edict_t const *building) {
+    return building && building->inuse && building->research && !G_UnitHasFlag(building, UNIT_FLAG_TRAINING) &&
+        building->research->upgrade != 0 &&
+        G_UnitIsStructure(building) &&
+        G_UnitIsBuilding(building->research->upgrade);
+}
+
+bool G_BuildingIsUnsummoning(edict_t const *building) {
+    return building && building->inuse &&
+        G_UnitStatusLevel(building, MAKEFOURCC('B', 'u', 'n', 's')) != 0;
+}
+
+static bool G_RelativeBuildingUpgradeCosts(void) {
+    cstring_t value = Stb_IniCacheFind(&game.config.misc, "Misc", "RelativeUpgradeCost");
+    /* Warsmash treats zero as the relative-cost mode. Missing Misc data follows
+     * the same default so stock total unit costs do not get charged twice. */
+    return !value || !*value || atoi(value) == 0;
+}
+
+void G_GetBuildingUpgradeCosts(buildingUpgradeCostParams_t const *params) {
+    UnitBalance_t const *from = params && params->building ? params->building->data.UnitBalance : NULL;
+    UnitBalance_t const *to = params ? G_UnitBalance(params->unit_id) : NULL;
+    int32_t relative_gold = to ? MAX(0, to->goldCost) : 0;
+    int32_t relative_lumber = to ? MAX(0, to->lumberCost) : 0;
+    int32_t food_delta = to ? MAX(0, to->foodUsed) : 0;
+
+    if (from) {
+        if (G_RelativeBuildingUpgradeCosts()) {
+            relative_gold -= MAX(0, from->goldCost);
+            relative_lumber -= MAX(0, from->lumberCost);
+        }
+        food_delta -= MAX(0, from->foodUsed);
+    }
+    if (params && params->gold) *params->gold = MAX(0, relative_gold);
+    if (params && params->lumber) *params->lumber = MAX(0, relative_lumber);
+    if (params && params->food) *params->food = MAX(0, food_delta);
+}
+
+static int32_t G_RequirementAmount(cstring_t amounts, uint32_t index) {
+    char amount[32];
+    int32_t value = 1;
+
+    if (!amounts || !G_CsvToken(amounts, index, amount, sizeof(amount))) return 1;
+    if (sscanf(amount, "%d", &value) != 1) {
+        fprintf(stderr, "G_RequirementAmount: invalid Requiresamount token '%s' at index %u\n",
+                amount, (unsigned)index);
+        return 1;
+    }
+    return MAX(1, value);
+}
+
+/* Count the owner's completed real heroes for tiered WC3 requirements. Dead
+ * heroes still occupy a hero tier; queued training entities and illusions do not. */
+static uint32_t G_PlayerHeroCount(gameClient_t *client) {
+    uint32_t count = 0;
+
+    if (!client) return 0;
+    FILTER_EDICTS(ent, ent->inuse && ent->data.UnitBalance && ent->s.player == client->ps.number &&
+                         !G_UnitHasFlag(ent, UNIT_FLAG_TRAINING) && G_UnitIsHero(ent) && !(ent->aiflags & AI_ILLUSION)) count++;
+    return count;
+}
+
+static bool G_UnitTypeIsHero(uint32_t type_id) {
+    UnitBalance_t const *balance = G_UnitBalance(type_id);
+    return balance && (balance->strength > 0 || balance->agility > 0 || balance->intelligence > 0);
+}
+
+static bool G_UnitTypeSatisfiesRequirement_r(uint32_t type_id, uint32_t requirement_id,
+                                               uint32_t *visited, uint32_t visited_count) {
+    UnitProfile_t const *profile;
+    char token[64];
+
+    if (!type_id || !requirement_id) return false;
+    if (type_id == requirement_id) return true;
+    if (visited_count >= 32) return false;
+    for (uint32_t i = 0; i < visited_count; i++) {
+        if (visited[i] == requirement_id) return false;
+    }
+    visited[visited_count++] = requirement_id;
+
+    profile = G_UnitProfile(requirement_id);
+    if (!profile || !profile->upgrade || !*profile->upgrade) return false;
+    for (uint32_t i = 0; G_CsvToken(profile->upgrade, i, token, sizeof(token)); i++) {
+        uint32_t upgrade_id;
+
+        if (strlen(token) != 4) continue;
+        memcpy(&upgrade_id, token, sizeof(upgrade_id));
+        if (G_UnitTypeSatisfiesRequirement_r(type_id, upgrade_id, visited, visited_count)) return true;
+    }
+    return false;
+}
+
+/* Warcraft prerequisite checks treat an in-place upgraded structure as also
+ * satisfying requirements on its predecessor. For example, a Keep satisfies
+ * a Town Hall requirement, and a Castle satisfies both Keep and Town Hall.
+ * Follow UnitProfile.Upgrade (uupt) transitively rather than teaching each
+ * production command about race-specific town-hall tiers. */
+static bool G_UnitTypeSatisfiesRequirement(uint32_t type_id, uint32_t requirement_id) {
+    uint32_t visited[32];
+    return G_UnitTypeSatisfiesRequirement_r(type_id, requirement_id, visited, 0);
+}
+
+int32_t G_PlayerRequirementCount(gameClient_t *client, uint32_t techid) {
+    int32_t count;
+    uint32_t player;
+
+    if (!client || !techid) return 0;
+    count = G_GetPlayerTechResearchedLevel(client, techid);
+    player = client->ps.number;
+    FILTER_EDICTS(ent, ent->inuse && ent->s.player == player &&
+                         !(ent->svflags & SVF_DEADMONSTER) && !ent->construction && !G_UnitHasFlag(ent, UNIT_FLAG_TRAINING) &&
+                         G_UnitTypeSatisfiesRequirement(ent->class_id, techid)) {
+        count++;
+    }
+    return count;
+}
+
+static cstring_t G_UpgradeLevelField(uint32_t upgrade_id, cstring_t base, int32_t level_value) {
+    static char fields[4][32];
+    static uint32_t cursor;
+    string_t field = fields[cursor++ & 3];
+    int32_t suffix = MAX(0, level_value - 1);
+
+    if (!upgrade_id || !base || !*base || level_value <= 0) return NULL;
+    if (suffix == 0) snprintf(field, sizeof(fields[0]), "%s", base);
+    else snprintf(field, sizeof(fields[0]), "%s%d", base, suffix);
+    return FindConfigValue(GetClassName(upgrade_id), field);
+}
+
+static int32_t G_UpgradeRequirementAmount(uint32_t upgrade_id, int32_t level_value, uint32_t index) {
+    cstring_t amounts = G_UpgradeLevelField(upgrade_id, "Requiresamount", level_value);
+    return G_RequirementAmount(amounts, index);
+}
+
+static bool G_UpgradeRequirementsSatisfied(gameClient_t *client, uint32_t upgrade_id, int32_t level_value,
+                                           string_t reason, uint32_t reason_size) {
+    cstring_t requirements = G_UpgradeLevelField(upgrade_id, "Requires", level_value);
+    char requirement[64];
+
+    if (!requirements || !*requirements || !strcmp(requirements, "_")) return true;
+    for (uint32_t i = 0; G_CsvToken(requirements, i, requirement, sizeof(requirement)); i++) {
+        uint32_t rawcode;
+        int32_t required;
+        cstring_t name;
+
+        if (strlen(requirement) != 4) continue;
+        memcpy(&rawcode, requirement, sizeof(rawcode));
+        required = G_UpgradeRequirementAmount(upgrade_id, level_value, i);
+        if (G_PlayerRequirementCount(client, rawcode) >= required) continue;
+
+        if (reason && reason_size) {
+            name = G_LevelString(G_UnitProfile(rawcode)->name);
+            if (!name || !*name) name = FindConfigValue(GetClassName(rawcode), "Name");
+            if (required > 1) {
+                snprintf(reason, reason_size, "Requires %s x%d",
+                         name && *name ? name : requirement, required);
+            } else {
+                snprintf(reason, reason_size, "Requires %s",
+                         name && *name ? name : requirement);
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool G_RequirementsListSatisfied(gameClient_t *client, uint32_t type_id, cstring_t requirements,
+                                        cstring_t amounts, string_t reason, uint32_t reason_size) {
+    char requirement[64];
+
+    for (uint32_t i = 0; G_CsvToken(requirements, i, requirement, sizeof(requirement)); i++) {
+        uint32_t rawcode;
+        int32_t required;
+        if (strlen(requirement) != 4) {
+            fprintf(stderr, "G_RequirementsSatisfied: unsupported requirement token '%s' for 0x%08x\n",
+                    requirement, (unsigned)type_id);
+            continue;
+        }
+        memcpy(&rawcode, requirement, sizeof(rawcode));
+        required = G_RequirementAmount(amounts, i);
+        if (G_PlayerRequirementCount(client, rawcode) < required) {
+            if (reason && reason_size) {
+                cstring_t name = G_LevelString(G_UnitProfile(rawcode)->name);
+                if (required > 1) {
+                    snprintf(reason, reason_size, "Requires %s x%d",
+                             name && *name ? name : requirement, required);
+                } else {
+                    snprintf(reason, reason_size, "Requires %s",
+                             name && *name ? name : requirement);
+                }
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool G_RequirementsSatisfied(gameClient_t *client, uint32_t type_id, string_t reason, uint32_t reason_size) {
+    UnitProfile_t const *profile = G_UnitProfile(type_id);
+    uint32_t hero_count, tier_count, tier;
+
+    if (!G_RequirementsListSatisfied(client, type_id, profile->requires, profile->requiresAmount,
+                                     reason, reason_size)) return false;
+    if (!G_UnitTypeIsHero(type_id) || !profile->requiresCount) return true;
+    hero_count = G_PlayerHeroCount(client);
+    tier_count = MIN(sizeof(profile->requiresLevel) / sizeof(profile->requiresLevel[0]),
+                     (uint32_t)MAX(0, atoi(profile->requiresCount)));
+    if (!hero_count || hero_count > tier_count) return true;
+    tier = hero_count;
+    if (!profile->requiresLevel[tier - 1] || !*profile->requiresLevel[tier - 1]) return true;
+    return G_RequirementsListSatisfied(client, type_id, profile->requiresLevel[tier - 1], NULL,
+                                       reason, reason_size);
+}
+
+static bool G_ProductionResourcesAvailable(gameClient_t *client, uint32_t type_id, string_t reason, uint32_t reason_size) {
+    UnitBalance_t const *b = G_UnitBalance(type_id);
+
+    if (!client) return false;
+    if (b->goldCost > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_GOLD]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nogold");
+        return false;
+    }
+    if (b->lumberCost > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nolumber");
+        return false;
+    }
+    if (!G_PlayerHasFoodFor(client, MAX(0, b->foodUsed))) {
+        if (reason && reason_size) snprintf(reason, reason_size, "%s", G_FoodCommandErrorKey(client, MAX(0, b->foodUsed)));
+        return false;
+    }
+    return true;
+}
+
+/* Command Both sandbox (game.command_all): another side's builder or producer is judged
+ * by its owner's tech limits, requirements and resources, as if that side gave the order. */
+static gameClient_t *G_CommandStateClient(gameClient_t *client, edict_t const *unit) {
+    gameClient_t *owner;
+    if (!game.command_all || !client || !unit || unit->s.player == client->ps.number) return client;
+    owner = G_GetPlayerClientByNumber(unit->s.player);
+    return owner ? owner : client;
+}
+
+buildCommandState_t G_GetBuildCommandState(gameClient_t *client, edict_t *worker, uint32_t building_id,
+                                           string_t reason, uint32_t reason_size) {
+    int32_t maximum;
+
+    client = G_CommandStateClient(client, worker);
+    if (reason && reason_size) reason[0] = '\0';
+    if (!client || !G_WorkerCanBuild(worker, building_id)) return BUILD_COMMAND_ABSENT;
+    if (!G_UnitIsBuilding(building_id)) return BUILD_COMMAND_ABSENT;
+    if (G_BuildAllEnabled()) return BUILD_COMMAND_AVAILABLE;
+
+    maximum = G_GetPlayerTechMaxAllowed(client, building_id);
+    if (maximum >= 0 && G_GetPlayerTechCountValue(client, building_id) >= maximum) {
+        return BUILD_COMMAND_HIDDEN;
+    }
+    if (!G_RequirementsSatisfied(client, building_id, reason, reason_size)) {
+        return BUILD_COMMAND_DISABLED;
+    }
+    if (!G_ProductionResourcesAvailable(client, building_id, reason, reason_size)) {
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    return BUILD_COMMAND_AVAILABLE;
+}
+
+buildCommandState_t G_GetTrainCommandState(gameClient_t *client, edict_t *producer, uint32_t unit_id,
+                                           string_t reason, uint32_t reason_size) {
+    int32_t maximum;
+
+    client = G_CommandStateClient(client, producer);
+    if (reason && reason_size) reason[0] = '\0';
+    if (!client || !G_ProducerCanTrain(producer, unit_id)) return BUILD_COMMAND_ABSENT;
+    if (G_BuildingIsUnsummoning(producer)) return BUILD_COMMAND_DISABLED;
+    if (!G_BuildAllEnabled()) {
+        maximum = G_GetPlayerTechMaxAllowed(client, unit_id);
+        if (maximum >= 0 && G_GetPlayerTechCountValue(client, unit_id) >= maximum) {
+            return BUILD_COMMAND_HIDDEN;
+        }
+        if (!G_RequirementsSatisfied(client, unit_id, reason, reason_size)) {
+            return BUILD_COMMAND_DISABLED;
+        }
+    }
+    if (!G_ProductionResourcesAvailable(client, unit_id, reason, reason_size)) {
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    return BUILD_COMMAND_AVAILABLE;
+}
+
+buildCommandState_t G_GetResearchCommandState(gameClient_t *client, edict_t *producer, uint32_t upgrade_id,
+                                              int32_t *next_level, string_t reason, uint32_t reason_size) {
+    client = G_CommandStateClient(client, producer);
+    UpgradeData_t const *upgrade;
+    int32_t current;
+    int32_t maximum;
+    int32_t player_max;
+    int32_t level_value;
+
+    if (reason && reason_size) reason[0] = '\0';
+    if (next_level) *next_level = 0;
+    if (!client || !G_ProducerCanResearch(producer, upgrade_id)) return BUILD_COMMAND_ABSENT;
+    if (G_BuildingIsUnsummoning(producer)) return BUILD_COMMAND_DISABLED;
+    upgrade = G_UpgradeData(upgrade_id);
+    if (!upgrade || upgrade->id != upgrade_id || upgrade->maxLevel <= 0) return BUILD_COMMAND_ABSENT;
+
+    current = G_GetPlayerTechResearchedLevel(client, upgrade_id);
+    level_value = current + 1;
+    maximum = upgrade->maxLevel;
+    player_max = G_GetPlayerTechMaxAllowed(client, upgrade_id);
+    if (player_max >= 0) maximum = MIN(maximum, player_max);
+    if (current >= maximum || G_GetPlayerTechInProgress(client, upgrade_id) > 0) {
+        return BUILD_COMMAND_HIDDEN;
+    }
+    if (next_level) *next_level = level_value;
+
+    if (!G_BuildAllEnabled() &&
+        !G_UpgradeRequirementsSatisfied(client, upgrade_id, level_value, reason, reason_size)) {
+        return BUILD_COMMAND_DISABLED;
+    }
+    if (G_UpgradeGoldCost(upgrade_id, level_value) > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_GOLD]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nogold");
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    if (G_UpgradeLumberCost(upgrade_id, level_value) > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nolumber");
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    return BUILD_COMMAND_AVAILABLE;
+}
+
+buildCommandState_t G_GetBuildingUpgradeCommandState(buildingUpgradeCommandParams_t const *params) {
+    int32_t maximum;
+    int32_t gold, lumber, food;
+    UnitBalance_t const *target;
+    gameClient_t *client = params ? params->client : NULL;
+    edict_t *producer = params ? params->producer : NULL;
+    uint32_t unit_id = params ? params->unit_id : 0;
+    string_t reason = params ? params->reason : NULL;
+    uint32_t reason_size = params ? params->reason_size : 0;
+
+    if (reason && reason_size) reason[0] = '\0';
+    if (!client || !G_ProducerCanUpgrade(producer, unit_id)) return BUILD_COMMAND_ABSENT;
+    if (G_BuildingIsUnsummoning(producer)) return BUILD_COMMAND_DISABLED;
+    target = G_UnitBalance(unit_id);
+    if (!target || target->id != unit_id || !G_UnitUI(unit_id) || !G_UnitUI(unit_id)->modelFile)
+        return BUILD_COMMAND_ABSENT;
+    if (G_BuildingUpgradeActive(producer) || producer->construction || G_UnitHasFlag(producer, UNIT_FLAG_TRAINING) || producer->build) {
+        return BUILD_COMMAND_DISABLED;
+    }
+
+    if (!G_BuildAllEnabled()) {
+        maximum = G_GetPlayerTechMaxAllowed(client, unit_id);
+        if (maximum >= 0 &&
+            G_GetPlayerTechCountValue(client, unit_id) + G_GetPlayerTechInProgress(client, unit_id) >= maximum) {
+            return BUILD_COMMAND_HIDDEN;
+        }
+        if (!G_RequirementsSatisfied(client, unit_id, reason, reason_size)) {
+            return BUILD_COMMAND_DISABLED;
+        }
+    }
+
+    G_GetBuildingUpgradeCosts(&(buildingUpgradeCostParams_t){
+        .building = producer, .unit_id = unit_id, .gold = &gold, .lumber = &lumber, .food = &food });
+    if (gold > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_GOLD]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nogold");
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    if (lumber > (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER]) {
+        if (reason && reason_size) snprintf(reason, reason_size, "Nolumber");
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    if (!G_PlayerHasFoodFor(client, food)) {
+        if (reason && reason_size) snprintf(reason, reason_size, "%s", G_FoodCommandErrorKey(client, food));
+        return BUILD_COMMAND_UNAFFORDABLE;
+    }
+    return BUILD_COMMAND_AVAILABLE;
+}
+
+bool G_ChargeBuilding(gameClient_t *client, uint32_t building_id) {
+    UnitBalance_t const *b;
+
+    if (!client) return false;
+    if (G_BuildAllEnabled()) return true;
+    if (!G_ProductionResourcesAvailable(client, building_id, NULL, 0)) return false;
+    b = G_UnitBalance(building_id);
+    client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] -= MAX(0, b->goldCost);
+    client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] -= MAX(0, b->lumberCost);
+    return true;
+}
+
+void G_RefundBuilding(gameClient_t *client, uint32_t building_id) {
+    UnitBalance_t const *b;
+    if (!client || G_BuildAllEnabled()) return;
+    b = G_UnitBalance(building_id);
+    client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] += MAX(0, b->goldCost);
+    client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] += MAX(0, b->lumberCost);
+}
+
+static void G_RefreshBuildingUpgradeUI(edict_t *building) {
+    gameClient_t *client;
+    edict_t *clent;
+
+    if (!building) return;
+    client = G_GetPlayerClientByNumber(building->s.player);
+    if (!client || client->ps.number != building->s.player) return;
+    G_InvalidateCommands(client);
+    clent = G_GetPlayerEntityByNumber(building->s.player);
+    if (!clent || !client->connected) return;
+    G_RefreshResourceBar(clent);
+    Get_Commands_f(clent);
+    Get_Portrait_f(clent);
+}
+
+void G_UpdateBuildingUpgradeAnimation(edict_t *building) {
+    animation_t const *anim;
+    float fraction;
+    uint32_t first, last, span, frame;
+
+    if (!G_BuildingUpgradeActive(building) || building->research->duration <= 0.0f) return;
+    anim = building->animation;
+    if (!G_AnimationHasPrimary(anim, "birth")) anim = G_GetUnitAnimation(building, "birth");
+    if (!anim || anim->interval[1] <= anim->interval[0]) return;
+    building->animation = anim;
+
+    fraction = MAX(0.0f, MIN(1.0f, building->research->progress / building->research->duration));
+    first = anim->interval[0];
+    last = anim->interval[1];
+    span = last - first;
+    frame = first + (uint32_t)((float)span * fraction);
+    if (frame >= last) frame = last - 1;
+    building->s.frame = frame;
+}
+
+void G_ShowBuildCommandError(edict_t *clent, buildCommandState_t state, cstring_t reason) {
+    if (!clent || !reason || !reason[0]) return;
+    if (state == BUILD_COMMAND_UNAFFORDABLE)
+        G_ShowCommandErrorKey(clent, reason, NULL);
+    else
+        G_ShowCommandErrorText(clent, reason);
+}
+
+bool G_StartBuildingUpgrade(edict_t *building, uint32_t unit_id) {
+    gameClient_t *client;
+    edict_t *clent;
+    buildCommandState_t state;
+    UnitBalance_t const *target;
+    int32_t gold, lumber, food;
+    char reason[128];
+
+    if (!building || !unit_id) return false;
+    client = G_GetPlayerClientByNumber(building->s.player);
+    if (!client || client->ps.number != building->s.player) return false;
+    clent = G_GetPlayerEntityByNumber(building->s.player);
+    state = G_GetBuildingUpgradeCommandState(&(buildingUpgradeCommandParams_t){
+        .client = client, .producer = building, .unit_id = unit_id, .reason = reason, .reason_size = sizeof(reason) });
+    if (state != BUILD_COMMAND_AVAILABLE) {
+        if (clent && client->connected && reason[0]) G_ShowBuildCommandError(clent, state, reason);
+        return false;
+    }
+
+    target = G_UnitBalance(unit_id);
+    G_GetBuildingUpgradeCosts(&(buildingUpgradeCostParams_t){
+        .building = building, .unit_id = unit_id, .gold = &gold, .lumber = &lumber, .food = &food });
+    client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] -= gold;
+    client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] -= lumber;
+
+    /* Upgrade construction is owned by the existing edict. Reuse the otherwise
+     * producer-local research scalars for target/cost/timing state; queued
+     * UpgradeData research continues to live on hidden training edicts. */
+    G_ClearUnitOrderQueue(building);
+    if (building->stand) building->stand(building);
+    G_FreeResearch(building);
+    building->research = G_AllocResearch();
+    assert(building->research);
+    building->research->upgrade = unit_id;
+    building->research->gold = gold;
+    building->research->lumber = lumber;
+    building->research->duration = (float)MAX(0, target->buildTime);
+    building->research->progress = 0.0f;
+    G_SetUnitFoodUsed(building, MAX(0, target->foodUsed));
+    G_AddPlayerTechInProgress(client, unit_id, 1);
+    building->aiflags |= AI_HOLD_FRAME;
+    G_UpdateBuildingUpgradeAnimation(building);
+    G_PublishEvent(building, EVENT_PLAYER_UNIT_UPGRADE_START);
+    G_PublishEvent(building, EVENT_UNIT_UPGRADE_START);
+    G_RefreshBuildingUpgradeUI(building);
+    return true;
+}
+
+void G_StopBuildingUpgrade(edict_t *building, bool refund) {
+    gameClient_t *client;
+    uint32_t unit_id;
+
+    if (!G_BuildingUpgradeActive(building)) return;
+    unit_id = building->research->upgrade;
+    client = G_GetPlayerClientByNumber(building->s.player);
+    if (client && client->ps.number == building->s.player) {
+        if (refund) {
+            int32_t gold = (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] +
+                        MAX(0, building->research->gold);
+            int32_t lumber = (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] +
+                          MAX(0, building->research->lumber);
+            client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = (uint16_t)MIN(gold, USHRT_MAX);
+            client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = (uint16_t)MIN(lumber, USHRT_MAX);
+        }
+        G_AddPlayerTechInProgress(client, unit_id, -1);
+    }
+    G_SetUnitFoodUsed(building, building->data.UnitBalance ? MAX(0, building->data.UnitBalance->foodUsed) : 0);
+    G_FreeResearch(building);
+    if (!building->construction && !(building->svflags & SVF_DEADMONSTER) && !M_IsDead(building)) {
+        building->aiflags &= ~AI_HOLD_FRAME;
+        if (building->stand) building->stand(building);
+    }
+    G_RefreshBuildingUpgradeUI(building);
+}
+
+bool G_CancelBuildingUpgrade(edict_t *building) {
+    if (!G_BuildingUpgradeActive(building)) return false;
+    G_PublishEvent(building, EVENT_PLAYER_UNIT_UPGRADE_CANCEL);
+    G_PublishEvent(building, EVENT_UNIT_UPGRADE_CANCEL);
+    G_StopBuildingUpgrade(building, true);
+    return true;
+}
+
+static bool G_CompleteBuildingUpgrade(edict_t *building) {
+    gameClient_t *client;
+    uint32_t unit_id;
+    int32_t charged_gold, charged_lumber;
+
+    if (!G_BuildingUpgradeActive(building)) return false;
+    unit_id = building->research->upgrade;
+    charged_gold = MAX(0, building->research->gold);
+    charged_lumber = MAX(0, building->research->lumber);
+    client = G_GetPlayerClientByNumber(building->s.player);
+    if (client && client->ps.number == building->s.player)
+        G_AddPlayerTechInProgress(client, unit_id, -1);
+
+    /* Clear the transient state before type rebinding so the new unit profile
+     * owns the command card immediately and the transform's food refresh uses
+     * only the completed target type. */
+    G_FreeResearch(building);
+    building->aiflags &= ~AI_HOLD_FRAME;
+    if (!G_TransformUnitType(building, unit_id)) {
+        /* Command acceptance validates the target, so this is defensive. Do
+         * not strand resources/food if map data becomes invalid mid-upgrade. */
+        if (client && client->ps.number == building->s.player) {
+            int32_t gold = (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] + charged_gold;
+            int32_t lumber = (int32_t)client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] + charged_lumber;
+            client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = (uint16_t)MIN(gold, USHRT_MAX);
+            client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = (uint16_t)MIN(lumber, USHRT_MAX);
+        }
+        G_SetUnitFoodUsed(building, building->data.UnitBalance ? MAX(0, building->data.UnitBalance->foodUsed) : 0);
+        if (building->stand) building->stand(building);
+        G_RefreshBuildingUpgradeUI(building);
+        return false;
+    }
+    building->aiflags &= ~AI_HOLD_FRAME;
+    if (building->stand) building->stand(building);
+    G_PublishEvent(building, EVENT_PLAYER_UNIT_UPGRADE_FINISH);
+    G_PublishEvent(building, EVENT_UNIT_UPGRADE_FINISH);
+    G_RefreshBuildingUpgradeUI(building);
+    return true;
+}
+
+void G_RunBuildingUpgradeFrame(edict_t *building) {
+    if (!G_BuildingUpgradeActive(building)) return;
+    if (G_BuildingIsUnsummoning(building)) return;
+    if (M_IsDead(building) || (building->svflags & SVF_DEADMONSTER)) {
+        G_StopBuildingUpgrade(building, false);
+        return;
+    }
+    if (G_UnitHasFlag(building, UNIT_FLAG_PAUSED)) return;
+    if (building->research->duration <= 0.0f || G_PlayerInstantBuild(building->s.player)) {
+        G_CompleteBuildingUpgrade(building);
+        return;
+    }
+    building->research->progress += (float)FRAMETIME / 1000.0f;
+    G_UpdateBuildingUpgradeAnimation(building);
+    if (building->research->progress >= building->research->duration)
+        G_CompleteBuildingUpgrade(building);
+}
+
+void G_GetBuildPlacementPathingFlags(uint32_t building_id, uint8_t *prevented, uint8_t *required) {
+    UnitBalance_t const *balance = G_UnitBalance(building_id);
+    UnitUI_t const *ui = G_UnitUI(building_id);
+    UnitData_t const *data = G_UnitData(building_id);
+    cstring_t prevent = balance->preventPlace ? balance->preventPlace : ui->preventPlace;
+    cstring_t require = balance->requirePlace ? balance->requirePlace : ui->requirePlace;
+    uint8_t prevented_flags = WC3_PATH_UNBUILDABLE | WC3_PATH_UNWALKABLE | G_PlacementFlags(prevent);
+
+    /* Naga structures can occupy shallow water: those cells are unwalkable
+     * but remain amphibious. Reject only cells blocked to both walkers and
+     * swimmers, while retaining the ordinary unbuildable restriction. */
+    if (WC3_RaceFromString(data->race) == RACE_NAGA && G_UnitIsBuilding(building_id)) {
+        prevented_flags &= (uint8_t)~WC3_PATH_UNWALKABLE;
+        prevented_flags |= WC3_PATH_UNAMPH;
+        prevented_flags |= WC3_PATH_NAGA_SHALLOW;
+    }
+
+    if (prevented) {
+        *prevented = prevented_flags;
+    }
+    if (required) {
+        *required = G_PlacementFlags(require);
+    }
+}
+
+void G_SnapBuildingPoint(uint32_t building_id, vec2_t *point) {
+    pathTex_t *pathtex;
+    UnitData_t const *data;
+
+    if (!point) return;
+    data = G_UnitData(building_id);
+    pathtex = M_LoadPathTex(data->pathingTexture);
+    if (!pathtex) {
+        point->x = floorf(point->x / WC3_BUILD_CELL_SIZE) * WC3_BUILD_CELL_SIZE;
+        point->y = floorf(point->y / WC3_BUILD_CELL_SIZE) * WC3_BUILD_CELL_SIZE;
+        return;
+    }
+    point->x = floorf(point->x / WC3_BUILD_GRID_SIZE) * WC3_BUILD_GRID_SIZE;
+    point->y = floorf(point->y / WC3_BUILD_GRID_SIZE) * WC3_BUILD_GRID_SIZE;
+    if (((pathtex->width / 2) & 1) != 0) point->x += WC3_BUILD_CELL_SIZE;
+    if (((pathtex->height / 2) & 1) != 0) point->y += WC3_BUILD_CELL_SIZE;
+    gi.MemFree(pathtex);
+}
+
+static bool G_PathCellUsed(pathTex_t const *pathtex, uint32_t x, uint32_t y) {
+    if (!pathtex) return true;
+    return pathtex->map[x + y * pathtex->width].b != 0;
+}
+
+bool G_FindBuildOnTarget(uint32_t building_id, vec2_t const *point, edict_t * *out) {
+    UnitData_t const *data = G_UnitData(building_id);
+    if (out) *out = NULL;
+    if (!data->isBuildOn) return true;
+    FILTER_EDICTS(ent, ent->inuse && G_UnitIsStructure(ent) && ent->data.UnitData->canBuildOn) {
+        /* Build-on targets may be off the placement lattice; accept the whole
+         * snap cell so clicking a mine does not fail after the ghost moves. */
+        if (fabsf(ent->s.origin2.x - point->x) <= WC3_BUILD_GRID_SIZE &&
+            fabsf(ent->s.origin2.y - point->y) <= WC3_BUILD_GRID_SIZE) {
+            if (out) *out = ent;
+#ifdef WC3_DEBUG_MINING
+            fprintf(stderr, "WC3_MINING build-target building=%.4s parent=%ld id=%.4s parent=(%.1f,%.1f) point=(%.1f,%.1f)\n",
+                    (cstring_t)&building_id, (long)(ent - globals.edicts), (cstring_t)&ent->class_id,
+                    ent->s.origin2.x, ent->s.origin2.y, point->x, point->y);
+#endif
+            return true;
+        }
+    }
+#ifdef WC3_DEBUG_MINING
+    fprintf(stderr, "WC3_MINING build-target-missing building=%.4s point=(%.1f,%.1f)\n",
+            (cstring_t)&building_id, point ? point->x : 0.0f, point ? point->y : 0.0f);
+#endif
+    return false;
+}
+
+static bool G_BuildUnitCanDisplace(edict_t *builder, edict_t *ent) {
+    return builder && ent && ent->s.player == builder->s.player && !G_UnitIsStructure(ent) &&
+           ent->movetype != MOVETYPE_NONE && ent->collision > 0.0f;
+}
+
+static bool G_LiveUnitBlocksBuild(edict_t *builder, edict_t *build_on, box2_t const *footprint,
+                                  bool allow_friendly_displacement) {
+    FILTER_EDICTS(ent, ent->inuse && (ent->svflags & SVF_MONSTER) && !(ent->svflags & SVF_DEADMONSTER)) {
+        float x, y;
+        /* Construction can later displace friendly mobile units; mode changes can require a strict clear footprint. */
+        if (ent == builder || ent == build_on || ent->collision <= 0.0f) continue;
+        x = MAX(footprint->min.x, MIN(footprint->max.x, ent->s.origin2.x));
+        y = MAX(footprint->min.y, MIN(footprint->max.y, ent->s.origin2.y));
+        vec2_t nearest = { x, y };
+        if (Vector2_distance(&nearest, &ent->s.origin2) < ent->collision &&
+            !(allow_friendly_displacement && G_BuildUnitCanDisplace(builder, ent))) return true;
+    }
+    return false;
+}
+
+static bool G_BuildTooCloseToGoldMine(uint32_t building_id, vec2_t const *point) {
+    if (!point || !S_UnitTypeReturnsGold(building_id)) return false;
+
+    FILTER_EDICTS(mine, mine->inuse && !M_IsDead(mine) && S_GoldMineIsMine(mine)) {
+        if (Vector2_distance(point, &mine->s.origin2) < WC3_GOLD_MINE_MIN_DISTANCE)
+            return true;
+    }
+    return false;
+}
+
+/* Move friendly mobile units clear of a newly baked footprint while retaining their active orders. */
+bool G_DisplaceBuildOccupants(edict_t *builder, edict_t *building) {
+    edict_t * *units;
+    vec2_t *positions;
+    uint32_t count = 0;
+
+    if (!builder || !building || !globals.num_edicts) return false;
+    units = gi.MemAlloc(sizeof(*units) * globals.num_edicts);
+    positions = gi.MemAlloc(sizeof(*positions) * globals.num_edicts);
+    if (!units || !positions) {
+        fprintf(stderr, "WC3: unable to allocate construction occupant displacement buffers\n");
+        if (positions) gi.MemFree(positions);
+        if (units) gi.MemFree(units);
+        return false;
+    }
+    FILTER_EDICTS(ent, ent->inuse && (ent->svflags & SVF_MONSTER) && !(ent->svflags & SVF_DEADMONSTER) &&
+                  G_BuildUnitCanDisplace(builder, ent) && ent != builder &&
+                  CM_DistanceToPathingFootprint(building, &ent->s.origin2) <
+                      ent->collision + WC3_BUILD_DISPLACE_MARGIN_CELLS * CM_PathCellWorldSize()) {
+#ifdef WC3_DEBUG_BUILD
+        fprintf(stderr, "WC3_BUILD displace-candidate builder=%ld building=%ld id=%.4s unit=%ld unitid=%.4s origin=(%.1f,%.1f) move=%s project=%.4s build=%ld goal=%ld\n",
+                (long)(builder - g_edicts), (long)(building - g_edicts), (cstring_t)&building->class_id,
+                (long)(ent - g_edicts), (cstring_t)&ent->class_id, ent->s.origin2.x, ent->s.origin2.y,
+                ent->currentmove && ent->currentmove->animation ? ent->currentmove->animation : "<none>",
+                ent->orders && ent->orders->build_project ? (cstring_t)&ent->orders->build_project : "----",
+                ent->build ? (long)(ent->build - g_edicts) : -1L,
+                ent->goalentity ? (long)(ent->goalentity - g_edicts) : -1L);
+#endif
+        float angle;
+        if (!SP_FindUnitExitPosition(building, ent, &positions[count], &angle)) {
+#ifdef WC3_DEBUG_BUILD
+            fprintf(stderr, "WC3_BUILD displace-failed builder=%ld building=%ld unit=%ld reason=no-exit\n",
+                    (long)(builder - g_edicts), (long)(building - g_edicts), (long)(ent - g_edicts));
+#endif
+            gi.MemFree(positions); gi.MemFree(units); return false;
+        }
+        (void)angle;
+        units[count++] = ent;
+    }
+    FOR_LOOP(i, count) {
+        FOR_LOOP(j, i) {
+            if (Vector2_distance(&positions[i], &positions[j]) < units[i]->collision + units[j]->collision) {
+                gi.MemFree(positions); gi.MemFree(units); return false;
+            }
+        }
+    }
+    FOR_LOOP(i, count) {
+#ifdef WC3_DEBUG_BUILD
+        fprintf(stderr, "WC3_BUILD displace-apply building=%ld unit=%ld old=(%.1f,%.1f) new=(%.1f,%.1f) move=%s project=%.4s goal=%ld\n",
+                (long)(building - g_edicts), (long)(units[i] - g_edicts),
+                units[i]->s.origin2.x, units[i]->s.origin2.y, positions[i].x, positions[i].y,
+                units[i]->currentmove && units[i]->currentmove->animation ? units[i]->currentmove->animation : "<none>",
+                units[i]->orders && units[i]->orders->build_project ? (cstring_t)&units[i]->orders->build_project : "----",
+                units[i]->goalentity ? (long)(units[i]->goalentity - g_edicts) : -1L);
+#endif
+        move_start_displacement(units[i], &positions[i]);
+    }
+    gi.MemFree(positions); gi.MemFree(units);
+    return true;
+}
+
+/* Construction sites are walk-through until completion, so units can enter
+ * after the placement-time exit walk.  Once the footprint becomes solid,
+ * move any remaining occupants directly to a legal exit while retaining
+ * their current orders. */
+static void G_TeleportBuildingOccupants(edict_t *building, edict_t *excluded_unit) {
+    if (!building || !globals.num_edicts) return;
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = g_edicts + i;
+        if (ent == building || ent == excluded_unit || !ent->inuse ||
+            !(ent->svflags & SVF_MONSTER) || (ent->svflags & SVF_DEADMONSTER) || M_IsDead(ent) ||
+            ent->movetype == MOVETYPE_NONE || ent->collision <= 0.0f ||
+            CM_DistanceToPathingFootprint(building, &ent->s.origin2) >= ent->collision)
+            continue;
+        float angle;
+        vec2_t position;
+        if (!SP_FindUnitExitPosition(building, ent, &position, &angle)) {
+            fprintf(stderr, "WC3: unable to find exit for unit %ld inside construction %ld\n",
+                    (long)(ent - g_edicts), (long)(building - g_edicts));
+            continue;
+        }
+        /* Move each occupant before selecting the next exit. The exit search
+         * sees this unit as a dynamic blocker, so a crowd cannot reserve the
+         * same legal point and strand all but the first unit inside. */
+        vec2_t old_position = ent->s.origin2;
+        move_cancel_displacement(ent);
+        move_reset_progress(ent);
+        ent->s.origin2 = position;
+        ent->s.origin.x = position.x;
+        ent->s.origin.y = position.y;
+        M_CheckGround(ent);
+        gi.LinkEntity(ent);
+        G_UnitPositionChanged(ent, &old_position);
+    }
+}
+
+/* UnitData requireWaterRadius (shipyards): some ship-navigable water must lie
+ * within the radius of the building center, so trained ships have an exit. */
+#define BUILD_WATER_CLEARANCE 64.0f /* largest hull collision class */
+static bool G_BuildHasRequiredWater(UnitData_t const *data, vec2_t const *point) {
+    vec2_t water;
+    if (!data || data->requireWaterRadius <= 0.0f) return true;
+    /* Bounded: a site far from any water must fail fast, not sweep the map (the AI probes many sites). */
+    return CM_ClosestPathablePointWithin(point, BUILD_WATER_CLEARANCE, CM_PATHING_UNSWIMMABLE, data->requireWaterRadius + 64.0f, &water) &&
+           Vector2_distance(point, &water) <= data->requireWaterRadius;
+}
+
+static buildPlacementResult_t G_EvaluateBuildPlacementPolicy(edict_t *builder, uint32_t building_id,
+                                                              vec2_t const *requested, vec2_t *snapped,
+                                                              bool allow_friendly_displacement) {
+    UnitData_t const *data = G_UnitData(building_id);
+    uint8_t prevented = 0;
+    uint8_t required = 0;
+    pathTex_t *pathtex = NULL;
+    edict_t *build_on = NULL;
+    uint32_t width = 1, height = 1;
+    box2_t footprint;
+    vec2_t point;
+
+    if (!requested || !G_UnitIsBuilding(building_id)) {
+#ifdef WC3_DEBUG_MINING
+        fprintf(stderr, "WC3_MINING placement result=%d reason=invalid-building building=%.4s\n",
+                PLACE_INVALID_BUILDING, (cstring_t)&building_id);
+#endif
+        return PLACE_INVALID_BUILDING;
+    }
+    G_GetBuildPlacementPathingFlags(building_id, &prevented, &required);
+    point = *requested;
+    G_SnapBuildingPoint(building_id, &point);
+
+    if (!G_FindBuildOnTarget(building_id, &point, &build_on)) {
+#ifdef WC3_DEBUG_MINING
+        fprintf(stderr, "WC3_MINING placement result=%d reason=parent-missing building=%.4s requested=(%.1f,%.1f) snapped=(%.1f,%.1f)\n",
+                PLACE_REQUIRED_PARENT_MISSING, (cstring_t)&building_id, requested->x, requested->y, point.x, point.y);
+#endif
+        return PLACE_REQUIRED_PARENT_MISSING;
+    }
+    /* Build-on structures inherit the parent's authored center; the grid is
+     * only for cursor placement and must not offset the mine overlay. */
+    if (build_on) point = build_on->s.origin2;
+    if (snapped) *snapped = point;
+    if (G_BuildTooCloseToGoldMine(building_id, &point)) return PLACE_TOO_CLOSE_TO_GOLD_MINE;
+    pathtex = M_LoadPathTex(data->pathingTexture);
+    if (data->pathingTexture && strlen(data->pathingTexture) > 1 && !pathtex) {
+ #ifdef WC3_DEBUG_MINING
+        fprintf(stderr, "WC3_MINING placement result=%d reason=pathing-texture building=%.4s point=(%.1f,%.1f)\n",
+                PLACE_INVALID_BUILDING, (cstring_t)&building_id, point.x, point.y);
+ #endif
+        return PLACE_INVALID_BUILDING;
+    }
+    if (pathtex) {
+        width = MAX(1, pathtex->width);
+        height = MAX(1, pathtex->height);
+    }
+    footprint.min.x = point.x - width * WC3_BUILD_CELL_SIZE * 0.5f;
+    footprint.min.y = point.y - height * WC3_BUILD_CELL_SIZE * 0.5f;
+    footprint.max.x = point.x + width * WC3_BUILD_CELL_SIZE * 0.5f;
+    footprint.max.y = point.y + height * WC3_BUILD_CELL_SIZE * 0.5f;
+
+    if (!build_on) {
+        FOR_LOOP(x, width) {
+            FOR_LOOP(y, height) {
+                vec2_t sample;
+                uint8_t flags;
+                if (pathtex && !G_PathCellUsed(pathtex, x, y)) continue;
+                sample.x = point.x + ((float)x + 0.5f - (float)width * 0.5f) * WC3_BUILD_CELL_SIZE;
+                sample.y = point.y + ((float)y + 0.5f - (float)height * 0.5f) * WC3_BUILD_CELL_SIZE;
+                if (!CM_GetPathingFlagsAt(&sample, &flags)) {
+                    if (pathtex) gi.MemFree(pathtex);
+ #ifdef WC3_DEBUG_MINING
+                    fprintf(stderr, "WC3_MINING placement result=%d reason=out-of-bounds building=%.4s sample=(%.1f,%.1f)\n",
+                            PLACE_OUT_OF_BOUNDS, (cstring_t)&building_id, sample.x, sample.y);
+ #endif
+                    return PLACE_OUT_OF_BOUNDS;
+                }
+                if (G_IsPointBlighted(&sample)) flags |= WC3_PATH_BLIGHTED;
+                else flags &= ~WC3_PATH_BLIGHTED;
+                bool shallow_water = false;
+                if ((prevented & WC3_PATH_NAGA_SHALLOW) &&
+                    (flags & WC3_PATH_UNBUILDABLE) &&
+                    !(flags & (CM_PATHING_UNSWIMMABLE | CM_PATHING_UNFLYABLE))) {
+                    shallow_water = CM_GetWaterHeightAtPoint(sample.x, sample.y) >
+                                    CM_GetHeightAtPoint(sample.x, sample.y);
+                }
+                if (G_PlacementPathingPrevented(flags, prevented, shallow_water)) {
+                    if (pathtex) gi.MemFree(pathtex);
+ #ifdef WC3_DEBUG_MINING
+                    fprintf(stderr, "WC3_MINING placement result=%d reason=terrain-blocked building=%.4s sample=(%.1f,%.1f) flags=0x%x prevented=0x%x\n",
+                            PLACE_TERRAIN_BLOCKED, (cstring_t)&building_id, sample.x, sample.y, flags, prevented);
+ #endif
+                    return PLACE_TERRAIN_BLOCKED;
+                }
+                if (!G_PlacementPathingRequired(flags, required)) {
+                    buildPlacementResult_t const result =
+                        (required & WC3_PATH_BLIGHTED) && !(flags & WC3_PATH_BLIGHTED)
+                            ? PLACE_REQUIRES_BLIGHT
+                            : PLACE_REQUIRED_PATHING_MISSING;
+                    if (pathtex) gi.MemFree(pathtex);
+ #ifdef WC3_DEBUG_MINING
+                    fprintf(stderr, "WC3_MINING placement result=%d reason=required-pathing building=%.4s sample=(%.1f,%.1f) flags=0x%x required=0x%x\n",
+                            result, (cstring_t)&building_id, sample.x, sample.y, flags, required);
+ #endif
+                    return result;
+                }
+            }
+        }
+    }
+    if (pathtex) gi.MemFree(pathtex);
+    if (!G_BuildHasRequiredWater(data, &point)) return PLACE_REQUIRES_WATER;
+    if (G_LiveUnitBlocksBuild(builder, build_on, &footprint, allow_friendly_displacement)) {
+#ifdef WC3_DEBUG_MINING
+        fprintf(stderr, "WC3_MINING placement result=%d reason=unit-blocked building=%.4s point=(%.1f,%.1f) parent=%ld\n",
+                PLACE_UNIT_BLOCKED, (cstring_t)&building_id, point.x, point.y,
+                build_on ? (long)(build_on - globals.edicts) : -1L);
+#endif
+        return PLACE_UNIT_BLOCKED;
+    }
+#ifdef WC3_DEBUG_MINING
+    fprintf(stderr, "WC3_MINING placement result=%d reason=ok building=%.4s point=(%.1f,%.1f) parent=%ld\n",
+            PLACE_OK, (cstring_t)&building_id, point.x, point.y,
+            build_on ? (long)(build_on - globals.edicts) : -1L);
+#endif
+    return PLACE_OK;
+}
+
+buildPlacementResult_t G_EvaluateBuildPlacement(edict_t *builder, uint32_t building_id,
+                                                vec2_t const *requested, vec2_t *snapped) {
+    return G_EvaluateBuildPlacementPolicy(builder, building_id, requested, snapped, true);
+}
+
+buildPlacementResult_t G_EvaluateRootPlacement(edict_t *unit, vec2_t const *requested, vec2_t *snapped) {
+    return unit ? G_EvaluateBuildPlacementPolicy(unit, unit->class_id, requested, snapped, false) :
+        PLACE_INVALID_BUILDING;
+}
+
+float G_BuildApproachDistance(uint32_t building_id) {
+    pathTex_t *pathtex = M_LoadPathTex(G_UnitData(building_id)->pathingTexture);
+    float result;
+    if (!pathtex) return MAX(WC3_BUILD_CELL_SIZE, G_UnitCollision(building_id));
+    result = MAX(pathtex->width, pathtex->height) * WC3_BUILD_CELL_SIZE * 0.5f;
+    gi.MemFree(pathtex);
+    return result;
+}
+
+void G_UpdateConstructionAnimation(edict_t *building) {
+    animation_t const *anim;
+    float duration, fraction;
+    uint32_t first, last, span, frame;
+
+    if (!building || !building->construction || !building->data.UnitBalance) return;
+    if (building->data.UnitBalance->buildTime <= 0 && building->construction->duration_ms <= 0) return;
+
+    /* Construction owns the birth sequence. Re-resolve it instead of relying
+     * on whatever animation happened to be left on the entity by a previous
+     * state transition. */
+    anim = building->animation;
+    if (!G_AnimationHasPrimary(anim, "birth"))
+        anim = G_GetUnitAnimation(building, "birth");
+    if (!anim || anim->interval[1] <= anim->interval[0]) return;
+    building->animation = anim;
+
+    duration = building->construction->duration_ms > 0 ? building->construction->duration_ms :
+               (float)building->data.UnitBalance->buildTime * 1000.0f;
+    fraction = MAX(0.0f, MIN(1.0f, building->construction->progress / duration));
+    first = anim->interval[0];
+    last = anim->interval[1];
+    span = last - first;
+    frame = first + (uint32_t)((float)span * fraction);
+    if (frame >= last) frame = last - 1;
+#ifdef WC3_DEBUG_BUILD
+    if (building->s.frame != frame) {
+        fprintf(stderr, "WC3_BUILD animation building=%ld id=%.4s type=%d paused=%u progress=%.1f/%.1f health=%.1f/%.1f frame=%u->%u range=%u-%u\n",
+                (long)(building - g_edicts), (cstring_t)&building->class_id,
+                building->construction->type, building->construction->paused,
+                building->construction->progress, duration, building->health.value,
+                building->health.max_value, building->s.frame, frame, first, last);
+    }
+#endif
+    building->s.frame = frame;
+}
+
+static bool G_ConstructionHasClassification(edict_t const *unit, cstring_t wanted) {
+    cstring_t list;
+    UnitBalance_t const *balance;
+    UnitData_t const *data;
+
+    if (!unit || !wanted || !*wanted) return false;
+    balance = unit->data.UnitBalance;
+    data = unit->data.UnitData;
+    list = balance ? balance->type : NULL;
+    if (!list || !*list) list = data ? data->unitClassification : NULL;
+    if (!list || !*list) return false;
+
+    PARSE_LIST(list, item, parse_segment) {
+        if (!strcasecmp(item, wanted)) return true;
+    }
+    return false;
+}
+
+static bool G_StartConstruction(edict_t *builder, edict_t *building, constructionType_t type, bool paused,
+                                bool worker_inside) {
+    edictStat_s *hp;
+
+    if (!building || !G_UnitIsStructure(building)) return false;
+    if (!building->construction) building->construction = G_AllocConstruction();
+    assert(building->construction);
+    hp = &building->health;
+    building->construction->paused = paused;
+    building->construction->type = type;
+    building->construction->primary_builder = NULL;
+    building->construction->worker = NULL;
+    building->construction->worker_spawn_time = 0;
+    building->construction->worker_inside = false;
+    building->construction->consumes_worker = false;
+    building->construction->restore_invulnerable = false;
+    building->construction->restore_paused = false;
+    building->construction->restore_hidden = false;
+    building->construction->worker_release_time = 0;
+    building->construction->progress = 0.0f;
+    building->construction->duration_ms = 0.0f;
+    building->construction->paid = false;
+    building->construction->payer = 0;
+    building->construction->gold = 0;
+    building->construction->lumber = 0;
+    building->aiflags |= AI_HOLD_FRAME;
+    /* Human Birth emission starts only when a Peasant begins actually working.
+     * Orc/Undead/Night Elf buildings still use their autonomous clocks. */
+    if (type == CONSTRUCTION_HUMAN) {
+        building->s.flags |= EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED;
+    } else {
+        building->s.flags &= ~(EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED);
+    }
+    G_SetHealth(building, MAX(1.0f, hp->max_value * WC3_BUILD_START_LIFE));
+    G_SetConstructionLoopSound(building, true);
+
+    /* Only the translucent Construction Site Indicator is walk-through. The
+     * real construction footprint becomes a route obstacle before the worker
+     * begins Repair/build work. */
+    CM_BakeStaticObstacles();
+    G_TeleportBuildingOccupants(building, worker_inside ? builder : NULL);
+
+    G_UpdateConstructionAnimation(building);
+    return true;
+}
+
+static void G_AssignConstructionWorker(edict_t *building, edict_t *worker, bool inside) {
+    if (!building || !worker) return;
+    assert(building->construction);
+    building->construction->worker = worker;
+    building->construction->worker_spawn_time = worker->spawn_time;
+    building->construction->worker_inside = inside;
+    building->construction->restore_invulnerable = G_UnitHasFlag(worker, UNIT_FLAG_INVULNERABLE);
+    building->construction->restore_paused = G_UnitHasFlag(worker, UNIT_FLAG_PAUSED);
+    building->construction->restore_hidden = worker->s.renderfx & RF_HIDDEN;
+    worker->build = building;
+    worker->goalentity = building;
+    if (!inside) return;
+
+    worker->s.renderfx |= RF_HIDDEN;
+    G_SetUnitFlag(worker, UNIT_FLAG_PAUSED, true);
+    G_SetUnitFlag(worker, UNIT_FLAG_INVULNERABLE, true);
+    G_InvalidateUnitShortcutsForUnit(worker);
+}
+
+bool G_StartHumanConstruction(edict_t *builder, edict_t *building) {
+    if (!builder || !G_StartConstruction(builder, building, CONSTRUCTION_HUMAN, true, false)) return false;
+    building->construction->primary_builder = builder;
+    return true;
+}
+
+bool G_StartOrcConstruction(edict_t *builder, edict_t *building) {
+    if (!builder || !G_StartConstruction(builder, building, CONSTRUCTION_ORC, false, true)) return false;
+    G_AssignConstructionWorker(building, builder, true);
+    return true;
+}
+
+bool G_StartUndeadConstruction(edict_t *builder, edict_t *building) {
+    if (!builder || !G_StartConstruction(builder, building, CONSTRUCTION_UNDEAD, false, false)) return false;
+    G_AssignConstructionWorker(building, builder, false);
+    building->construction->worker_release_time = G_Time() + WC3_UNDEAD_BUILD_WORK_MS;
+    return true;
+}
+
+bool G_StartNagaConstruction(edict_t *builder, edict_t *building) {
+    if (!builder || !G_StartConstruction(builder, building, CONSTRUCTION_NAGA, false, true)) return false;
+    G_AssignConstructionWorker(building, builder, true);
+    return true;
+}
+
+bool G_StartNightElfConstruction(edict_t *builder, edict_t *building) {
+    if (!builder || !G_StartConstruction(builder, building, CONSTRUCTION_NIGHTELF, false, true)) return false;
+    G_AssignConstructionWorker(building, builder, true);
+    if (G_ConstructionHasClassification(building, "ancient")) {
+        building->construction->consumes_worker = true;
+        /* Warsmash removes the Wisp's food contribution as soon as it becomes
+         * part of an Ancient. Cancellation restores the worker and its food. */
+        G_SetUnitFoodUsed(builder, 0);
+    }
+    return true;
+}
+
+/* Entangle Gold Mine creates a Night Elf building without consuming/owning a
+ * Wisp. It still uses the same authoritative autonomous construction clock. */
+bool G_StartNightElfOverlayConstruction(edict_t *builder, edict_t *building) {
+    return G_StartConstruction(builder, building, CONSTRUCTION_NIGHTELF, false, false);
+}
+
+/* Tiny Structures do not attach or consume a builder.  Their timer and
+ * construction state belong to the spawned building itself. */
+bool G_StartTinyConstruction(edict_t *builder, edict_t *building, float duration_seconds) {
+    if (!G_StartConstruction(builder, building, CONSTRUCTION_TINY, false, false)) return false;
+    building->construction->duration_ms = MAX(0.0f, duration_seconds) * 1000.0f;
+    building->build = building;
+    /* G_StartConstruction initially uses normal UnitBalance buildTime.
+     * Refresh the first presentation frame after applying this ability's
+     * authored duration, before construction is published to clients. */
+    G_UpdateConstructionAnimation(building);
+    return true;
+}
+
+static edict_t *G_ConstructionWorker(edict_t *building) {
+    edict_t *worker;
+
+    if (!building || !(worker = building->construction->worker)) return NULL;
+    if (!worker->inuse || worker->spawn_time != building->construction->worker_spawn_time) {
+        building->construction->worker = NULL;
+        building->construction->worker_spawn_time = 0;
+        building->construction->worker_inside = false;
+        building->construction->worker_release_time = 0;
+        return NULL;
+    }
+    return worker;
+}
+
+static void G_ReleaseConstructionWorker(edict_t *building, bool completed) {
+    edict_t *worker;
+    bool consumes, inside;
+
+    if (!building) return;
+    worker = G_ConstructionWorker(building);
+    consumes = building->construction->consumes_worker;
+    inside = building->construction->worker_inside;
+    building->construction->worker = NULL;
+    building->construction->worker_spawn_time = 0;
+    building->construction->worker_inside = false;
+    building->construction->worker_release_time = 0;
+    if (!worker) return;
+
+    if (completed && consumes) {
+        /* The Wisp was already removed from Food Used at construction start. */
+        G_FreeEdict(worker);
+        return;
+    }
+
+    G_SetUnitFlag(worker, UNIT_FLAG_PAUSED, building->construction->restore_paused);
+    G_SetUnitFlag(worker, UNIT_FLAG_INVULNERABLE, building->construction->restore_invulnerable);
+    if (building->construction->restore_hidden) worker->s.renderfx |= RF_HIDDEN;
+    else worker->s.renderfx &= ~RF_HIDDEN;
+    G_InvalidateUnitShortcutsForUnit(worker);
+    if (consumes && worker->data.UnitBalance)
+        G_SetUnitFoodUsed(worker, worker->data.UnitBalance->foodUsed);
+
+    if (inside) {
+        vec2_t origin;
+        float angle;
+        if (SP_FindUnitExitPosition(building, worker, &origin, &angle)) {
+            worker->s.origin2 = origin;
+            worker->s.angle = angle - M_PI;
+        }
+    }
+    gi.LinkEntity(worker);
+    worker->build = NULL;
+    if (worker->goalentity == building) worker->goalentity = NULL;
+    if (worker->stand) worker->stand(worker);
+}
+
+/* The Peasant's work move owns Human construction, not the building's timer.
+ * Publish whether any worker is *actually working* so render particles cannot
+ * continue on a held Birth frame after the final Peasant moves away. */
+static void G_UpdateHumanConstructionEmitterState(edict_t *building) {
+    bool working = false;
+    bool const was_paused = (building->s.flags & EF_MDX_EMISSION_PAUSED) != 0;
+#ifdef WC3_DEBUG_BUILD
+    static uint32_t last_status_log[MAX_ENTITIES];
+    edict_t const *working_worker = NULL;
+#endif
+
+    if (building->construction->type != CONSTRUCTION_HUMAN) return;
+    if (!G_UnitHasFlag(building, UNIT_FLAG_PAUSED)) {
+        FOR_LOOP(i, globals.num_edicts) {
+            edict_t const *worker = &g_edicts[i];
+            if (S_RepairWorkerAdvancingHumanConstruction(worker, building)) {
+                working = true;
+#ifdef WC3_DEBUG_BUILD
+                working_worker = worker;
+#endif
+                break;
+            }
+        }
+    }
+    if (working) building->s.flags &= ~(EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED);
+    else building->s.flags |= EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED;
+#ifdef WC3_DEBUG_BUILD
+    if (was_paused != !working) {
+        fprintf(stderr, "WC3_BUILD emitter building=%ld id=%.4s paused=%u->%u worker=%ld progress=%.1f health=%.1f/%.1f frame=%u build=%ld\n",
+                (long)(building - g_edicts), (cstring_t)&building->class_id,
+                was_paused, !working,
+                working_worker ? (long)(working_worker - g_edicts) : -1L,
+                building->construction->progress, building->health.value,
+                building->health.max_value, building->s.frame,
+                building->build ? (long)(building->build - g_edicts) : -1L);
+    }
+    if (!working) {
+        uint32_t const number = (uint32_t)(building - g_edicts);
+        uint32_t const now = (uint32_t)G_Time();
+        if (number < MAX_ENTITIES &&
+            (!last_status_log[number] || now < last_status_log[number] ||
+             now - last_status_log[number] >= 1000)) {
+            animation_t const *anim = building->animation;
+            last_status_log[number] = now;
+            fprintf(stderr, "WC3_BUILD paused-status building=%u id=%.4s time=%u progress=%.1f duration=%.1f health=%.1f/%.1f frame=%u anim=%s range=%u-%u flags=0x%08x worker=%ld build=%ld\n",
+                    number, (cstring_t)&building->class_id, now,
+                    building->construction->progress, building->construction->duration_ms,
+                    building->health.value, building->health.max_value, building->s.frame,
+                    anim && anim->name[0] ? anim->name : "<none>",
+                    anim ? anim->interval[0] : 0, anim ? anim->interval[1] : 0,
+                    building->s.flags,
+                    building->construction->worker ? (long)(building->construction->worker - g_edicts) : -1L,
+                    building->build ? (long)(building->build - g_edicts) : -1L);
+        }
+    }
+#endif
+    if (was_paused != !working) G_InvalidateUnitInfoPanel(building);
+}
+
+void G_RunConstructionFrame(edict_t *building) {
+    float duration, hp_gain;
+    edictStat_s *hp;
+
+    if (!building || !building->construction) return;
+    G_UpdateHumanConstructionEmitterState(building);
+    if (G_UnitHasFlag(building, UNIT_FLAG_PAUSED) || !building->data.UnitBalance) return;
+
+    duration = MAX(1.0f, building->construction->duration_ms > 0 ?
+                   building->construction->duration_ms : (float)building->data.UnitBalance->buildTime * 1000.0f);
+    hp = &building->health;
+    /* Check the cheat before the Human paused-strategy gate: construction
+     * state, not a worker behavior, owns instant completion. */
+    if (G_PlayerInstantBuild(building->s.player)) {
+        building->construction->progress = duration;
+        G_SetHealth(building, hp->max_value);
+        G_UpdateConstructionAnimation(building);
+        G_CompleteConstruction(building);
+        return;
+    }
+
+    if (building->construction->paused) return;
+    if (building->construction->type != CONSTRUCTION_ORC &&
+        building->construction->type != CONSTRUCTION_UNDEAD &&
+        building->construction->type != CONSTRUCTION_NIGHTELF &&
+        building->construction->type != CONSTRUCTION_NAGA &&
+        building->construction->type != CONSTRUCTION_TINY) return;
+
+    if (building->construction->type == CONSTRUCTION_UNDEAD &&
+        building->construction->worker_release_time &&
+        G_Time() >= building->construction->worker_release_time) {
+        G_ReleaseConstructionWorker(building, false);
+    }
+
+    building->construction->progress += (float)FRAMETIME;
+    hp_gain = (hp->max_value - MAX(1.0f, hp->max_value * WC3_BUILD_START_LIFE)) *
+              ((float)FRAMETIME / duration);
+    hp->value = MIN(hp->max_value, hp->value + MAX(0.0f, hp_gain));
+    G_UpdateConstructionAnimation(building);
+    if (building->construction->progress >= duration) G_CompleteConstruction(building);
+}
+
+/* Construction teardown releases Human Repair participants and any race-owned
+ * worker before the target enters death/completion cleanup; otherwise workers
+ * retain pointers to an entity whose construction state no longer exists. */
+void G_StopConstruction(edict_t *building) {
+    if (!building || !building->construction) return;
+#ifdef WC3_DEBUG_BUILD
+    fprintf(stderr, "WC3_BUILD construction-stop building=%ld id=%.4s type=%d health=%.1f/%.1f progress=%.1f primary=%ld build=%ld\n",
+            (long)(building - g_edicts), (cstring_t)&building->class_id, building->construction->type,
+            building->health.value, building->health.max_value, building->construction->progress,
+            building->construction->primary_builder ? (long)(building->construction->primary_builder - g_edicts) : -1L,
+            building->build ? (long)(building->build - g_edicts) : -1L);
+#endif
+
+    FILTER_EDICTS(worker, worker->inuse && worker != building && worker->build == building &&
+                           worker->buildwork && worker->buildwork->ability) {
+        S_CancelRepair(worker);
+        if (worker->stand) worker->stand(worker);
+    }
+
+    G_ReleaseConstructionWorker(building, false);
+
+    /* The construction info panel historically used a self-linked build queue.
+     * Clear it before unit_die() walks production/revival ownership. */
+    if (building->build == building) building->build = NULL;
+    G_SetConstructionLoopSound(building, false);
+    G_FreeConstruction(building);
+    building->aiflags &= ~AI_HOLD_FRAME;
+    building->s.flags &= ~(EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED);
+}
+
+static int32_t G_ConstructionCancelRefund(int32_t paid) {
+    if (paid <= 0) return 0;
+    return (paid * WC3_BUILD_CANCEL_REFUND_PERCENT) / 100;
+}
+
+/* A player cancellation is distinct from destruction: publish the Warcraft
+ * construct-cancel events and refund only the recorded base construction
+ * payment, then use ordinary unit death for selection/food/death semantics. */
+bool G_CancelStructureConstruction(edict_t *building) {
+    gameClient_t *payer;
+    int32_t gold, lumber;
+
+    if (!building || !building->inuse || !building->construction ||
+        (building->svflags & SVF_DEADMONSTER) || !G_UnitIsStructure(building)) {
+        return false;
+    }
+#ifdef WC3_DEBUG_BUILD
+    fprintf(stderr, "WC3_BUILD construction-cancel building=%ld id=%.4s health=%.1f/%.1f progress=%.1f payer=%d\n",
+            (long)(building - g_edicts), (cstring_t)&building->class_id, building->health.value,
+            building->health.max_value, building->construction->progress, building->construction->payer);
+#endif
+
+    gold = building->construction->paid
+        ? G_ConstructionCancelRefund(building->construction->gold) : 0;
+    lumber = building->construction->paid
+        ? G_ConstructionCancelRefund(building->construction->lumber) : 0;
+    payer = G_GetPlayerClientByNumber(building->construction->payer);
+
+    G_PublishEvent(building, EVENT_PLAYER_UNIT_CONSTRUCT_CANCEL);
+    G_PublishEvent(building, EVENT_UNIT_CONSTRUCT_CANCEL);
+
+    if (building->construction->paid && payer &&
+        payer->ps.number == building->construction->payer) {
+        payer->ps.stats[PLAYERSTATE_RESOURCE_GOLD] += gold;
+        payer->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] += lumber;
+        building->construction->paid = false;
+        G_InvalidateCommands(payer);
+        G_MarkMultiboardPlayerDirty(payer->ps.number);
+        if (payer->connected)
+            G_RefreshResourceBar(G_GetPlayerEntityByNumber(payer->ps.number));
+    }
+
+    unit_die(building, NULL);
+    return true;
+}
+
+void G_CompleteConstruction(edict_t *building) {
+    gameClient_t *client;
+    edict_t *hidden_construction_worker = NULL;
+    bool legacy;
+
+    if (!building) return;
+    /* Human construction has explicit construction state.  The still-legacy
+     * Orc/Night Elf/Undead build path marks an in-progress structure by
+     * self-linking building->build.  Both lifecycles must converge here so
+     * completion grants supply and publishes CONSTRUCT_FINISH exactly once. */
+    legacy = building->build == building;
+    if (!building->construction && !legacy) return;
+    if (WC3_TUTORIAL_DEBUG_ENABLED()) {
+        fprintf(stderr,
+                "WC3_QUEST_BUILD complete-enter building=%ld id=%.4s player=%u legacy=%d active=%d primary_builder=%ld build_link=%ld health=%.1f/%.1f\n",
+                (long)(building - globals.edicts), (cstring_t)&building->class_id,
+                (unsigned)building->s.player, legacy, (building->construction != NULL),
+                building->construction && building->construction->primary_builder
+                    ? (long)(building->construction->primary_builder - globals.edicts) : -1L,
+                building->build ? (long)(building->build - globals.edicts) : -1L,
+                building->health.value, building->health.max_value);
+    }
+    client = G_GetPlayerClientByNumber(building->s.player);
+    if (client && client->ps.number != building->s.player) client = NULL;
+    if (building->construction && building->construction->worker_inside)
+        hidden_construction_worker = G_ConstructionWorker(building);
+    if (building->construction) G_ReleaseConstructionWorker(building, true);
+    G_SetConstructionLoopSound(building, false);
+    G_FreeConstruction(building);
+    building->aiflags &= ~AI_HOLD_FRAME;
+    building->s.flags &= ~(EF_MDX_EMISSION_PAUSED | EF_MDX_ANIMATION_PAUSED);
+    if (building->build == building) building->build = NULL;
+    G_SetHealth(building, building->health.max_value);
+	/* A Birth construction site is walk-through in retail.  Its authored
+	 * footprint becomes a static route obstacle only when the building is
+	 * complete. */
+    CM_BakeStaticObstacles();
+	if (building->stand) building->stand(building);
+    G_TeleportBuildingOccupants(building, hidden_construction_worker);
+#ifdef WC3_DEBUG_AI
+    fprintf(stderr, "WC3_DEBUG_AI construction complete building=%ld id=%.4s player=%u\n",
+        (long)(building - g_edicts), (cstring_t)&building->class_id, building->s.player);
+#endif
+    G_BOT_TRACE(building->s.player, NULL, "building_completed",
+               "building=%ld type=%.4s point=(%.1f,%.1f)",
+               (long)(building - g_edicts), (cstring_t)&building->class_id,
+               building->s.origin2.x, building->s.origin2.y);
+    G_SetUnitFoodMade(building, building->data.UnitBalance->foodMade);
+    G_QueueOwnerUISound(building, "JobDoneSound");
+    G_SendOwnerMinimapAlert(building);
+    G_PlayerScoreStructureBuilt(building);
+    G_PublishEvent(building, EVENT_PLAYER_UNIT_CONSTRUCT_FINISH);
+    G_PublishEvent(building, EVENT_UNIT_CONSTRUCT_FINISH);
+    if (WC3_TUTORIAL_DEBUG_ENABLED()) {
+        fprintf(stderr,
+                "WC3_QUEST_BUILD complete-publish building=%ld id=%.4s player=%u event=%u build_link=%ld food_made=%d\n",
+                (long)(building - globals.edicts), (cstring_t)&building->class_id,
+                (unsigned)building->s.player, (unsigned)EVENT_PLAYER_UNIT_CONSTRUCT_FINISH,
+                building->build ? (long)(building->build - globals.edicts) : -1L,
+                building->food->made);
+    }
+    if (client) {
+        edict_t *clent = G_GetPlayerEntityByNumber(client->ps.number);
+        G_InvalidateCommands(client);
+        G_RefreshResourceBar(clent);
+        Get_Portrait_f(clent);
+    }
+}

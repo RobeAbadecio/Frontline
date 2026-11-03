@@ -1,0 +1,3756 @@
+#include "test.h"
+#include "renderer/r_local.h"
+#include "renderer/r_game.h"
+#include "renderer/r_emit.h"
+#include "games/warcraft-3/renderer/w3m/r_war3map.h"
+#include "games/warcraft-3/renderer/mdx/r_mdx.h"
+#include "renderer/r_shader.h"
+#include <stdarg.h>
+#include <stdlib.h>
+#include <setjmp.h>
+
+static cparticle_t emitted[16];
+static uint32_t emit_count;
+cparticle_t *R_SpawnParticle(void) {
+    T_ASSERT(emit_count < 16);
+    emitted[emit_count] = (cparticle_t){ .size_value_scale = 1, .size_time_scale = 1 };
+    return &emitted[emit_count++];
+}
+texture_t const *MDLX_GetTexture(mdxModel_t const *model, uint32_t team, uint32_t tex, uint32_t repl, texture_t const *over, uint32_t slot) {
+    (void)model; (void)team; (void)tex; (void)repl; (void)over; (void)slot; return NULL;
+}
+void MDLX_ReleaseSprites(mdxModel_t *model) { (void)model; }
+
+static char shader_src[16384];
+static void reset_shader(void);
+static rect_t backdrop_uv, backdrop_rect;
+static bool backdrop_repeat;
+static uint32_t backdrop_calls, backdrop_opaque_calls;
+static size2_t backdrop_size = {256, 64};
+
+TEST(renderer_model, mdx_transparent_layers_run_after_water_and_tinted_opaque_layers_move_too) {
+    T_ASSERT(MDLX_RenderPhaseIncludesPass(RENDER_PHASE_SOLID, false, false));
+    T_ASSERT(!MDLX_RenderPhaseIncludesPass(RENDER_PHASE_SOLID, true, false));
+    T_ASSERT(!MDLX_RenderPhaseIncludesPass(RENDER_PHASE_SOLID, false, true));
+    T_ASSERT(!MDLX_RenderPhaseIncludesPass(RENDER_PHASE_ALPHA, false, false));
+    T_ASSERT(MDLX_RenderPhaseIncludesPass(RENDER_PHASE_ALPHA, true, false));
+    T_ASSERT(MDLX_RenderPhaseIncludesPass(RENDER_PHASE_ALPHA, false, true));
+    T_ASSERT(MDLX_RenderPhaseIncludesPass(RENDER_PHASE_LIGHTS, false, false));
+}
+
+/* Capture the real shader source submission without requiring a window in the unit suite. */
+static void BZ_TestShaderSource(GLuint shader, GLsizei count, GLchar const *const *strings, GLint const *lengths) {
+    size_t used = 0;
+    (void)shader;
+    FOR_LOOP(i, count) {
+        size_t size = lengths && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
+        T_ASSERT(used + size < sizeof(shader_src));
+        memcpy(shader_src + used, strings[i], size); used += size;
+    }
+    shader_src[used] = 0;
+}
+/* Mock only GL submission/status calls; shader creation and cache logic stay production code. */
+static struct {
+    GLenum fail;
+    GLint logsize;
+    int creates, links, uses, logs, deleted, uploads, exitcode;
+    bool noalloc;
+    handle_t memory;
+} shader_test;
+static jmp_buf shader_exit;
+static GLuint BZ_TestCreateShader(GLenum type) { shader_test.creates++; return type; }
+static GLuint BZ_TestCreateProgram(void) { return GL_LINK_STATUS; }
+static void BZ_TestCompileShader(GLuint obj) { (void)obj; }
+static void BZ_TestAttachShader(GLuint obj, GLuint shader) { (void)obj; (void)shader; }
+static void BZ_TestBindAttrib(GLuint obj, GLuint idx, GLchar const *name) { (void)obj; (void)idx; (void)name; }
+static void BZ_TestLinkProgram(GLuint obj) { (void)obj; shader_test.links++; }
+static void BZ_TestUseProgram(GLuint obj) { (void)obj; shader_test.uses++; }
+static void BZ_TestDeleteShader(GLuint obj) { (void)obj; shader_test.deleted++; }
+static GLint BZ_TestUniformLocation(GLuint obj, GLchar const *name) { (void)obj; (void)name; return 0; }
+static struct { int calls, width, integer; GLsizei count; GLboolean transpose; float data[2048]; } upload;
+static void capture_float(int width, GLsizei count, GLfloat const *val) {
+    upload.calls++; upload.width = width; upload.count = count;
+    memcpy(upload.data, val, width * count * sizeof(float));
+}
+static void BZ_TestUniform1i(GLint loc, GLint val) { (void)loc; upload.calls++; upload.integer = val; }
+static void BZ_TestUniform1iv(GLint loc, GLsizei n, GLint const *v) { (void)n; BZ_TestUniform1i(loc, *v); }
+static void BZ_TestUniform2iv(GLint loc, GLsizei n, GLint const *v) { (void)n; BZ_TestUniform1i(loc, v[1]); }
+static void BZ_TestUniform1fv(GLint loc, GLsizei n, GLfloat const *v) { (void)loc; capture_float(1, n, v); }
+static void BZ_TestUniform2fv(GLint loc, GLsizei n, GLfloat const *v) { (void)loc; capture_float(2, n, v); }
+static void BZ_TestUniform3fv(GLint loc, GLsizei n, GLfloat const *v) { (void)loc; capture_float(3, n, v); }
+static void BZ_TestUniform4fv(GLint loc, GLsizei n, GLfloat const *v) { (void)loc; capture_float(4, n, v); }
+static void BZ_TestUniformMatrix3(GLint loc, GLsizei count, GLboolean transpose, GLfloat const *val) {
+    (void)loc; capture_float(9, count, val); upload.transpose = transpose;
+}
+static void BZ_TestUniformMatrix4(GLint loc, GLsizei count, GLboolean transpose, GLfloat const *val) {
+    (void)loc; capture_float(16, count, val); upload.transpose = transpose; shader_test.uploads++;
+}
+static int deleted_programs;
+static void BZ_TestDeleteProgram(GLuint id) { (void)id; deleted_programs++; }
+static void BZ_TestShaderStatus(GLuint obj, GLenum check, GLint *val) {
+    *val = check == GL_INFO_LOG_LENGTH ? shader_test.logsize : obj != shader_test.fail;
+}
+static void BZ_TestShaderLog(GLuint obj, GLsizei size, GLsizei *length, GLchar *log) {
+    (void)obj; (void)length; shader_test.logs++;
+    snprintf(log, size, "mock driver rejection");
+}
+static void *BZ_TestShaderMalloc(size_t size) { return shader_test.noalloc && size == (size_t)shader_test.logsize ? NULL : malloc(size); }
+static _Noreturn void BZ_TestShaderExit(int code) { shader_test.exitcode = code; longjmp(shader_exit, 1); }
+#define glShaderSource BZ_TestShaderSource
+#define glCreateShader BZ_TestCreateShader
+#define glCreateProgram BZ_TestCreateProgram
+#define glCompileShader BZ_TestCompileShader
+#define glAttachShader BZ_TestAttachShader
+#define glBindAttribLocation BZ_TestBindAttrib
+#define glLinkProgram BZ_TestLinkProgram
+#define glUseProgram BZ_TestUseProgram
+#define glDeleteShader BZ_TestDeleteShader
+#define glGetUniformLocation BZ_TestUniformLocation
+#define glUniform1i BZ_TestUniform1i
+#define glUniform1iv BZ_TestUniform1iv
+#define glUniform2iv BZ_TestUniform2iv
+#define glUniform1fv BZ_TestUniform1fv
+#define glUniform2fv BZ_TestUniform2fv
+#define glUniform3fv BZ_TestUniform3fv
+#define glUniform4fv BZ_TestUniform4fv
+#define glDeleteProgram BZ_TestDeleteProgram
+#define glUniformMatrix3fv BZ_TestUniformMatrix3
+#define glUniformMatrix4fv BZ_TestUniformMatrix4
+#define glGetShaderiv BZ_TestShaderStatus
+#define glGetProgramiv BZ_TestShaderStatus
+#define glGetShaderInfoLog BZ_TestShaderLog
+#define glGetProgramInfoLog BZ_TestShaderLog
+#define malloc BZ_TestShaderMalloc
+#define Sys_Exit BZ_TestShaderExit
+#include "renderer/r_shader.c"
+static void test_shader_source(GLuint stage, shader_desc_t const *desc, bool vertex, char const *defines) {
+    gs_options_t options = R_ShaderOptions(defines);
+    T_ASSERT(gs_source(stage, desc, vertex, &options));
+}
+#undef glShaderSource
+#undef glCreateShader
+#undef glCreateProgram
+#undef glCompileShader
+#undef glAttachShader
+#undef glBindAttribLocation
+#undef glLinkProgram
+#undef glUseProgram
+#undef glDeleteShader
+#undef glGetUniformLocation
+#undef glUniform1i
+#undef glUniform1iv
+#undef glUniform2iv
+#undef glUniform1fv
+#undef glUniform2fv
+#undef glUniform3fv
+#undef glUniform4fv
+#undef glDeleteProgram
+#undef glUniformMatrix3fv
+#undef glUniformMatrix4fv
+#undef glGetShaderiv
+#undef glGetProgramiv
+#undef glGetShaderInfoLog
+#undef glGetProgramInfoLog
+#undef malloc
+#undef Sys_Exit
+
+refImport_t ri;
+void R_ClearEntityCameraParticleScenes(void) {}
+struct render_globals tr;
+static uint32_t load_count, release_count, register_count;
+static bool fail_load, fail_scoped_load, touch_during_registration;
+static PATHSTR last_model_load;
+static uint32_t spawn_count;
+static texture_t *texture_load_result;
+static PATHSTR last_texture_load;
+static GLenum upload_format, upload_internal;
+static color32_t upload_pixel;
+static uint32_t upload_count;
+static void const *upload_data;
+static cstring_t test_version = "3.1", test_extension = "";
+static uint32_t alloc_count, free_count, ext_count;
+static int test_alloc_fail_after = -1;
+static bool cache_minimap_textures;
+static bool minimap_test_saw_streamed_override;
+static uint32_t next_minimap_texture_id;
+static handle_t minimap_test_base_archive, minimap_test_map_archive;
+static uint8_t *minimap_test_map_data;
+static bool minimap_test_read_map_skin;
+static int test_minimap_fs_read(cstring_t path, void **buffer);
+void R_TestProductionRegisterMap(cstring_t mapFileName);
+
+static GLubyte const *test_glstring(GLenum name) { (void)name; return (GLubyte const *)test_version; }
+static SDL_bool test_hasext(char const *name) { ext_count++; return !strcmp(name, test_extension) ? SDL_TRUE : SDL_FALSE; }
+
+/* Capture the actual GL upload contract without requiring a display or a particular GL backend. */
+static void test_teximage(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, void const *data) {
+    (void)target; (void)level; (void)w; (void)h; (void)border;
+    T_EQ(type, GL_UNSIGNED_BYTE);
+    upload_format = format; upload_internal = internal; upload_data = data; upload_count++;
+    if (data) upload_pixel = *(color32_t const *)data;
+}
+static void test_gentex(GLsizei n, GLuint *ids) { while (n--) *ids++ = 99; }
+static void test_bindtex(GLenum target, GLuint id) { (void)target; (void)id; }
+static void test_texparam(GLenum target, GLenum name, GLint value) { (void)target; (void)name; (void)value; }
+static uint32_t texture_delete_count;
+static void test_deletetex(GLsizei n, GLuint const *ids) { (void)ids; texture_delete_count += n; }
+#undef glTexImage2D
+#undef glGenTextures
+#undef glBindTexture
+#undef glTexParameteri
+#undef glDeleteTextures
+#define glTexImage2D test_teximage
+#define glGenTextures test_gentex
+#define glBindTexture test_bindtex
+#define glTexParameteri test_texparam
+#define glDeleteTextures test_deletetex
+#undef glGetString
+#define glGetString test_glstring
+#define SDL_GL_ExtensionSupported test_hasext
+#include "renderer/r_texture.c"
+#include "renderer/r_blp1.c"
+#include "renderer/r_blp2.c"
+#include "renderer/r_pcx.c"
+#include "renderer/r_dds.c"
+
+static struct { uint32_t calls, first, count, instances, stats_count, stats_instances; } draw_test;
+void R_StatsDraw(GLenum mode, uint32_t count, uint32_t instances) {
+    (void)mode; draw_test.stats_count = count; draw_test.stats_instances = instances;
+}
+static void test_genva(GLsizei n, GLuint *ids) { while (n--) *ids++ = 7; }
+static void test_bindva(GLuint id) { (void)id; }
+static void test_bindbuf(GLenum target, GLuint id) { (void)target; (void)id; }
+static void test_enableattr(GLuint index) { (void)index; }
+static struct { bool active; vec2_t data[3]; GLsizei stride; uintptr_t offset; int uploads; } uv_upload;
+static void test_attrptr(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, void const *ptr) {
+    (void)index; (void)size; (void)type; (void)normalized; (void)stride; (void)ptr;
+    if (uv_upload.active && index == attrib_texcoord) { uv_upload.stride = stride; uv_upload.offset = (uintptr_t)ptr; }
+}
+static void test_divisor(GLuint index, GLuint divisor) { (void)index; (void)divisor; }
+static void test_drawarrays(GLenum mode, GLint first, GLsizei count) {
+    (void)mode; draw_test.calls++; draw_test.first = first; draw_test.count = count; draw_test.instances = 1;
+}
+static void test_drawarrays_inst(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
+    (void)mode; draw_test.calls++; draw_test.first = first; draw_test.count = count; draw_test.instances = instances;
+}
+/* The production MDX loader uploads and frees geometry; intercept only GL
+ * calls so these headless tests also run on macOS without a current context. */
+static void test_bufdata(GLenum target, GLsizeiptr size, void const *data, GLenum usage) {
+    (void)target; (void)size; (void)data; (void)usage;
+    if (uv_upload.active && target == GL_ARRAY_BUFFER && size == sizeof(uv_upload.data)) {
+        memcpy(uv_upload.data, data, size); uv_upload.uploads++;
+    }
+}
+static void test_delete_ids(GLsizei count, GLuint const *ids) { (void)count; (void)ids; }
+#define glGenBuffers test_genva
+#define glBufferData test_bufdata
+#define glDeleteBuffers test_delete_ids
+#define glDeleteVertexArrays test_delete_ids
+#define glGenVertexArrays test_genva
+#define glBindVertexArray test_bindva
+#define glBindBuffer test_bindbuf
+#define glEnableVertexAttribArray test_enableattr
+#define glVertexAttribPointer test_attrptr
+#define glVertexAttribDivisor test_divisor
+#define glDrawArrays test_drawarrays
+#define glDrawArraysInstanced test_drawarrays_inst
+#include "renderer/r_buffer.c"
+#include "games/warcraft-3/renderer/mdx/r_mdx_buffer.c"
+#include "games/warcraft-3/renderer/mdx/r_mdx_load.c"
+#undef cstring_t
+#undef glGenBuffers
+#undef glBufferData
+#undef glDeleteBuffers
+#undef glDeleteVertexArrays
+#undef glGenVertexArrays
+#undef glBindVertexArray
+#undef glBindBuffer
+#undef glEnableVertexAttribArray
+#undef glVertexAttribPointer
+#undef glVertexAttribDivisor
+#undef glDrawArrays
+#undef glDrawArraysInstanced
+
+static handle_t test_alloc(long size) {
+    alloc_count++;
+    if (test_alloc_fail_after == 0) { test_alloc_fail_after = -1; return NULL; }
+    if (test_alloc_fail_after > 0) test_alloc_fail_after--;
+    return calloc(1, (size_t)size);
+}
+static void test_free(handle_t memory) { free_count++; free(memory); }
+static void test_error(cstring_t format, ...) { (void)format; T_ASSERT(false); }
+static void test_spawn(void *context) { (*(uint32_t *)context)++; }
+
+texture_t *R_LoadTexture(cstring_t filename) {
+    snprintf(last_texture_load, sizeof(last_texture_load), "%s", filename);
+    if (cache_minimap_textures) {
+        PATHSTR resolved;
+        void *file = NULL;
+        cstring_t path = filename;
+        if (strstr(filename, "minimap_hero.blp")) minimap_test_saw_streamed_override = r_load_streamed;
+        if (R_MapAssetCandidate(filename, resolved, sizeof(resolved)) && test_minimap_fs_read(resolved, &file) >= 0) {
+            free(file); file = NULL; path = resolved;
+        }
+        texture_t *texture = R_FindLoadedTexture(path);
+        if (texture) return texture;
+        if (test_minimap_fs_read(path, &file) < 0)
+            return tr.texture[TEX_PLACEHOLDER];
+        free(file);
+        texture = test_alloc(sizeof(*texture));
+        texture->texid = ++next_minimap_texture_id;
+        R_CacheLoadedTexture(path, texture);
+        return texture;
+    }
+    return texture_load_result;
+}
+
+static mdxModel_t *cliff_model;
+static bool use_production_model_loader;
+extern model_t *R_TestProductionLoadModel(cstring_t filename);
+extern void R_TestProductionReleaseModel(model_t *model);
+void R_TestUseProductionModelLoader(bool enabled) { use_production_model_loader = enabled; }
+cstring_t R_TestLastTextureLoad(void) { return last_texture_load; }
+void R_TestSetTextureLoadResult(texture_t *texture) { texture_load_result = texture; }
+
+model_t *R_LoadModel(cstring_t filename) {
+    load_count++;
+    snprintf(last_model_load, sizeof(last_model_load), "%s", filename ? filename : "");
+    if (fail_load || (fail_scoped_load &&
+        (strstr(last_model_load, ".w3m\\") || strstr(last_model_load, ".w3x\\")))) return NULL;
+    if (use_production_model_loader && strstr(last_model_load, "TestUI\\Models\\quad_sprite.mdx"))
+        return R_TestProductionLoadModel(filename);
+    model_t *model = test_alloc(sizeof(model_t));
+    if (cliff_model) { model->modeltype = ID_MDLX; model->mdx = cliff_model; }
+    return model;
+}
+
+void R_ReleaseModel(model_t *model) {
+    if (use_production_model_loader && model && model->modeltype == ID_MDLX && model->mdx) {
+        R_TestProductionReleaseModel(model);
+        return;
+    }
+    release_count++; test_free(model);
+}
+
+static bool test_mpq_read(handle_t archive, cstring_t path, void **buffer, uint32_t *size_out) {
+    handle_t file = NULL;
+    uint32_t size, read = 0;
+    if (!archive || !SFileOpenFileEx(archive, path, 0, &file)) return false;
+    size = SFileGetFileSize(file, NULL);
+    *buffer = malloc((size_t)size + 1);
+    if (!*buffer || !SFileReadFile(file, *buffer, size, &read, NULL) || read != size) {
+        free(*buffer); *buffer = NULL; SFileCloseFile(file); return false;
+    }
+    ((uint8_t *)*buffer)[size] = 0;
+    if (size_out) *size_out = size;
+    SFileCloseFile(file);
+    return true;
+}
+
+static int test_minimap_fs_read(cstring_t path, void **buffer) {
+    cstring_t file_path = path;
+    handle_t archive = minimap_test_base_archive;
+    uint32_t size = 0;
+    *buffer = NULL;
+    if (!strncasecmp(path, "Maps\\MapOverlay.w3x\\", 20)) {
+        file_path = path + 20;
+        archive = minimap_test_map_archive;
+        if (!strcasecmp(file_path, "war3mapSkin.txt")) minimap_test_read_map_skin = true;
+    }
+    if (!test_mpq_read(archive, file_path, buffer, &size)) return -1;
+    return (int)size;
+}
+
+static void test_minimap_fs_free(void *buffer) { free(buffer); }
+void R_WeatherRegisterMap(void) {}
+void R_LightningRegisterMap(void) {}
+void R_RegisterMap(cstring_t map) {
+    if (map && (strstr(map, ".w3m") || strstr(map, ".w3x"))) R_SetMapAssetScope(map);
+    else R_SetMapAssetScope(NULL);
+    register_count++;
+    if (touch_during_registration) R_LoadRegisteredModel("models/touched.mdx");
+}
+
+static void reset_registry(void) {
+    R_ShutdownModels();
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free; ri.error = test_error;
+    load_count = release_count = register_count = 0;
+    fail_load = fail_scoped_load = touch_during_registration = false;
+    last_model_load[0] = '\0';
+}
+
+static texture_t *reset_texture_registry(void) {
+    R_ShutdownTextureCache();
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    r_load_streamed = false; r_stream_generation = 0; texture_delete_count = 0;
+    return test_alloc(sizeof(texture_t));
+}
+
+static rImageCacheEntry_t *test_texture_entry(cstring_t name) {
+    for (rImageCacheEntry_t *entry = r_image_cache; entry; entry = entry->next)
+        if (!strcasecmp(entry->name, name)) return entry;
+    return NULL;
+}
+
+TEST(renderer_model, mdx_keytrack_binary_lookup_preserves_sequence_semantics) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 5 * (sizeof(int) + sizeof(float))] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    int times[] = { 50, 150, 200, 300, 400 };
+    float values[] = { 0.5f, 1.5f, 2.0f, 3.0f, 4.0f };
+    mdxSequence_t seq = { .interval = { 100, 350 } };
+    mdxModel_t model = { .sequences = &seq, .num_sequences = 1 };
+    float value = 0;
+
+    track->keyframeCount = 5; track->datatype = TDATA_FLOAT1;
+    track->linetype = TRACK_LINEAR; track->globalSeqId = (uint32_t)-1;
+    FOR_LOOP(i, 5) {
+        mdxKeyFrame_t *key = (mdxKeyFrame_t *)((uint8_t *)track->values + i * (sizeof(int) + sizeof(float)));
+        key->time = times[i]; memcpy(key->data, &values[i], sizeof(values[i]));
+    }
+    MDLX_GetModelKeytrackValue(&model, track, 100, &value); T_FEQ(value, 1.5f, 0.001f);
+    MDLX_GetModelKeytrackValue(&model, track, 250, &value); T_FEQ(value, 2.5f, 0.001f);
+    MDLX_GetModelKeytrackValue(&model, track, 325, &value); T_FEQ(value, 2.625f, 0.001f);
+}
+
+TEST(renderer_model, mdx_keytrack_lookup_uses_hermite_stride) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 3 * (sizeof(int) + 3 * sizeof(float))] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxSequence_t seq = { .interval = { 100, 350 } };
+    mdxModel_t model = { .sequences = &seq, .num_sequences = 1 };
+    float value = 0;
+
+    track->keyframeCount = 3; track->datatype = TDATA_FLOAT1;
+    track->linetype = TRACK_HERMITE; track->globalSeqId = (uint32_t)-1;
+    FOR_LOOP(i, 3) {
+        mdxKeyFrame_t *key = (mdxKeyFrame_t *)((uint8_t *)track->values + i * 16);
+        float authored = (float)(i + 1);
+        key->time = 100 + i * 100;
+        memcpy(key->data, &authored, sizeof(authored));
+    }
+    MDLX_GetModelKeytrackValue(&model, track, 100, &value); T_FEQ(value, 1.0f, 0.001f);
+    MDLX_GetModelKeytrackValue(&model, track, 200, &value); T_FEQ(value, 2.0f, 0.001f);
+    MDLX_GetModelKeytrackValue(&model, track, 300, &value); T_FEQ(value, 3.0f, 0.001f);
+}
+
+TEST(renderer_model, mdx_global_sequence_uses_first_key_when_duration_precedes_it) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(quaternion_t)] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxGlobalSequence_t global = { .value = 0 };
+    mdxModel_t model = { .globalSequences = &global, .num_globalSequences = 1 };
+    quaternion_t authored = { 0.25f, -0.5f, 0.75f, 1.0f };
+    quaternion_t value = { 0, 0, 0, 1 };
+    mdxKeyFrame_t *key = (mdxKeyFrame_t *)track->values;
+
+    track->keyframeCount = 1;
+    track->datatype = TDATA_FLOAT4;
+    track->linetype = TRACK_NO_INTERP;
+    track->globalSeqId = 0;
+    key->time = 333;
+    memcpy(key->data, &authored, sizeof(authored));
+
+    tr.viewDef.time = 9000;
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    T_FEQ(value.x, authored.x, 0.001f);
+    T_FEQ(value.y, authored.y, 0.001f);
+    T_FEQ(value.z, authored.z, 0.001f);
+    T_FEQ(value.w, authored.w, 0.001f);
+}
+
+TEST(renderer_model, mdx_global_sequence_holds_per_entity_and_resumes_without_jumping) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 2 * (sizeof(int) + sizeof(float))] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxGlobalSequence_t global = { .value = 1000 };
+    mdxModel_t model = { .globalSequences = &global, .num_globalSequences = 1 };
+    renderEntity_t entity = { .number = MAX_GAME_ENTITIES - 1, .generation = 0x574333u };
+    mdxKeyFrame_t *first = (mdxKeyFrame_t *)track->values;
+    mdxKeyFrame_t *last = (mdxKeyFrame_t *)((uint8_t *)track->values + sizeof(int) + sizeof(float));
+    uint32_t const old_time = tr.viewDef.time;
+    float const values[2] = { 0.0f, 10.0f };
+    float value = 0.0f;
+    mdxAnimationTimeScope_t scope;
+
+    track->keyframeCount = 2;
+    track->datatype = TDATA_FLOAT1;
+    track->linetype = TRACK_LINEAR;
+    track->globalSeqId = 0;
+    first->time = 0;
+    last->time = 1000;
+    memcpy(first->data, &values[0], sizeof(values[0]));
+    memcpy(last->data, &values[1], sizeof(values[1]));
+
+    tr.viewDef.time = 400;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 4.0f, 0.001f);
+
+    entity.flags |= RF_MDX_ANIMATION_PAUSED;
+    tr.viewDef.time = 800;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 8.0f, 0.001f);
+
+    tr.viewDef.time = 900;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 8.0f, 0.001f);
+
+    entity.flags &= ~RF_MDX_ANIMATION_PAUSED;
+    tr.viewDef.time = 1200;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 8.0f, 0.001f); /* no phase jump on resume */
+
+    tr.viewDef.time = 1300;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 9.0f, 0.001f);
+    tr.viewDef.time = old_time;
+}
+
+TEST(renderer_model, mdx_global_sequence_pause_transitions_can_be_observed_while_culled) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 2 * (sizeof(int) + sizeof(float))] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxGlobalSequence_t global = { .value = 1000 };
+    mdxModel_t model = { .globalSequences = &global, .num_globalSequences = 1 };
+    renderEntity_t entity = { .number = MAX_GAME_ENTITIES - 2, .generation = 0x574334u };
+    mdxKeyFrame_t *first = (mdxKeyFrame_t *)track->values;
+    mdxKeyFrame_t *last = (mdxKeyFrame_t *)((uint8_t *)track->values + sizeof(int) + sizeof(float));
+    mdxAnimationTimeScope_t scope;
+    uint32_t const old_time = tr.viewDef.time;
+    float values[2] = { 0.0f, 10.0f }, value = 0.0f;
+
+    track->keyframeCount = 2;
+    track->datatype = TDATA_FLOAT1;
+    track->linetype = TRACK_LINEAR;
+    track->globalSeqId = 0;
+    first->time = 0; last->time = 1000;
+    memcpy(first->data, &values[0], sizeof(values[0]));
+    memcpy(last->data, &values[1], sizeof(values[1]));
+
+    tr.viewDef.time = 100;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 1.0f, 0.001f);
+    entity.flags |= RF_MDX_ANIMATION_PAUSED;
+    tr.viewDef.time = 300;
+    MDLX_UpdateEntityAnimationPause(&entity); /* model is outside the frustum */
+    entity.flags &= ~RF_MDX_ANIMATION_PAUSED;
+    tr.viewDef.time = 700;
+    MDLX_UpdateEntityAnimationPause(&entity); /* still culled */
+    tr.viewDef.time = 900;
+    MDLX_PushEntityAnimationTime(&entity, &scope);
+    MDLX_GetModelKeytrackValue(&model, track, 0, &value);
+    MDLX_PopEntityAnimationTime(&scope);
+    T_FEQ(value, 5.0f, 0.001f); /* 400 ms held interval removed */
+    tr.viewDef.time = old_time;
+}
+
+TEST(renderer_model, mdx_sequence_zero_clock_wraps_with_render_time) {
+    uint32_t old_time = tr.viewDef.time;
+    mdxSequence_t seq = { .interval = { 100, 1100 } };
+    mdxModel_t mdx = { .sequences = &seq, .num_sequences = 1 };
+
+    tr.viewDef.time = 250;
+    T_NOT_NULL(R_FindSequenceAtTime(&mdx, tr.viewDef.time));
+    T_EQ(100 + (tr.viewDef.time % (seq.interval[1] - seq.interval[0])), 350);
+
+    tr.viewDef.time = 1250;
+    T_NOT_NULL(R_FindSequenceAtTime(&mdx, 250));
+    T_EQ(100 + (tr.viewDef.time % (seq.interval[1] - seq.interval[0])), 350);
+    tr.viewDef.time = old_time;
+}
+
+TEST(renderer_model, dnc_first_light_follows_sequence_zero_phase) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 2 * (sizeof(int) + sizeof(float))] = { 0 };
+    mdxKeyTrack_t *intensity = (mdxKeyTrack_t *)storage;
+    float values[] = { 0.2f, 0.8f };
+    mdxSequence_t seq = { .interval = { 0, 1000 } };
+    mdxLight_t light = {
+        .type = MODELLIGHTTYPE_DIRECT,
+        .Color = { 0.4f, 0.5f, 0.6f },
+        .Intensity = 1.0f,
+        .AmbColor = { 0.1f, 0.2f, 0.3f },
+        .AmbIntensity = 0.25f,
+    };
+    mdxModel_t mdx = { .sequences = &seq, .num_sequences = 1, .lights = &light };
+    model_t model = { .modeltype = ID_MDLX, .mdx = &mdx };
+    rModelLight_t sampled = { 0 };
+
+    intensity->keyframeCount = 2;
+    intensity->datatype = TDATA_FLOAT1;
+    intensity->linetype = TRACK_LINEAR;
+    intensity->globalSeqId = (uint32_t)-1;
+    FOR_LOOP(i, 2) {
+        mdxKeyFrame_t *key = (mdxKeyFrame_t *)((uint8_t *)intensity->values +
+                                               i * (sizeof(int) + sizeof(float)));
+        key->time = i ? 1000 : 0;
+        memcpy(key->data, &values[i], sizeof(values[i]));
+    }
+    light.keytracks.Intensity = intensity;
+    tr.viewDef.time = 1234;
+
+    T_ASSERT(MDLX_SampleFirstLight(&model, 0.5f, &sampled));
+    T_EQ(sampled.type, R_MODEL_LIGHT_DIRECT);
+    T_FEQ(sampled.intensity, 0.5f, 0.001f);
+    T_FEQ(sampled.color.x, 0.4f, 0.001f);
+    T_FEQ(sampled.color.y, 0.5f, 0.001f);
+    T_FEQ(sampled.color.z, 0.6f, 0.001f);
+    T_FEQ(sampled.ambient_intensity, 0.25f, 0.001f);
+}
+
+/* Read actual GEOA payloads: the Orc sky's orange RGB and a non-stock cool-blue tint must keep their channels. */
+TEST(renderer_model, static_geoset_colors_preserve_rgb_from_mdx) {
+    uint8_t bytes[][24] = {
+        { 0x00, 0x00, 0x80, 0x3f, 0x02, 0x00, 0x00, 0x00,
+          0x01, 0xf8, 0x77, 0x3f, 0xea, 0xec, 0xec, 0x3e,
+          0xe9, 0xf0, 0x70, 0x3d, 0x0a, 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x80, 0x3f, 0x02, 0x00, 0x00, 0x00,
+          0xcd, 0xcc, 0x4c, 0x3e, 0x33, 0x33, 0x33, 0x3f,
+          0x66, 0x66, 0x66, 0x3f, 0x0c, 0x00, 0x00, 0x00 },
+    };
+    vec3_t expected[] = { { 0.968628f, 0.462745f, 0.0588235f }, { 0.2f, 0.7f, 0.9f } };
+
+    FOR_LOOP(i, 2) {
+        sizeBuf_t buffer = { .data = bytes[i], .cursize = sizeof(bytes[i]) };
+        mdxGeosetAnim_t anim = { 0 };
+        vec3_t rgb = { 0, 0, 0 };
+
+        ReadGeosetAnim(&buffer, &anim);
+        T_EQ(buffer.readcount, sizeof(bytes[i]));
+        T_EQ(anim.flags, 2);
+        T_EQ(anim.geosetId, i ? 12 : 10);
+        T_NULL(anim.colors);
+        MDLX_GetGeosetAnimationStaticColor(&anim, &rgb);
+        T_FEQ(rgb.x, expected[i].x, 0.000001f);
+        T_FEQ(rgb.y, expected[i].y, 0.000001f);
+        T_FEQ(rgb.z, expected[i].z, 0.000001f);
+    }
+}
+
+TEST(renderer_model, animated_mdx_color_tracks_convert_bgr_to_rgb) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(vec3_t)] = { 0 };
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxKeyFrame_t *key = (mdxKeyFrame_t *)track->values;
+    vec3_t authored_bgr = { 0.85f, 0.40f, 0.10f };
+    vec3_t rgb = { 0, 0, 0 };
+    mdxSequence_t seq = { .interval = { 0, 1000 } };
+    mdxModel_t model = { .sequences = &seq, .num_sequences = 1 };
+
+    track->keyframeCount = 1;
+    track->datatype = TDATA_FLOAT3;
+    track->linetype = TRACK_NO_INTERP;
+    track->globalSeqId = (uint32_t)-1;
+    key->time = 0;
+    memcpy(key->data, &authored_bgr, sizeof(authored_bgr));
+
+    MDLX_GetAnimatedColorTrackValue(&model, track, 500, &rgb);
+    T_FEQ(rgb.x, authored_bgr.z, 0.001f);
+    T_FEQ(rgb.y, authored_bgr.y, 0.001f);
+    T_FEQ(rgb.z, authored_bgr.x, 0.001f);
+}
+
+TEST(renderer_model, animated_mdx_light_colors_follow_warsmash_rgb_order) {
+    uint8_t color_storage[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(vec3_t)] = { 0 };
+    uint8_t ambient_storage[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(vec3_t)] = { 0 };
+    mdxKeyTrack_t *color_track = (mdxKeyTrack_t *)color_storage;
+    mdxKeyTrack_t *ambient_track = (mdxKeyTrack_t *)ambient_storage;
+    mdxKeyFrame_t *color_key = (mdxKeyFrame_t *)color_track->values;
+    mdxKeyFrame_t *ambient_key = (mdxKeyFrame_t *)ambient_track->values;
+    vec3_t authored_bgr = { 0.799191f, 0.532794f, 0.313408f };
+    mdxSequence_t seq = { .interval = { 0, 1000 } };
+    mdxLight_t light = {
+        .type = MODELLIGHTTYPE_DIRECT,
+        .Color = { 1, 1, 1 },
+        .Intensity = 1.0f,
+        .AmbColor = { 1, 1, 1 },
+        .AmbIntensity = 0.25f,
+    };
+    mdxModel_t mdx = { .sequences = &seq, .num_sequences = 1, .lights = &light };
+    model_t model = { .modeltype = ID_MDLX, .mdx = &mdx };
+    rModelLight_t sampled = { 0 };
+
+    color_track->keyframeCount = ambient_track->keyframeCount = 1;
+    color_track->datatype = ambient_track->datatype = TDATA_FLOAT3;
+    color_track->linetype = ambient_track->linetype = TRACK_LINEAR;
+    color_track->globalSeqId = ambient_track->globalSeqId = (uint32_t)-1;
+    color_key->time = ambient_key->time = 0;
+    memcpy(color_key->data, &authored_bgr, sizeof(authored_bgr));
+    memcpy(ambient_key->data, &authored_bgr, sizeof(authored_bgr));
+    light.keytracks.Color = color_track;
+    light.keytracks.AmbColor = ambient_track;
+    tr.viewDef.time = 4321;
+
+    T_ASSERT(MDLX_SampleFirstLight(&model, 0.5f, &sampled));
+    T_FEQ(sampled.color.x, authored_bgr.z, 0.001f);
+    T_FEQ(sampled.color.y, authored_bgr.y, 0.001f);
+    T_FEQ(sampled.color.z, authored_bgr.x, 0.001f);
+    T_FEQ(sampled.ambient.x, authored_bgr.z, 0.001f);
+    T_FEQ(sampled.ambient.y, authored_bgr.y, 0.001f);
+    T_FEQ(sampled.ambient.z, authored_bgr.x, 0.001f);
+}
+
+/* Retail UI PRE2 has fractional sizes, distinct pivots, and Both (2) head/tail emission. */
+TEST(renderer_model, mdx_ui_particles_preserve_pivot_sizes_and_both_quads) {
+    mdxParticleEmitter_t emitter = { .node.node_id = 0, .LifeSpan = 1, .EmissionRate = 50,
+        .Speed = 0.02f, .FrameFlags = 2, .TailLength = 0.3f, .Time = 0.5f,
+        .Alpha = {255, 255, 0}, .ParticleScaling = {0.01f, 0.004f, 0.002f},
+        .SegmentColor = {1,1,1, 1,1,0, 0,0,0}, .Rows = 1, .Columns = 1, .FilterMode = 1 };
+    vec3_t pivot = {0.005f, 0.02f, 0.018f};
+    mdxModel_t model = { .emitters = &emitter, .pivots = &pivot, .num_pivots = 1 };
+    renderEntity_t entity = { .frame = 833, .oldframe = 833 };
+    mat4_t matrix;
+    viewDef_t saved = tr.viewDef;
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    tr.viewDef.deltaTime = 20; emit_count = 0;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 2);
+    T_FEQ(emitted[0].org.x, pivot.x, 0.00001f);
+    T_FEQ(emitted[0].org.y, pivot.y, 0.00001f);
+    T_FEQ(emitted[0].size[0] * emitted[0].size_value_scale, 0.01f, 0.0001f);
+    T_FEQ(emitted[1].tail.z, 0.006f, 0.00001f);
+    tr.viewDef = saved;
+}
+
+/* A gate's non-looping Open sequence must not indefinitely respawn PRE2
+ * particles after it holds its final frame. Looping Stand effects still work. */
+TEST(renderer_model, mdx_one_shot_emitter_stops_only_after_final_frame_is_held) {
+    mdxParticleEmitter_t emitter = { .node.node_id = 0, .LifeSpan = 1,
+        .EmissionRate = 50, .Speed = 1, .Alpha = {255, 255, 255},
+        .ParticleScaling = {1, 1, 1}, .SegmentColor = {1,1,1, 1,1,1, 1,1,1},
+        .Rows = 1, .Columns = 1 };
+    mdxSequence_t sequences[2] = {
+        { .name = "Open", .interval = {100, 500}, .flags = 1 },
+        { .name = "Stand", .interval = {500, 900}, .flags = 0 },
+    };
+    mdxModel_t model = { .emitters = &emitter, .sequences = sequences, .num_sequences = 2 };
+    renderEntity_t entity = { .frame = 499, .oldframe = 499 };
+    viewDef_t saved = tr.viewDef;
+    mat4_t matrix;
+
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    tr.viewDef.deltaTime = 20;
+    emit_count = 0;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 0); /* Open has ended */
+
+    entity.oldframe = 450; /* transitional sample still permits its final burst */
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 1);
+
+    entity.oldframe = entity.frame = 899; /* Stand is looping, despite a held sample */
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 2);
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_paused_worker_construction_does_not_spawn_particles) {
+    mdxParticleEmitter_t emitter = { .node.node_id = 0, .LifeSpan = 1,
+        .EmissionRate = 50, .Speed = 1, .Alpha = {255, 255, 255},
+        .ParticleScaling = {1, 1, 1}, .SegmentColor = {1,1,1, 1,1,1, 1,1,1},
+        .Rows = 1, .Columns = 1 };
+    mdxSequence_t sequence = { .name = "Birth", .interval = {100, 2000}, .flags = 1 };
+    mdxModel_t model = { .emitters = &emitter, .sequences = &sequence, .num_sequences = 1 };
+    renderEntity_t entity = { .frame = 900, .oldframe = 900,
+                               .flags = RF_BUILDING | RF_MDX_EMISSION_PAUSED };
+    viewDef_t saved = tr.viewDef;
+    mat4_t matrix;
+
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    tr.viewDef.deltaTime = 20;
+    emit_count = 0;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 0);
+
+    entity.flags &= ~RF_MDX_EMISSION_PAUSED;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 1); /* worker resumed: same Birth frame can emit again */
+    entity.flags |= RF_MDX_EMISSION_PAUSED;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+    T_EQ(emit_count, 1);
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_particle_velocity_follows_emitter_node_rotation) {
+    mdxParticleEmitter_t emitter = { .node.node_id = 0, .LifeSpan = 1, .EmissionRate = 628,
+        .Speed = 10, .FrameFlags = BZ_MDX_PARTICLE_TAIL, .TailLength = 0.5f,
+        .Latitude = 0, .Alpha = {255, 255, 255}, .ParticleScaling = {2, 2, 2},
+        .SegmentColor = {1,1,1, 1,1,1, 1,1,1}, .Rows = 1, .Columns = 1 };
+    mdxModel_t model = { .emitters = &emitter };
+    renderEntity_t entity = { .frame = 0, .oldframe = 0 };
+    mat4_t matrix;
+    viewDef_t saved = tr.viewDef;
+
+    Matrix4_identity(&matrix);
+    Matrix4_identity(&node_matrices[0]);
+    Matrix4_rotate(&node_matrices[0], &(vec3_t){180, 0, 0}, ROTATE_XYZ);
+    tr.viewDef.deltaTime = 16;
+    emit_count = 0;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+
+    T_EQ(emit_count, 10);
+    T_FEQ(emitted[0].vel.z, -10.0f, 0.001f);
+    T_FEQ(emitted[0].tail.z, -5.0f, 0.001f);
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_xyquad_axes_use_orientation_without_world_translation) {
+    mdxParticleEmitter_t emitter = { .node.node_id = 0, .node.flags = MDLXNODE_XYQuad,
+        .LifeSpan = 1, .EmissionRate = 100, .Speed = 1, .Latitude = 0,
+        .Alpha = {255, 255, 255}, .ParticleScaling = {1, 1, 1},
+        .SegmentColor = {1,1,1, 1,1,1, 1,1,1}, .Rows = 1, .Columns = 1 };
+    mdxModel_t model = { .emitters = &emitter };
+    renderEntity_t entity = { .frame = 0, .oldframe = 0 };
+    mat4_t matrix;
+    viewDef_t saved = tr.viewDef;
+
+    Matrix4_identity(&matrix);
+    matrix.v[12] = 17.0f; matrix.v[13] = -23.0f; matrix.v[14] = 31.0f;
+    Matrix4_identity(&node_matrices[0]);
+    Matrix4_rotate(&node_matrices[0], &(vec3_t){90, 0, 0}, ROTATE_XYZ);
+    tr.viewDef.deltaTime = 10;
+    emit_count = 0;
+    MDLX_RenderParticleEmitters(&entity, &model, &matrix);
+
+    T_EQ(emit_count, 1);
+    T_FEQ(emitted[0].quad_right.x, 1.0f, 0.001f);
+    T_FEQ(emitted[0].quad_right.y, 0.0f, 0.001f);
+    T_FEQ(emitted[0].quad_right.z, 0.0f, 0.001f);
+    T_FEQ(emitted[0].quad_up.x, 0.0f, 0.001f);
+    T_FEQ(emitted[0].quad_up.y, 0.0f, 0.001f);
+    T_FEQ(emitted[0].quad_up.z, 1.0f, 0.001f);
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_ribbon_trail_emits_connected_edges_and_expires) {
+    trail_t trail = { 0 };
+    vec3_t above = { 0, 10, 0 }, below = { 0, -10, 0 };
+    color32_t white = { 255, 255, 255, 180 };
+    trailVert_t verts[32];
+    uint32_t nverts;
+
+    T_EQ(R_TrailAdvance(&trail, above, below, white, 0.5f, 10.0f, 0.0f, 100, 100), 1);
+    above.x = 5; below.x = 5;
+    T_EQ(R_TrailAdvance(&trail, above, below, white, 0.5f, 10.0f, 0.0f, 200, 100), 2);
+    nverts = R_TrailStripVerts(&trail, 0.5f, 1, 1, 0, verts, 32);
+    T_EQ(nverts, 6);
+    T_FEQ(verts[0].position.y, 10.0f, 0.001f);
+    T_FEQ(verts[1].position.y, -10.0f, 0.001f);
+    T_FEQ(verts[2].position.x, 5.0f, 0.001f);
+    T_FEQ(verts[0].uv.x, 0.2f, 0.001f); /* age-based U: oldest edge age 0.1 of 0.5s lifespan */
+    T_FEQ(verts[5].uv.x, 0.0f, 0.001f);
+    T_EQ(R_TrailAdvance(&trail, above, below, white, 0.5f, 0.0f, 0.0f, 400, 600), 0);
+}
+
+TEST(renderer_model, mdx_ribbon_strip_u_survives_adding_an_edge) {
+    trail_t trail = { .head = 2, .count = 2 };
+    trailVert_t before[12], after[18];
+    uint32_t nbefore, nafter;
+    color32_t white = { 255, 255, 255, 255 };
+
+    trail.edges[0] = (trailEdge_t){ .above = { 0, 10, 0 }, .below = { 0, -10, 0 }, .color = white, .age = 0.2f };
+    trail.edges[1] = (trailEdge_t){ .above = { 5, 10, 0 }, .below = { 5, -10, 0 }, .color = white, .age = 0.1f };
+    nbefore = R_TrailStripVerts(&trail, 0.5f, 1, 1, 0, before, 12);
+    T_EQ(nbefore, 6);
+    trail.edges[2] = (trailEdge_t){ .above = { 10, 10, 0 }, .below = { 10, -10, 0 }, .color = white, .age = 0.0f };
+    trail.head = 3; trail.count = 3;
+    nafter = R_TrailStripVerts(&trail, 0.5f, 1, 1, 0, after, 18);
+    T_EQ(nafter, 12);
+    FOR_LOOP(i, 6) { /* the old quad keeps its exact UVs; only the new quad is appended */
+        T_FEQ(after[i].uv.x, before[i].uv.x, 0.000001f);
+        T_FEQ(after[i].uv.y, before[i].uv.y, 0.000001f);
+    }
+    T_FEQ(after[6].position.x, 5.0f, 0.001f);
+    T_FEQ(after[11].position.x, 10.0f, 0.001f);
+}
+
+TEST(renderer_model, mdx_ribbon_hitch_does_not_stack_coincident_edges) {
+    trail_t trail = { 0 };
+    vec3_t above = { 0, 10, 0 }, below = { 0, -10, 0 };
+    color32_t white = { 255, 255, 255, 255 };
+    float xmin, xmax;
+    int e, alive;
+
+    T_EQ(R_TrailAdvance(&trail, above, below, white, 30.0f, 20.0f, 0.0f, 1000, 50), 1);
+    above.x = below.x = 100.0f;
+    alive = R_TrailAdvance(&trail, above, below, white, 30.0f, 20.0f, 0.0f, 1050, 10000);
+    T_ASSERT(alive <= 3); /* accumulator clamps at 2: at most 2 edges per call, the seed survives */
+    xmin = xmax = trail.edges[0].above.x;
+    for (e = 0; e < trail.count; e++) {
+        int idx = (trail.head - trail.count + e + TRAIL_MAX_EDGES) % TRAIL_MAX_EDGES;
+        xmin = MIN(xmin, trail.edges[idx].above.x);
+        xmax = MAX(xmax, trail.edges[idx].above.x);
+    }
+    T_ASSERT(xmax - xmin > 50.0f);
+}
+
+TEST(renderer_model, mdx_ribbon_edges_match_spawn_time_positions) {
+    trail_t trail = { 0 };
+    vec3_t above = { 0, 10, 0 }, below = { 0, -10, 0 };
+    color32_t white = { 255, 255, 255, 255 };
+    int e;
+
+    FOR_LOOP(i, 5) { /* linear motion, 1 edge per 100 ms at 10/s */
+        above.x = below.x = (float)i * 2.0f;
+        R_TrailAdvance(&trail, above, below, white, 10.0f, 10.0f, 0.0f, 1000 + i * 100, 100);
+    }
+    T_EQ(trail.count, 5);
+    for (e = 0; e < 5; e++) {
+        int idx = (trail.head - trail.count + e + TRAIL_MAX_EDGES) % TRAIL_MAX_EDGES;
+        T_FEQ(trail.edges[idx].above.x, (float)e * 2.0f, 0.001f);
+    }
+}
+
+TEST(renderer_model, mdx_ribbon_edge_colors_stay_historic) {
+    trail_t trail = { 0 };
+    vec3_t above = { 0, 10, 0 }, below = { 0, -10, 0 };
+    color32_t red = { 255, 0, 0, 255 }, white = { 255, 255, 255, 255 };
+    trailVert_t verts[12];
+
+    R_TrailAdvance(&trail, above, below, red, 10.0f, 10.0f, 0.0f, 1000, 100);
+    R_TrailAdvance(&trail, above, below, white, 10.0f, 10.0f, 0.0f, 1100, 100);
+    T_EQ(R_TrailStripVerts(&trail, 10.0f, 1, 1, 0, verts, 12), 6);
+    T_EQ(verts[0].color.r, 255); T_EQ(verts[0].color.g, 0); /* oldest edge keeps its red */
+    T_EQ(verts[5].color.r, 255); T_EQ(verts[5].color.g, 255); /* newest edge is white */
+}
+
+TEST(renderer_model, mdx_ribbon_visibility_defaults_outside_death_keys) {
+    uint8_t vis_store[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(float)] = { 0 };
+    mdxKeyTrack_t *vis = (mdxKeyTrack_t *)vis_store;
+    mdxKeyFrame_t *key = (mdxKeyFrame_t *)vis->values;
+    mdxSequence_t seqs[2] = { { .interval = { 0, 1000 } }, { .interval = { 2000, 3000 } } };
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 20, .heightBelow = 20, .alpha = 0.7f,
+        .color = { 1, 1, 1 }, .lifespan = 0.5f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    vec3_t pivot = { 0, 0, 0 };
+    mdxModel_t model = { .ribbons = &ribbon, .pivots = &pivot, .num_pivots = 1,
+        .sequences = seqs, .num_sequences = 2 };
+    renderEntity_t entity = { .number = 7, .frame = 0 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    uint32_t nverts;
+    float visibility = 1.0f;
+    viewDef_t saved = tr.viewDef;
+
+    vis->keyframeCount = 1; vis->datatype = TDATA_FLOAT1;
+    vis->linetype = TRACK_NO_INTERP; vis->globalSeqId = (uint32_t)-1;
+    key->time = 0; *(float *)key->data = 0.0f;
+    ribbon.keytracks.Visibility = vis;
+    ribbon.node.node_id = 0; ribbon.node.parent_id = (uint32_t)-1;
+    model.nodes[0] = &ribbon.node; model.node_list[0] = &ribbon.node; model.num_nodes = 1;
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef.deltaTime = 100; tr.viewDef.time = 1;
+
+    MDLX_GetModelKeytrackValue(&model, vis, 0, &visibility);
+    T_FEQ(visibility, 0.0f, 0.001f);
+    visibility = 1.0f;
+    MDLX_GetModelKeytrackValue(&model, vis, 2500, &visibility);
+    T_FEQ(visibility, 1.0f, 0.001f);
+
+    nverts = MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(nverts, 0);
+    entity.frame = 2500;
+    tr.viewDef.time += tr.viewDef.deltaTime; /* next frame: the same timestamp must not advance twice */
+    nverts = MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(nverts, 6);
+    T_FEQ(verts[0].position.y, 20.0f, 0.001f);
+    T_FEQ(verts[1].position.y, -20.0f, 0.001f);
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) {
+        test_free(model.ribbon_states->trails);
+        test_free(model.ribbon_states);
+        model.ribbon_states = NULL;
+    }
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_ribbon_second_emit_same_frame_does_not_advance) {
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 20, .heightBelow = 20, .alpha = 1.0f,
+        .color = { 1, 1, 1 }, .lifespan = 1.0f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    vec3_t pivot = { 0, 0, 0 };
+    mdxModel_t model = { .ribbons = &ribbon, .pivots = &pivot, .num_pivots = 1 };
+    renderEntity_t entity = { .number = 9, .frame = 0 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    viewDef_t saved = tr.viewDef;
+
+    ribbon.node.node_id = 0;
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef.deltaTime = 50; tr.viewDef.time = 1000;
+    T_EQ(MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64), 0);
+    T_EQ(model.ribbon_states->trails[0].count, 1);
+    T_EQ(MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64), 0);
+    T_EQ(model.ribbon_states->trails[0].count, 1); /* shadow/lights redraw in the same frame emits nothing new */
+    tr.viewDef.time = 1050;
+    T_EQ(MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64), 6);
+    T_EQ(model.ribbon_states->trails[0].count, 2);
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) {
+        test_free(model.ribbon_states->trails);
+        test_free(model.ribbon_states);
+        model.ribbon_states = NULL;
+    }
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_ribbon_entity_reuse_after_gap_drops_old_edges) {
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 10, .heightBelow = 10, .alpha = 1.0f,
+        .color = { 1, 1, 1 }, .lifespan = 1.0f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    vec3_t pivot = { 0, 0, 0 };
+    mdxModel_t model = { .ribbons = &ribbon, .pivots = &pivot, .num_pivots = 1 };
+    renderEntity_t entity = { .number = 11, .frame = 0 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    uint32_t nverts;
+    viewDef_t saved = tr.viewDef;
+
+    ribbon.node.node_id = 0;
+    Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef.deltaTime = 50; tr.viewDef.time = 1000;
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(model.ribbon_states->trails[0].count, 1);
+    Matrix4_translate(&matrix, &(vec3_t){ 10000.0f, 0.0f, 0.0f }); /* edict reused far away a second later */
+    tr.viewDef.time = 2000;
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(model.ribbon_states->trails[0].count, 1);
+    tr.viewDef.time = 2050;
+    nverts = MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(nverts, 6);
+    FOR_LOOP(i, nverts) /* no streak back to the old impact point */
+        T_ASSERT(fabsf(verts[i].position.x - 10000.0f) < 1.0f);
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) {
+        test_free(model.ribbon_states->trails);
+        test_free(model.ribbon_states);
+        model.ribbon_states = NULL;
+    }
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_detached_ribbon_waits_one_frame_then_fades_out) {
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 10, .heightBelow = 10,
+        .color = { 1, 1, 1 }, .lifespan = 0.5f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    mdxModel_t model = { .ribbons = &ribbon };
+    renderEntity_t entity = { .number = 31 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    viewDef_t saved = tr.viewDef;
+
+    ribbon.node.node_id = 0; Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef = (viewDef_t){ .time = 1000, .deltaTime = 100 };
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    MDLX_TickDetachedRibbons(); /* the owner drew in this frame: no orphan yet */
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)0);
+    tr.viewDef.time = 1100;
+    MDLX_TickDetachedRibbons();
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)1);
+    tr.viewDef.time = 1600;
+    MDLX_TickDetachedRibbons();
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)0);
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) { test_free(model.ribbon_states->trails); test_free(model.ribbon_states); model.ribbon_states = NULL; }
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_detached_ribbon_reattach_cancels_orphan) {
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 10, .heightBelow = 10,
+        .color = { 1, 1, 1 }, .lifespan = 1.0f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    mdxModel_t model = { .ribbons = &ribbon };
+    renderEntity_t entity = { .number = 32 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    viewDef_t saved = tr.viewDef;
+
+    ribbon.node.node_id = 0; Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef = (viewDef_t){ .time = 2000, .deltaTime = 100 };
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    tr.viewDef.time = 2100; MDLX_TickDetachedRibbons();
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)1);
+    tr.viewDef.time = 2200; MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)0);
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) { test_free(model.ribbon_states->trails); test_free(model.ribbon_states); model.ribbon_states = NULL; }
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_detached_ribbon_reuse_drops_old_owner_state) {
+    mdxRibbonEmitter_t ribbon = { .heightAbove = 10, .heightBelow = 10,
+        .color = { 1, 1, 1 }, .lifespan = 1.0f, .emissionRate = 20, .rows = 1, .columns = 1 };
+    mdxModel_t model = { .ribbons = &ribbon };
+    renderEntity_t entity = { .number = 33 };
+    mat4_t matrix;
+    vertex_t verts[64];
+    viewDef_t saved = tr.viewDef;
+
+    ribbon.node.node_id = 0; Matrix4_identity(&matrix); Matrix4_identity(&node_matrices[0]);
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.viewDef = (viewDef_t){ .time = 3000, .deltaTime = 100 };
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    tr.viewDef.time = 3100; MDLX_TickDetachedRibbons();
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)1);
+    tr.viewDef.time = 4000; Matrix4_translate(&matrix, &(vec3_t){10000, 0, 0});
+    MDLX_EmitRibbonVertices(&model, &entity, &matrix, &ribbon, verts, 64);
+    T_EQ(MDLX_DetachedRibbonCount(), (uint32_t)0);
+    T_ASSERT(model.ribbon_states->trails[0].count >= 1);
+    FOR_LOOP(i, model.ribbon_states->trails[0].count) {
+        int edge = (model.ribbon_states->trails[0].head - model.ribbon_states->trails[0].count + i + TRAIL_MAX_EDGES) % TRAIL_MAX_EDGES;
+        T_FEQ(model.ribbon_states->trails[0].edges[edge].above.x, 10000.0f, 0.001f);
+    }
+    MDLX_ForgetRibbonModel(&model);
+    if (model.ribbon_states) { test_free(model.ribbon_states->trails); test_free(model.ribbon_states); model.ribbon_states = NULL; }
+    tr.viewDef = saved;
+}
+
+enum {
+    TEST_MDX_ID_MDLX = MAKEFOURCC('M','D','L','X'),
+    TEST_MDX_ID_VERS = MAKEFOURCC('V','E','R','S'),
+    TEST_MDX_ID_SEQS = MAKEFOURCC('S','E','Q','S'),
+    TEST_MDX_ID_PIVT = MAKEFOURCC('P','I','V','T'),
+    TEST_MDX_ID_RIBB = MAKEFOURCC('R','I','B','B'),
+    TEST_MDX_ID_KRVS = MAKEFOURCC('K','R','V','S'),
+    TEST_MDX_ID_PREM = MAKEFOURCC('P','R','E','M'),
+    TEST_MDX_ID_KPEV = MAKEFOURCC('K','P','E','V'),
+};
+static void mdx_put_u32(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4); *p += 4; }
+static void mdx_put_f32(uint8_t **p, float v) { memcpy(*p, &v, 4); *p += 4; }
+static void mdx_put_fourcc(uint8_t **p, uint32_t tag) { mdx_put_u32(p, tag); }
+
+/* NewRoughCliffDoodadCave2 uses UV0 for replacement slot 11 and UV1 for its alpha-key cave overlay. */
+TEST(renderer_model, mdx_cave_uv_channels_do_not_overwrite_the_cliff_coordinates) {
+    uint8_t data[256], *p = data, *channel2 = NULL;
+    mdx_put_fourcc(&p, MAKEFOURCC('V','R','T','X')); mdx_put_u32(&p, 3);
+    FOR_LOOP(i, 9) mdx_put_f32(&p, 0);
+    mdx_put_fourcc(&p, MAKEFOURCC('N','R','M','S')); mdx_put_u32(&p, 3);
+    FOR_LOOP(i, 9) mdx_put_f32(&p, i % 3 == 2 ? 1 : 0);
+    mdx_put_fourcc(&p, MAKEFOURCC('U','V','A','S'));
+    uint8_t *uvdecl = p; mdx_put_u32(&p, 2);
+    FOR_LOOP(set, 2) {
+        if (set) channel2 = p;
+        mdx_put_fourcc(&p, MAKEFOURCC('U','V','B','S')); mdx_put_u32(&p, 3);
+        FOR_LOOP(i, 3) { mdx_put_f32(&p, set ? 0.7f : 0.1f); mdx_put_f32(&p, set ? 0.8f : 0.2f); }
+    }
+    reset_registry();
+    mdxGeoset_t *geo = test_alloc(sizeof(*geo));
+    sizeBuf_t block = { .data = data, .cursize = (uint32_t)(p - data) };
+    ReadGeoset(&block, geo);
+    T_EQ(geo->num_texcoordChannels, 2); T_EQ(geo->num_texcoord, 3);
+    T_FEQ(geo->texcoord[0].x, 0.1f, 0.001f); T_FEQ(geo->texcoord[0].y, 0.2f, 0.001f);
+    T_FEQ(geo->texcoord[3].x, 0.7f, 0.001f); T_FEQ(geo->texcoord[3].y, 0.8f, 0.001f);
+    mdxModel_t model = { .geosets = geo };
+    geo->num_triangles = 3; geo->triangles = test_alloc(3 * sizeof(*geo->triangles));
+    geo->triangles[1] = 1; geo->triangles[2] = 2;
+    uv_upload = (typeof(uv_upload)){ .active = true };
+    MDX_BuildBuffers(&model);
+    T_EQ(ARRAY_COUNT(geo->vaos), 2); T_EQ(uv_upload.uploads, 1);
+    T_FEQ(uv_upload.data[0].x, 0.7f, 0.001f); T_EQ(uv_upload.stride, sizeof(vec2_t));
+    T_EQ(uv_upload.offset, 0);
+    geo->vaos[0] = 37; geo->vaos[1] = 41;
+    T_EQ(MDX_GeosetArray(geo, 0), 37); T_EQ(MDX_GeosetArray(geo, 1), 41);
+    T_EQ(MDX_GeosetArray(geo, -1), 37); T_EQ(MDX_GeosetArray(geo, 2), 0);
+    T_EQ(MDX_GeosetArray(geo, -2), 0);
+    uv_upload.active = false;
+    MDLX_Release(&model);
+    /* A missing declared channel is rejected before geometry upload, rather than filling it with UV0. */
+    geo = test_alloc(sizeof(*geo));
+    block = (sizeBuf_t){ .data = data, .cursize = (uint32_t)(channel2 - data) };
+    ReadGeoset(&block, geo);
+    T_EQ(geo->num_texcoordChannels, -1);
+    MDLX_ReleaseModelGeoset(geo);
+    /* The same shape with a single declared channel follows the ordinary packed-UV path. */
+    uint32_t one = 1; memcpy(uvdecl, &one, sizeof(one));
+    geo = test_alloc(sizeof(*geo)); block.readcount = 0;
+    ReadGeoset(&block, geo);
+    T_EQ(geo->num_texcoordChannels, 1); T_FEQ(geo->texcoord[0].x, 0.1f, 0.001f);
+    model = (mdxModel_t){ .geosets = geo };
+    MDX_BuildBuffers(&model);
+    T_EQ(ARRAY_COUNT(geo->vaos), 1); T_EQ(model.buffers[BZ_MDX_UV_BUFFER], 0);
+    MDLX_Release(&model);
+}
+
+TEST(renderer_model, mdx_ribb_loader_reads_emitter_tracks_and_nodes) {
+    uint8_t blob[1024] = { 0 };
+    uint8_t *p = blob;
+    mdxModel_t *model;
+    mdxRibbonEmitter_t *ribbon;
+    uint32_t node_inc = 96, static_bytes = 52, krvs_bytes = 24, emitter_inc;
+
+    emitter_inc = 4 + node_inc + static_bytes + krvs_bytes;
+    mdx_put_fourcc(&p, TEST_MDX_ID_MDLX);
+    mdx_put_fourcc(&p, TEST_MDX_ID_VERS); mdx_put_u32(&p, 4); mdx_put_u32(&p, 800);
+    mdx_put_fourcc(&p, TEST_MDX_ID_SEQS); mdx_put_u32(&p, 132);
+    memset(p, 0, 132); memcpy(p, "Stand", 5);
+    ((uint32_t *)(p + 80))[0] = 2000; ((uint32_t *)(p + 80))[1] = 3000;
+    p += 132;
+    mdx_put_fourcc(&p, TEST_MDX_ID_PIVT); mdx_put_u32(&p, 12);
+    mdx_put_f32(&p, 1.0f); mdx_put_f32(&p, 2.0f); mdx_put_f32(&p, 3.0f);
+    mdx_put_fourcc(&p, TEST_MDX_ID_RIBB); mdx_put_u32(&p, emitter_inc);
+    mdx_put_u32(&p, emitter_inc);
+    mdx_put_u32(&p, node_inc);
+    memset(p, 0, 80); memcpy(p, "BlizRibbon02", 12); p += 80;
+    mdx_put_u32(&p, 0); mdx_put_u32(&p, 0xFFFFFFFF); mdx_put_u32(&p, MDLXNODE_RibbonEmitter);
+    mdx_put_f32(&p, 20.0f); mdx_put_f32(&p, 20.0f); mdx_put_f32(&p, 0.7f);
+    mdx_put_f32(&p, 1.0f); mdx_put_f32(&p, 1.0f); mdx_put_f32(&p, 1.0f);
+    mdx_put_f32(&p, 0.5f);
+    mdx_put_u32(&p, 0); mdx_put_u32(&p, 15); mdx_put_u32(&p, 1); mdx_put_u32(&p, 1); mdx_put_u32(&p, 0);
+    mdx_put_f32(&p, 0.0f);
+    mdx_put_fourcc(&p, TEST_MDX_ID_KRVS); mdx_put_u32(&p, 1); mdx_put_u32(&p, 0); mdx_put_u32(&p, 0xFFFFFFFF);
+    mdx_put_u32(&p, 0); mdx_put_f32(&p, 0.0f);
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free; ri.error = test_error;
+    model = R_LoadModelMDLX(blob, (uint32_t)(p - blob));
+    T_NOT_NULL(model);
+    ribbon = model->ribbons;
+    T_NOT_NULL(ribbon);
+    T_STREQ(ribbon->node.name, "BlizRibbon02");
+    T_EQ(ribbon->node.flags, MDLXNODE_RibbonEmitter);
+    T_FEQ(ribbon->heightAbove, 20.0f, 0.001f);
+    T_FEQ(ribbon->alpha, 0.7f, 0.001f);
+    T_EQ(ribbon->emissionRate, 15);
+    T_NOT_NULL(ribbon->keytracks.Visibility);
+    T_EQ(model->num_pivots, 1);
+    T_EQ(model->nodes[0], &ribbon->node);
+    MDLX_Release(model);
+}
+
+TEST(renderer_model, mdx_prem_loader_preserves_model_emitter_fields_and_tracks) {
+    uint8_t blob[2048] = { 0 };
+    uint8_t *p = blob;
+    mdxModel_t *model;
+    mdxParticleEmitter1_t *emitter;
+    uint32_t node_inc = 96, static_bytes = 284, kpev_bytes = 24, emitter_inc;
+
+    emitter_inc = 4 + node_inc + static_bytes + kpev_bytes;
+    mdx_put_fourcc(&p, TEST_MDX_ID_MDLX);
+    mdx_put_fourcc(&p, TEST_MDX_ID_VERS); mdx_put_u32(&p, 4); mdx_put_u32(&p, 800);
+    mdx_put_fourcc(&p, TEST_MDX_ID_SEQS); mdx_put_u32(&p, 132);
+    memset(p, 0, 132); memcpy(p, "Stand", 5);
+    ((uint32_t *)(p + 80))[0] = 0; ((uint32_t *)(p + 80))[1] = 1000;
+    p += 132;
+    mdx_put_fourcc(&p, TEST_MDX_ID_PIVT); mdx_put_u32(&p, 12);
+    mdx_put_f32(&p, 0.0f); mdx_put_f32(&p, 0.0f); mdx_put_f32(&p, 0.0f);
+    mdx_put_fourcc(&p, TEST_MDX_ID_PREM); mdx_put_u32(&p, emitter_inc);
+    mdx_put_u32(&p, emitter_inc);
+    mdx_put_u32(&p, node_inc);
+    memset(p, 0, 80); memcpy(p, "ModelEmitter", 12); p += 80;
+    mdx_put_u32(&p, 0); mdx_put_u32(&p, 0xFFFFFFFF);
+    mdx_put_u32(&p, MDLXNODE_ParticleEmitter | MDLXNODE_Unshaded_EmitterUsesMdl);
+    mdx_put_f32(&p, 12.0f); mdx_put_f32(&p, 9.0f); mdx_put_f32(&p, 0.5f); mdx_put_f32(&p, 0.25f);
+    memset(p, 0, 260); memcpy(p, "SharedModels\\Test.mdx", 21); p += 260;
+    mdx_put_f32(&p, 2.5f); mdx_put_f32(&p, 175.0f);
+    mdx_put_fourcc(&p, TEST_MDX_ID_KPEV); mdx_put_u32(&p, 1); mdx_put_u32(&p, 0); mdx_put_u32(&p, 0xFFFFFFFF);
+    mdx_put_u32(&p, 0); mdx_put_f32(&p, 1.0f);
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free; ri.error = test_error;
+    model = R_LoadModelMDLX(blob, (uint32_t)(p - blob));
+    T_NOT_NULL(model);
+    emitter = model->emitters1;
+    T_NOT_NULL(emitter);
+    T_STREQ(emitter->node.name, "ModelEmitter");
+    T_ASSERT(emitter->node.flags & MDLXNODE_Unshaded_EmitterUsesMdl);
+    T_FEQ(emitter->EmissionRate, 12.0f, 0.001f);
+    T_FEQ(emitter->Gravity, 9.0f, 0.001f);
+    T_FEQ(emitter->Longitude, 0.5f, 0.001f);
+    T_FEQ(emitter->Latitude, 0.25f, 0.001f);
+    T_STREQ(emitter->path, "SharedModels\\Test.mdx");
+    T_FEQ(emitter->LifeSpan, 2.5f, 0.001f);
+    T_FEQ(emitter->Speed, 175.0f, 0.001f);
+    T_NOT_NULL(emitter->keytracks.Visibility);
+    T_EQ(model->nodes[0], &emitter->node);
+    MDLX_Release(model);
+}
+
+TEST(renderer_model, mdx_sound_event_keys_follow_sequence_and_global_sequence_time) {
+    mdxSequence_t sequences[2] = {
+        { .name = "Stand", .interval = {100, 200} },
+        { .name = "Attack", .interval = {300, 400} },
+    };
+    mdxGlobalSequence_t global = { .value = 1000 };
+    mdxModel_t model = { .sequences = sequences, .num_sequences = 2,
+                         .globalSequences = &global, .num_globalSequences = 1 };
+    mdxEvent_t event = { .globalSeqId = (uint32_t)-1 };
+
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 150, 120, 160, 0, 0));
+    T_ASSERT(!MDLX_EventKeyCrossed(&model, &event, 150, 160, 180, 0, 0));
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 105, 190, 110, 0, 0));
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 310, 150, 320, 0, 0));
+    T_ASSERT(!MDLX_EventKeyCrossed(&model, &event, 180, 150, 320, 0, 0));
+
+    event.globalSeqId = 0;
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 100, 0, 0, 50, 150));
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 25, 0, 0, 950, 1050));
+    T_ASSERT(!MDLX_EventKeyCrossed(&model, &event, 500, 0, 0, 950, 1050));
+    T_ASSERT(MDLX_EventKeyCrossed(&model, &event, 500, 0, 0, 50, 1050));
+}
+
+TEST(renderer_model, mdx_animation_duration_uses_authored_sequence_interval) {
+    mdxSequence_t sequences[] = {
+        { .name = "Birth", .interval = { 250, 1750 } },
+    };
+    mdxModel_t mdx = { .sequences = sequences, .num_sequences = 1 };
+    model_t model = { .modeltype = ID_MDLX, .mdx = &mdx };
+    uint32_t duration = 0;
+
+    T_ASSERT(R_GetModelAnimationDuration(&model, "Birth", &duration));
+    T_EQ(duration, 1500);
+    T_ASSERT(!R_GetModelAnimationDuration(&model, "Stand", &duration));
+    model.modeltype = ID_43DM;
+    T_ASSERT(!R_GetModelAnimationDuration(&model, "Birth", &duration));
+}
+
+TEST(renderer_model, mdx_event_object_id_parses_spawn_rows) {
+    mdxEvent_t event = { 0 };
+    char id[32] = { 0 };
+
+    snprintf(event.node.name, sizeof(event.node.name), "SPNxTestSpawn   ");
+    T_ASSERT(MDLX_EventObjectId(&event, "SPN", id, sizeof(id)));
+    T_STREQ(id, "TestSpawn");
+    T_ASSERT(!MDLX_EventObjectId(&event, "SND", id, sizeof(id)));
+}
+
+TEST(renderer_model, mdx_parented_eye_and_pendant_billboards_face_camera_without_losing_animated_pivots) {
+    uint8_t storage[sizeof(mdxKeyTrack_t) + 2 * (sizeof(int) + sizeof(quaternion_t))] = {0};
+    mdxKeyTrack_t *track = (mdxKeyTrack_t *)storage;
+    mdxSequence_t seq = { .interval = {100, 1001} };
+    uint8_t scales[sizeof(mdxKeyTrack_t) + sizeof(int) + sizeof(vec3_t)] = {0};
+    mdxKeyTrack_t *scale = (mdxKeyTrack_t *)scales;
+    mdxNode_t parent = { .node_id = 0, .parent_id = UINT32_MAX, .rotation = track, .scale = scale };
+    mdxNode_t eyes = { .node_id = 1, .parent_id = 0, .flags = MDLXNODE_Billboarded };
+    mdxNode_t charm = { .node_id = 2, .parent_id = 0, .flags = MDLXNODE_Billboarded };
+    vec3_t pivots[] = {{1, 2, 3}, {3, 5, 7}, {4, 1, 2}};
+    mdxModel_t model = { .sequences = &seq, .num_sequences = 1, .pivots = pivots, .num_pivots = 3 };
+    mat4_t entity, proj, view, world;
+    viewDef_t saved = tr.viewDef;
+    uint32_t stride = sizeof(int) + sizeof(quaternion_t);
+
+    track->keyframeCount = 2; track->datatype = TDATA_FLOAT4;
+    track->linetype = TRACK_LINEAR; track->globalSeqId = UINT32_MAX;
+    FOR_LOOP(i, 2) {
+        mdxKeyFrame_t *key = (mdxKeyFrame_t *)((uint8_t *)track->values + i * stride);
+        quaternion_t rot = Quaternion_fromEuler(&(vec3_t){i ? 31 : -19, i ? 12 : 7, i ? 41 : -23}, ROTATE_XYZ);
+        key->time = i ? 900 : 100; memcpy(key->data, &rot, sizeof(rot));
+    }
+    model.nodes[0] = model.node_list[0] = &parent;
+    model.nodes[1] = model.node_list[1] = &eyes;
+    model.nodes[2] = model.node_list[2] = &charm; model.num_nodes = 3;
+    Matrix4_identity(&entity); Matrix4_rotate(&entity, &(vec3_t){0, 0, 17}, ROTATE_XYZ);
+    Matrix4_translate(&entity, &(vec3_t){3, 4, 5});
+    Matrix4_perspective(&proj, 45, 1.7f, 1, 1000);
+    scale->keyframeCount = 1; scale->datatype = TDATA_FLOAT3;
+    scale->linetype = TRACK_NO_INTERP; scale->globalSeqId = UINT32_MAX;
+    ((mdxKeyFrame_t *)scale->values)->time = 100;
+    float factors[] = {1, 1.01f, 2.3f};
+    FOR_LOOP(scl, 3) {
+        vec3_t factor = {factors[scl], factors[scl], factors[scl]};
+        memcpy(((mdxKeyFrame_t *)scale->values)->data, &factor, sizeof(factor));
+        FOR_LOOP(cam, 2) {
+            vec3_t dir = {-1, -0.2f, -0.3f}, up = cam ? (vec3_t){0, 1, 1} : (vec3_t){0, 0, 1};
+            vec3_t front, right;
+            Vector3_normalize(&dir); front = Vector3_unm(&dir);
+            right = Vector3_cross(&up, &front); Vector3_normalize(&right);
+            up = Vector3_cross(&front, &right); Vector3_normalize(&up);
+            Matrix4_lookAt(&view, &(vec3_t){10, 20, 30}, &dir, &up);
+            Matrix4_multiply(&proj, &view, &tr.viewDef.viewProjectionMatrix);
+            FOR_LOOP(pose, 3) {
+                uint32_t time = 100 + pose * 400;
+                MDLX_BindBoneMatrices(&model, &entity, time, time);
+                FOR_LOOP(child, 2) {
+                    uint32_t id = child + 1;
+                    vec3_t pivot = Matrix4_multiply_vector3(&node_matrices[0], &pivots[id]);
+                    vec3_t expect = Matrix4_multiply_vector3(&entity, &pivot), actual;
+                    Matrix4_multiply(&entity, &node_matrices[id], &world);
+                    actual = Matrix4_multiply_vector3(&world, &pivots[id]);
+                    T_FEQ(actual.x, expect.x, 0.001f); T_FEQ(actual.y, expect.y, 0.001f);
+                    T_FEQ(actual.z, expect.z, 0.001f);
+                    vec3_t normal = {world.v[0], world.v[1], world.v[2]};
+                    vec3_t width = {world.v[4], world.v[5], world.v[6]};
+                    vec3_t height = {world.v[8], world.v[9], world.v[10]};
+                    T_FEQ(Vector3_len(&normal), factors[scl], 0.001f);
+                    T_FEQ(Vector3_len(&width), factors[scl], 0.001f);
+                    T_FEQ(Vector3_len(&height), factors[scl], 0.001f);
+                    Vector3_normalize(&normal); Vector3_normalize(&width); Vector3_normalize(&height);
+                    T_FEQ(Vector3_distance(&normal, &front), 0, 0.0001f);
+                    T_FEQ(Vector3_distance(&width, &right), 0, 0.0001f);
+                    T_FEQ(Vector3_distance(&height, &up), 0, 0.0001f);
+                }
+            }
+        }
+    }
+    /* The unflagged sibling still follows parent animation rather than facing the camera. */
+    eyes.flags = 0;
+    MDLX_BindBoneMatrices(&model, &entity, 500, 500);
+    FOR_LOOP(i, 16) T_FEQ(node_matrices[1].v[i], node_matrices[0].v[i], 0.001f);
+    tr.viewDef = saved;
+}
+
+TEST(renderer_model, mdx_event_world_transform_uses_event_pivot) {
+    mdxEvent_t event = { 0 };
+    vec3_t pivots[] = { { 4.0f, 5.0f, 6.0f } };
+    mdxModel_t model = { .events = &event, .pivots = pivots, .num_pivots = 1 };
+    renderEntity_t entity = { .frame = 100, .oldframe = 90 };
+    mat4_t parent, world;
+
+    event.node.node_id = 0; event.node.parent_id = (uint32_t)-1;
+    model.nodes[0] = &event.node; model.node_list[0] = &event.node; model.num_nodes = 1;
+    Matrix4_identity(&parent);
+    Matrix4_translate(&parent, &(vec3_t){ 10.0f, 20.0f, 30.0f });
+
+    T_ASSERT(MDLX_EventWorldTransform(&model, &event, &entity, &parent, &world));
+    T_FEQ(world.v[12], 14.0f, 0.001f);
+    T_FEQ(world.v[13], 25.0f, 0.001f);
+    T_FEQ(world.v[14], 36.0f, 0.001f);
+}
+
+TEST(renderer_model, mdx_particle_filter_modes_preserve_authored_blending) {
+    T_EQ(MDLX_ParticleBlendMode(MDX_PRE2_FILTER_BLEND), BLEND_MODE_BLEND);
+    T_EQ(MDLX_ParticleBlendMode(MDX_PRE2_FILTER_ADDITIVE), BLEND_MODE_ADD);
+    T_EQ(MDLX_ParticleBlendMode(MDX_PRE2_FILTER_MODULATE), BLEND_MODE_MODULATE);
+    T_EQ(MDLX_ParticleBlendMode(MDX_PRE2_FILTER_MODULATE_2X), BLEND_MODE_MODULATE_2X);
+    T_EQ(MDLX_ParticleBlendMode(MDX_PRE2_FILTER_ALPHAKEY), BLEND_MODE_ALPHAKEY);
+}
+
+TEST(renderer_model, mdx_attachment_positions_follow_authored_pivot_and_model_transform) {
+    mdxAttachment_t sprite = { 0 }, other = { 0 };
+    mdxAttachmentPosition_t positions[2] = { 0 };
+    vec3_t pivots[] = { { 4.0f, 5.0f, 6.0f }, { 1.0f, 2.0f, 3.0f } };
+    mdxModel_t model = { .attachments = &sprite, .pivots = pivots, .num_pivots = 2 };
+    mat4_t transform;
+    uint32_t count;
+
+    snprintf(sprite.node.name, sizeof(sprite.node.name), "Sprite First Ref");
+    sprite.node.node_id = 0; sprite.node.parent_id = (uint32_t)-1; sprite.next = &other;
+    snprintf(other.node.name, sizeof(other.node.name), "Origin Ref");
+    other.node.node_id = 1; other.node.parent_id = (uint32_t)-1;
+    model.nodes[0] = &sprite.node; model.nodes[1] = &other.node;
+    model.node_list[0] = &sprite.node; model.node_list[1] = &other.node;
+    model.num_nodes = 2;
+
+    Matrix4_identity(&transform);
+    Matrix4_translate(&transform, &(vec3_t){ 10.0f, 20.0f, 30.0f });
+    count = MDLX_CollectAttachmentPositions(&model, &transform, 0, 0,
+                                            "Sprite ", positions,
+                                            sizeof(positions) / sizeof(*positions));
+
+    T_EQ(count, 1);
+    T_STREQ(positions[0].name, "Sprite First Ref");
+    T_FEQ(positions[0].origin.x, 14.0f, 0.001f);
+    T_FEQ(positions[0].origin.y, 25.0f, 0.001f);
+    T_FEQ(positions[0].origin.z, 36.0f, 0.001f);
+}
+
+
+TEST(renderer_model, mdx_geometry_packs_two_geosets_into_model_ranges) {
+    vec3_t pos[] = {{1,2,3}, {4,5,6}, {7,8,9}}, normals[] = {{0,0,1}, {0,1,0}, {1,0,0}};
+    vec2_t uv[] = {{0,0}, {1,0}, {0,1}};
+    short first_idx[] = {0,1,0}, second_idx[] = {0};
+    mdxGeoset_t second = {.vertices=pos+2,.normals=normals+2,.texcoord=uv+2,.triangles=second_idx,
+        .num_vertices=1,.num_normals=1,.num_texcoord=1,.num_triangles=1};
+    mdxGeoset_t first = {.vertices=pos,.normals=normals,.texcoord=uv,.triangles=first_idx,
+        .num_vertices=2,.num_normals=2,.num_texcoord=2,.num_triangles=3,.next=&second};
+    mdxModel_t model = {.geosets=&first}; vertex_t vertices[3]; uint16_t indices[4];
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    MDX_PackModelGeometry(&model, vertices, indices);
+    T_FEQ(vertices[2].position.x, 7, 0.001f);
+    T_EQ(vertices[0].color.r, 255); T_EQ(vertices[0].color.g, 255);
+    T_EQ(vertices[0].color.b, 255); T_EQ(vertices[0].color.a, 255);
+    T_EQ(indices[2], 0); T_EQ(indices[3], 0); T_EQ((int)first.indexofs, 0); T_EQ((int)second.indexofs, 6);
+    ri.MemFree(first.matrixPalette); ri.MemFree(second.matrixPalette);
+}
+
+TEST(renderer_model, map_scope_precedes_base_model_and_clears_at_boundary) {
+    model_t *first, *second;
+
+    reset_registry();
+    R_RegisterMapAssets("Maps\\Campaign\\Human02.w3m");
+    first = R_LoadRegisteredModel("Units\\Human\\Footman\\Footman.mdx");
+    second = R_LoadRegisteredModel("Units\\Human\\Footman\\Footman.mdx");
+    T_ASSERT(first == second);
+    T_EQ(load_count, 1);
+    T_STREQ(last_model_load, "Maps\\Campaign\\Human02.w3m\\Units\\Human\\Footman\\Footman.mdx");
+    R_ReleaseRegisteredModel(first);
+    R_ReleaseRegisteredModel(second);
+    R_RegisterMapAssets(NULL);
+    T_EQ(register_count, 1);
+    T_EQ(release_count, 1);
+
+    first = R_LoadRegisteredModel("Units\\Human\\Footman\\Footman.mdx");
+    T_STREQ(last_model_load, "Units\\Human\\Footman\\Footman.mdx");
+    R_ReleaseRegisteredModel(first);
+}
+
+/* ScoreScreen.fdf references an MDX whose textures use stock path names.
+ * Map imports must win for both the model and each parchment BLP; changing
+ * maps must not continue looking inside the previous map's archive. */
+TEST(renderer_model, score_screen_background_map_model_override_and_fallback) {
+    static cstring_t const background =
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\ScoreScreen-Background.mdx";
+    model_t *model;
+
+    reset_registry();
+    R_RegisterMapAssets("Maps\\Custom\\ScoreOverride.w3x");
+    model = R_LoadRegisteredModel(background);
+    T_STREQ(last_model_load,
+        "Maps\\Custom\\ScoreOverride.w3x\\UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\ScoreScreen-Background.mdx");
+    R_ReleaseRegisteredModel(model);
+
+    /* A map without a replacement must still load the original model. */
+    R_RegisterMapAssets("Maps\\Custom\\StockScore.w3x");
+    fail_scoped_load = true;
+    model = R_LoadRegisteredModel(background);
+    T_STREQ(last_model_load, background);
+    R_ReleaseRegisteredModel(model);
+
+    /* Leaving the match also drops the map-specific lookup prefix. */
+    R_RegisterMapAssets(NULL);
+    fail_scoped_load = false;
+    model = R_LoadRegisteredModel(background);
+    T_STREQ(last_model_load, background);
+    R_ReleaseRegisteredModel(model);
+}
+
+TEST(renderer_model, score_screen_background_blp_paths_prefer_current_map) {
+    static cstring_t const textures[] = {
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-L1.blp",
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-L2.blp",
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-R1.blp",
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-R2.blp",
+        "UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-sort4.blp",
+    };
+    assetCandidates_t paths;
+
+    R_SetMapAssetScope("Maps\\Custom\\ScoreOverride.w3x");
+    FOR_LOOP(i, sizeof(textures) / sizeof(textures[0])) {
+        char expected[MAX_PATHLEN];
+        snprintf(expected, sizeof(expected), "Maps\\Custom\\ScoreOverride.w3x\\%s", textures[i]);
+        R_AssetCandidates(textures[i], &paths);
+        T_ASSERT(paths.scoped);
+        T_ASSERT(paths.count >= 2);
+        T_STREQ(paths.path[0], expected);
+        T_STREQ(paths.path[paths.count - 1], textures[i]);
+    }
+    R_SetMapAssetScope("Maps\\Custom\\Another.w3x");
+    R_AssetCandidates(textures[0], &paths);
+    T_STREQ(paths.path[0],
+        "Maps\\Custom\\Another.w3x\\UI\\Glues\\ScoreScreen\\ScoreScreen-Background\\scorescreen-background-L1.blp");
+    R_SetMapAssetScope(NULL);
+    R_AssetCandidates(textures[0], &paths);
+    T_ASSERT(!paths.scoped);
+    T_STREQ(paths.path[paths.count - 1], textures[0]);
+}
+
+TEST(renderer_model, map_scope_falls_back_when_import_is_absent) {
+    model_t *model;
+
+    reset_registry();
+    R_RegisterMapAssets("Maps\\Campaign\\Human03.w3m");
+    fail_scoped_load = true;
+    model = R_LoadRegisteredModel("Units\\Human\\Peasant\\Peasant.mdx");
+    T_EQ(load_count, 2);
+    T_STREQ(last_model_load, "Units\\Human\\Peasant\\Peasant.mdx");
+    R_ReleaseRegisteredModel(model);
+}
+
+TEST(renderer_model, filename_cache_hit_and_miss) {
+    model_t *first, *second;
+    reset_registry();
+    first = R_LoadRegisteredModel("Models/Foo.mdx");
+    second = R_LoadRegisteredModel("models/foo.mdx");
+    T_ASSERT(first == second); T_EQ(load_count, 1); T_EQ(release_count, 0);
+    R_ReleaseRegisteredModel(first); R_ReleaseRegisteredModel(second);
+    R_RegisterMapAssets("next");
+    T_EQ(register_count, 1); T_EQ(release_count, 1);
+}
+
+TEST(renderer_model, registration_keeps_touched_model_then_reclaims_it) {
+    model_t *model;
+    reset_registry();
+    model = R_LoadRegisteredModel("models/touched.mdx"); R_ReleaseRegisteredModel(model);
+    touch_during_registration = true; R_RegisterMapAssets("current");
+    T_EQ(load_count, 1); T_EQ(release_count, 0);
+    R_ReleaseRegisteredModel(model); touch_during_registration = false; R_RegisterMapAssets("next");
+    T_EQ(release_count, 1);
+}
+
+TEST(renderer_model, missing_model_placeholder_is_cached) {
+    model_t *first, *second;
+    reset_registry(); fail_load = true;
+    first = R_LoadRegisteredModel("models/missing.mdx"); second = R_LoadRegisteredModel("models/missing.mdx");
+    T_ASSERT(first == second); T_EQ(load_count, 1);
+    R_ReleaseRegisteredModel(first); R_ReleaseRegisteredModel(second); R_RegisterMapAssets("next");
+    T_EQ(release_count, 1);
+}
+
+TEST(renderer_model, unknown_model_release_is_immediate) {
+    model_t *model;
+    reset_registry(); model = test_alloc(sizeof(*model));
+    R_ReleaseRegisteredModel(model); T_EQ(release_count, 1);
+}
+
+TEST(renderer_texture, cached_registration_preserves_newer_texture_indices) {
+    texture_t first = { .texid = 100 }, second = { .texid = 101 };
+
+    texture_load_result = &first; T_EQ(R_RegisterTextureFile("first"), 100);
+    texture_load_result = &second; T_EQ(R_RegisterTextureFile("second"), 101);
+    T_ASSERT(R_FindTextureByID(100) == &first); T_ASSERT(R_FindTextureByID(101) == &second);
+    texture_load_result = &first; T_EQ(R_RegisterTextureFile("first"), 100);
+    T_ASSERT(R_FindTextureByID(100) == &first); T_ASSERT(R_FindTextureByID(101) == &second);
+}
+
+TEST(renderer_texture, resident_registry_keeps_entries_beyond_configstring_limit) {
+    static texture_t placeholder = { .texid = 77 };
+    char path[64];
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free; tr.texture[TEX_PLACEHOLDER] = &placeholder;
+    FOR_LOOP(i, MAX_IMAGES * 4 + 1) {
+        snprintf(path, sizeof(path), "Textures/Registry/%u.blp", i);
+        R_CacheLoadedTexture(path, &placeholder);
+    }
+    T_ASSERT(R_FindLoadedTexture("textures/registry/1024.BLP") == &placeholder);
+}
+
+/* Map registration reloads the MDX event tables; this fixture ships none, so every table reads as empty. */
+static uint32_t test_no_slk(cstring_t filename, slkField_t const *schema, void **dest, uint32_t row_stride) {
+    (void)filename; (void)schema; (void)row_stride;
+    *dest = NULL;
+    return 0;
+}
+
+TEST(renderer_texture, wc3_map_registration_reclaims_skin_override_and_keeps_stock) {
+    static texture_t placeholder = { .texid = 1 };
+    rImageCacheEntry_t *entry;
+    uint32_t map_size = 0;
+    void *map_data = NULL;
+
+    R_ShutdownTextureCache(); reset_registry();
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    r_load_streamed = false; r_stream_generation = 0; texture_delete_count = 0;
+    T_ASSERT(SFileOpenArchive("build/tests/tests.mpq", 0, 0, &minimap_test_base_archive));
+    T_ASSERT(test_mpq_read(minimap_test_base_archive, "Maps\\MapOverlay.w3x", &map_data, &map_size));
+    minimap_test_map_data = map_data;
+    T_ASSERT(SFileOpenArchiveFromMemory(map_data, map_size, 0, &minimap_test_map_archive));
+    ri.FS_ReadFile = test_minimap_fs_read; ri.FS_FreeFile = test_minimap_fs_free;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free; ri.LoadSlk = test_no_slk;
+    tr.texture[TEX_PLACEHOLDER] = &placeholder;
+    cache_minimap_textures = true; next_minimap_texture_id = 1;
+    minimap_test_saw_streamed_override = false;
+    minimap_test_read_map_skin = false;
+
+    R_TestProductionRegisterMap("Maps\\MapOverlay.w3x");
+    T_ASSERT(minimap_test_read_map_skin);
+    T_ASSERT(minimap_test_saw_streamed_override);
+    entry = test_texture_entry("Maps\\MapOverlay.w3x\\Textures\\minimap_hero.blp");
+    T_NOT_NULL(entry); T_ASSERT(entry && entry->streamed && !entry->pinned);
+    entry = test_texture_entry("TestUI\\Textures\\solid_white.blp");
+    T_NOT_NULL(entry); T_ASSERT(entry && entry->pinned && !entry->streamed);
+
+    R_TestProductionRegisterMap("Maps\\Next.w3x");
+    T_NULL(test_texture_entry("Maps\\MapOverlay.w3x\\Textures\\minimap_hero.blp"));
+    entry = test_texture_entry("TestUI\\Textures\\solid_white.blp");
+    T_NOT_NULL(entry); T_ASSERT(entry && entry->pinned && !entry->streamed);
+    T_EQ(texture_delete_count, 1);
+
+    R_TestProductionRegisterMap(NULL);
+    R_ShutdownTextureCache();
+    cache_minimap_textures = false;
+    SFileCloseArchive(minimap_test_map_archive); minimap_test_map_archive = NULL;
+    SFileCloseArchive(minimap_test_base_archive); minimap_test_base_archive = NULL;
+    free(minimap_test_map_data); minimap_test_map_data = NULL;
+}
+
+TEST(renderer_texture, persistent_then_streamed_remains_pinned) {
+    texture_t *texture = reset_texture_registry();
+
+    R_CacheLoadedTexture("textures/shared.blp", texture);
+    T_ASSERT(r_image_cache->pinned); T_ASSERT(!r_image_cache->streamed);
+    r_load_streamed = true; T_ASSERT(R_FindLoadedTexture("textures/shared.blp") == texture); r_load_streamed = false;
+    R_AdvanceTextureGeneration(); R_ReclaimStreamedTextures(0);
+    T_ASSERT(r_image_cache && r_image_cache->texture == texture); T_EQ(texture_delete_count, 0);
+    R_ShutdownTextureCache();
+}
+
+TEST(renderer_texture, streamed_then_persistent_becomes_pinned) {
+    texture_t *texture = reset_texture_registry();
+
+    r_load_streamed = true; R_CacheLoadedTexture("textures/shared.blp", texture); r_load_streamed = false;
+    T_ASSERT(r_image_cache->streamed); T_ASSERT(!r_image_cache->pinned);
+    T_ASSERT(R_FindLoadedTexture("textures/shared.blp") == texture);
+    T_ASSERT(r_image_cache->pinned); T_ASSERT(!r_image_cache->streamed);
+    R_AdvanceTextureGeneration(); R_ReclaimStreamedTextures(0);
+    T_ASSERT(r_image_cache && r_image_cache->texture == texture); T_EQ(texture_delete_count, 0);
+    R_ShutdownTextureCache();
+}
+
+TEST(renderer_texture, stale_streamed_texture_is_reclaimed) {
+    texture_t *texture = reset_texture_registry();
+
+    r_load_streamed = true; R_CacheLoadedTexture("textures/streamed.blp", texture); r_load_streamed = false;
+    R_AdvanceTextureGeneration(); R_ReclaimStreamedTextures(0);
+    T_NULL(r_image_cache); T_EQ(texture_delete_count, 1);
+}
+
+TEST(renderer_texture, current_streamed_generation_is_retained) {
+    texture_t *texture = reset_texture_registry();
+
+    r_load_streamed = true; R_CacheLoadedTexture("textures/current.blp", texture); r_load_streamed = false;
+    R_ReclaimStreamedTextures(0);
+    T_ASSERT(r_image_cache && r_image_cache->texture == texture); T_EQ(texture_delete_count, 0);
+    R_ShutdownTextureCache();
+}
+
+TEST(renderer_texture, persistent_alias_pins_streamed_owner) {
+    texture_t *texture = reset_texture_registry();
+
+    r_load_streamed = true; R_CacheLoadedTexture("textures/owner.blp", texture); r_load_streamed = false;
+    R_CacheLoadedTexture("textures/alias.blp", texture);
+    rImageCacheEntry_t *owner = R_TextureOwner(r_image_cache);
+    T_ASSERT(owner->owns_texture); T_ASSERT(owner->pinned); T_ASSERT(!owner->streamed);
+    R_AdvanceTextureGeneration(); R_ReclaimStreamedTextures(0);
+    T_EQ(texture_delete_count, 0);
+    R_ShutdownTextureCache();
+}
+
+TEST(renderer_texture, reclaim_removes_streamed_aliases_with_owner) {
+    texture_t *texture = reset_texture_registry();
+
+    r_load_streamed = true;
+    R_CacheLoadedTexture("textures/owner.blp", texture);
+    R_CacheLoadedTexture("textures/alias.blp", texture);
+    r_load_streamed = false;
+    R_AdvanceTextureGeneration(); R_ReclaimStreamedTextures(0);
+    T_NULL(r_image_cache); T_NULL(R_FindLoadedTexture("textures/alias.blp")); T_EQ(texture_delete_count, 1);
+}
+
+TEST(renderer_model, clock_emission_needs_no_instance_accumulator) {
+    spawn_count = 0;
+    R_EmitParticlesAtTime(10.0f, 1050, 100, test_spawn, &spawn_count);
+    T_EQ(spawn_count, 1);
+}
+
+TEST(renderer_model, clock_emission_ignores_zero_rate_and_delta) {
+    spawn_count = 0;
+    R_EmitParticlesAtTime(0.0f, 1050, 100, test_spawn, &spawn_count);
+    R_EmitParticlesAtTime(10.0f, 1050, 0, test_spawn, &spawn_count);
+    T_EQ(spawn_count, 0);
+}
+
+TEST(renderer_model, frame_emission_bounds_extreme_authored_rates) {
+    uint32_t count = 0;
+    float accum = 0.0f;
+
+    R_EmitParticles(1000000000.0f, &accum, 100, test_spawn, &count);
+    T_EQ(count, R_EMIT_PARTICLE_BUDGET);
+    T_FEQ(accum, 0.0f, 0.001f);
+}
+
+TEST(renderer_model, frame_emission_keeps_finite_accumulator_at_float_max) {
+    uint32_t count = 0;
+    float accum = 0.5f;
+    R_EmitParticles(FLT_MAX, &accum, 100, test_spawn, &count);
+    T_EQ(count, R_EMIT_PARTICLE_BUDGET);
+    T_ASSERT(isfinite(accum)); T_ASSERT(accum >= 0 && accum < 1);
+}
+
+TEST(renderer_model, frame_emission_rejects_nonfinite_rates) {
+    uint32_t count = 0;
+    float accum = 0.5f;
+
+    R_EmitParticles(INFINITY, &accum, 100, test_spawn, &count);
+    T_EQ(count, 0);
+    T_FEQ(accum, 0.0f, 0.001f);
+}
+
+TEST(renderer_alpha, active_samples_require_a_real_multisample_buffer) {
+    T_EQ(R_MsaaActiveSamples(0, 4), 0); T_EQ(R_MsaaActiveSamples(1, 1), 0);
+    T_EQ(R_MsaaActiveSamples(1, 4), 4);
+}
+
+TEST(renderer_instances, upload_size_uses_wide_arithmetic) {
+    T_EQ(R_InstanceBufferBytes(465524), (size_t)29793536);
+}
+
+TEST(renderer_instances, dynamic_capacity_reuses_and_grows_power_of_two) {
+    T_EQ(R_InstanceBufferCapacity(0, 1), (uint32_t)16);
+    T_EQ(R_InstanceBufferCapacity(16, 16), (uint32_t)16);
+    T_EQ(R_InstanceBufferCapacity(16, 17), (uint32_t)32);
+}
+
+TEST(renderer_shader, environ_light_converts_to_model_lighting) {
+    environLight_t env = {
+        .dir = { 1, 0, 0 }, .color = { 0.4f, 0.5f, 0.6f }, .ambient = { 0.1f, 0.2f, 0.3f },
+        .intensity = 0.8f, .ambient_intensity = 0.25f, .type = R_MODEL_LIGHT_DIRECT, .valid = true,
+    };
+    modelLighting_t lighting;
+    environLight_t empty = {0};
+    T_ASSERT(R_LightingFromEnviron(&env, &lighting));
+    T_EQ(lighting.count, 1);
+    T_EQ(lighting.lights[0].type, R_MODEL_LIGHT_DIRECT);
+    T_FEQ(lighting.lights[0].dir.x, 1.0f, 0.001f);
+    T_FEQ(lighting.lights[0].color.y, 0.5f, 0.001f);
+    T_FEQ(lighting.lights[0].ambient_intensity, 0.25f, 0.001f);
+    T_ASSERT(!R_LightingFromEnviron(&empty, &lighting));
+    T_EQ(lighting.count, 0);
+    T_EQ(UI_PLAYERSTAT_ENV_PHASE, 16);
+    T_EQ(UI_PLAYERSTAT_CINEMATIC_PORTRAIT_COLOR, 17);
+}
+
+TEST(renderer_shader, directional_light_uses_array_schema) {
+    mat4_t packed[BZ_MODEL_LIGHT_MAX];
+    modelLighting_t state = {
+        .ambient = { 1, 1, 1 }, .count = 1,
+        .lights[0] = {
+            .dir = { 1, 2, 3 }, .color = { 4, 5, 6 }, .ambient = { 7, 8, 9 },
+            .intensity = 0.5f, .ambient_intensity = 0.5f, .type = R_MODEL_LIGHT_DIRECT,
+        },
+    };
+    R_PackModelLighting(packed, &state);
+    T_EQ(packed[0].v[3], 1.0f); T_EQ(packed[0].v[4], -1.0f); T_EQ(packed[0].v[6], -3.0f);
+    T_EQ(packed[0].v[8], 4.0f); T_EQ(packed[0].v[11], 0.5f);
+    T_EQ(packed[0].v[12], 4.5f); T_EQ(packed[0].v[14], 5.5f); T_EQ(packed[0].v[15], 1.0f);
+}
+
+TEST(renderer_shader, lighting_state_packs_all_sources) {
+    mat4_t packed[BZ_MODEL_LIGHT_MAX];
+    modelLighting_t state = { .count = 3 };
+    FOR_LOOP(i, state.count) {
+        state.lights[i].type = R_MODEL_LIGHT_DIRECT;
+        state.lights[i].color.x = (float)i + 1.0f;
+        state.lights[i].intensity = 1.0f;
+    }
+    R_PackModelLighting(packed, &state);
+    T_EQ(packed[0].v[8], 1.0f); T_EQ(packed[1].v[8], 2.0f); T_EQ(packed[2].v[8], 3.0f);
+}
+
+TEST(renderer_shader, grass_state_uses_one_matrix) {
+    mat4_t packed;
+    modelGrass_t grass = {
+        .camera = { 1, 2 }, .fade = { 3, 4 }, .time = 5, .wind = { 6, 7, 8 },
+        .phase = { 9, 10, 11, 12 }, .height = { 13, 14 }, .enabled = true,
+    };
+    R_PackModelGrass(&packed, &grass);
+    FOR_LOOP(i, 14) T_EQ(packed.v[i], (float)i + 1.0f);
+    T_EQ(packed.v[14], 1.0f); T_EQ(packed.v[15], 0.0f);
+    grass.enabled = false; R_PackModelGrass(&packed, &grass); T_EQ(packed.v[14], 0.0f); T_EQ(packed.v[15], 0.0f);
+}
+
+TEST(renderer_bones, model_shader_preserves_high_palette_indices) {
+    memset(&tr, 0, sizeof(tr));
+    test_shader_source(1, &sd_model, true, NULL);
+    T_NOT_NULL(strstr(shader_src, "uniform mat4 u_bones[128];"));
+    T_EQ(sd_model.Uniforms[0].count, BZ_BONE_PALETTE_MAX);
+    T_EQ(sd_model.Uniforms[0].count_offset, offsetof(modelState_t, boneCount));
+    T_ASSERT(sd_model.Uniforms[0].counted);
+    T_NULL(strstr(shader_src, "BZ_BONE_COUNT"));
+    /* Slot 83 must stay 83: the old clamp redirected it to 63 with a 64-matrix palette. */
+    T_NOT_NULL(strstr(shader_src, "int boneIdx = int(a_skin1[i]) + int(u_firstBoneLookupIndex);"));
+    T_NULL(strstr(shader_src, "#define BZ_USE_INSTANCING"));
+}
+
+TEST(renderer_bones, instanced_shader_uses_the_same_palette_contract) {
+    test_shader_source(1, &sd_model, true, "#define BZ_USE_INSTANCING 1\n");
+    T_NOT_NULL(strstr(shader_src, "#define BZ_USE_INSTANCING 1\n"));
+    T_NOT_NULL(strstr(shader_src, "uniform mat4 u_bones[128];"));
+    T_NOT_NULL(strstr(shader_src, "int boneIdx = int(a_skin1[i]) + int(u_firstBoneLookupIndex);"));
+}
+
+TEST(renderer_shader, normal_model_defines_do_not_inherit_instancing) {
+    T_NOT_NULL(strstr(R_ShaderDefines(true), "#define BZ_USE_INSTANCING 1\n"));
+    T_NULL(strstr(R_ShaderDefines(false), "BZ_USE_INSTANCING"));
+}
+
+TEST(renderer_shader, model_fog_masks_unshaded_fragments) {
+    char const *unshaded, *fog_sample;
+
+    test_shader_source(1, &sd_model, false, NULL);
+    unshaded = strstr(shader_src, "if (!u_unshaded)");
+    fog_sample = strstr(shader_src, "float fog = get_fogofwar();");
+    T_NOT_NULL(unshaded);
+    T_NOT_NULL(fog_sample);
+    if (!unshaded || !fog_sample) return;
+    T_ASSERT(unshaded < fog_sample);
+    T_NOT_NULL(strstr(shader_src, "if (fog <= 0.0) discard;"));
+    T_NOT_NULL(strstr(shader_src, "col.rgb *= fog;"));
+}
+
+/* gs_load assigns sampler units in declaration order (texture, shadowmap, fogOfWar);
+ * the world frame binds the fog texture on unit 2, so the model layout must keep that slot. */
+TEST(renderer_shader, model_fog_sampler_uses_world_fog_texture_unit) {
+    FOR_LOOP(instancing, 2) {
+        modelProg_t shader = {0};
+
+        reset_shader();
+        R_LoadModelShader(&shader, instancing != 0);
+        T_EQ(shader.state.fogOfWar, 2);
+        R_DeleteShader(&shader.prog);
+    }
+}
+
+/* GLSL 120 does not accept implicit integer-to-float conversion in these fog-raycast expressions. */
+TEST(renderer_shader, fog_raycast_uses_float_literals_for_glsl120) {
+    FILE *file = fopen("renderer/r_fogofwar.c", "rb");
+    char line[256];
+    bool up = false, z = false, invalid = false;
+
+    T_NOT_NULL(file);
+    while (file && fgets(line, sizeof(line), file)) {
+        if (strstr(line, "vec3 up = vec3(0.0, 0.0, 1.0)")) up = true;
+        if (strstr(line, "pos.z = 0.0")) z = true;
+        if (strstr(line, "vec3 up = vec3(0, 0, 1)") || strstr(line, "pos.z = 0;")) invalid = true;
+    }
+    if (file) fclose(file);
+    T_ASSERT(up); T_ASSERT(z); T_ASSERT(!invalid);
+}
+
+/* PRE2 supports non-additive filter modes; the shared particle pass must not collapse them to alpha blend. */
+TEST(renderer_shader, world_particles_support_pre2_modulate_filter_modes) {
+    FILE *file = fopen("renderer/r_particles.c", "rb");
+    char line[256];
+    bool modulate = false, modulate2x = false, alpha_key_state = false;
+
+    T_NOT_NULL(file);
+    while (file && fgets(line, sizeof(line), file)) {
+        if (strstr(line, "case BLEND_MODE_MODULATE:")) modulate = true;
+        if (strstr(line, "case BLEND_MODE_MODULATE_2X:")) modulate2x = true;
+        if (strstr(line, "blend_mode == BLEND_MODE_ALPHAKEY")) alpha_key_state = true;
+    }
+    if (file) fclose(file);
+    T_ASSERT(modulate); T_ASSERT(modulate2x); T_ASSERT(alpha_key_state);
+}
+
+/* WC3 waterfalls are PRE2-only MDX models, so their shared particle shader must consume the world FOW mask. */
+TEST(renderer_shader, world_particles_sample_fog_of_war) {
+    FILE *file = fopen("renderer/r_particles.c", "rb");
+    char line[256];
+    bool matrix = false, sampler = false, coord = false, shade = false, define = false;
+
+    T_NOT_NULL(file);
+    while (file && fgets(line, sizeof(line), file)) {
+        if (strstr(line, "UNIFORM(textureMatrix,")) matrix = true;
+        if (strstr(line, "UNIFORM(fogOfWar,")) sampler = true;
+        if (strstr(line, "v_texcoord2 = (u_textureMatrix * vec4(pos, 1.0)).xy")) coord = true;
+        if (strstr(line, "col.rgb *= texture(u_fogOfWar, v_texcoord2).r")) shade = true;
+        if (strstr(line, "#define USE_FOGOFWAR 1\\n")) define = true;
+    }
+    if (file) fclose(file);
+    T_ASSERT(matrix); T_ASSERT(sampler); T_ASSERT(coord); T_ASSERT(shade); T_ASSERT(define);
+}
+
+static handle_t shader_alloc(long size) { return shader_test.memory = test_alloc(size); }
+
+/* Each case starts with empty caches and independent driver counters. */
+static void reset_shader(void) {
+    ri.MemAlloc = shader_alloc; ri.MemFree = test_free;
+    R_ShutdownModelShader();
+    memset(&shader_test, 0, sizeof(shader_test));
+    shader_test.logsize = 64;
+}
+
+TEST(renderer_shader, default_world_shader_accepts_environment_lights) {
+    memset(shader_src, 0, sizeof(shader_src));
+    test_shader_source(1, &sd_default, true, NULL);
+    T_ASSERT(strstr(shader_src, "uniform int u_lightCount;") != NULL);
+    T_ASSERT(strstr(shader_src, "uniform mat4 u_lights[8];") != NULL);
+    T_ASSERT(strstr(shader_src, "environment_lighting") != NULL);
+
+    memset(shader_src, 0, sizeof(shader_src));
+    test_shader_source(1, &sd_default, false, NULL);
+    T_ASSERT(strstr(shader_src, "if (u_lightCount > 0)") != NULL);
+    T_ASSERT(strstr(shader_src, "clamp(v_lighting, vec3(0.0), vec3(1.0))") != NULL);
+    T_ASSERT(strstr(shader_src, "mix(0.35, 1.0") != NULL);
+}
+
+/* Exercise the shadow descriptor's actual upload ABI and cache across fog enable/disable transitions. */
+TEST(renderer_shader, shadow_fog_uploads_colour_range_and_disable) {
+    spriteProg_t shader = {0};
+    reset_shader(); R_LoadShader(&sd_shadow_splat, NULL, &shader); R_ApplyShader(&shader);
+    memset(&upload, 0, sizeof(upload));
+    shader.state.fogEnable = true;
+    R_ApplyShader(&shader); T_EQ(upload.calls, 1); T_EQ(upload.integer, 1);
+    shader.state.fogColor = (vec3_t){0.2f, 0.3f, 0.4f};
+    R_ApplyShader(&shader); T_EQ(upload.calls, 2); T_EQ(upload.width, 3);
+    T_FEQ(upload.data[0], 0.2f, 0.0001f); T_FEQ(upload.data[2], 0.4f, 0.0001f);
+    shader.state.fogParams = (vec2_t){800, 3500};
+    R_ApplyShader(&shader); T_EQ(upload.calls, 3); T_EQ(upload.width, 2);
+    T_EQ(upload.data[0], 800); T_EQ(upload.data[1], 3500);
+    R_ApplyShader(&shader); T_EQ(upload.calls, 3);
+    shader.state.fogEnable = false;
+    R_ApplyShader(&shader); T_EQ(upload.calls, 4); T_EQ(upload.integer, 0);
+    R_DeleteShader(&shader.prog);
+}
+
+TEST(renderer_shader, model_cache_checks_compile_and_link_once) {
+    reset_shader();
+    modelProg_t *shader = R_ModelShader();
+    T_NOT_NULL(shader); T_ASSERT(R_ModelShader() == shader);
+    T_EQ(shader_test.creates, 2); T_EQ(shader_test.links, 1); T_EQ(shader_test.deleted, 2);
+    T_EQ(shader_test.exitcode, 0); T_EQ(shader_test.logs, 0);
+    R_ShutdownModelShader();
+}
+
+TEST(renderer_shader, instanced_cache_initializes_full_identity_palette_once) {
+    reset_shader();
+    modelProg_t *shader = R_ModelShaderInstanced();
+    T_NOT_NULL(shader); T_ASSERT(R_ModelShaderInstanced() == shader);
+    T_EQ(shader_test.creates, 2); T_EQ(shader_test.links, 1); T_EQ(shader_test.uploads, 0);
+    FOR_LOOP(i, BZ_BONE_PALETTE_MAX) FOR_LOOP(j, 16) T_EQ(shader->state.bones[i].v[j], j % 5 == 0 ? 1.0f : 0.0f);
+    T_EQ(shader_test.deleted, 2); T_EQ(shader_test.exitcode, 0);
+    R_ShutdownModelShader();
+}
+
+/* A rejected stage must terminate before binding or caching an invalid/unskinned program. */
+TEST(renderer_shader, failed_compile_or_link_never_returns_a_model_fallback) {
+    static const GLenum stages[] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_LINK_STATUS };
+    FOR_LOOP(i, sizeof(stages) / sizeof(stages[0])) {
+        reset_shader(); shader_test.fail = stages[i];
+        if (!setjmp(shader_exit)) {
+            R_ModelShader(); T_ASSERT(false);
+        }
+        T_EQ(shader_test.exitcode, EXIT_FAILURE); T_EQ(shader_test.uses, 0);
+        T_EQ(shader_test.links, stages[i] == GL_LINK_STATUS ? 1 : 0);
+        T_EQ(shader_test.logs, 1); T_ASSERT(!model_shader_loaded);
+        free(shader_test.memory);
+    }
+}
+
+TEST(renderer_shader, instanced_link_failure_is_fatal_without_palette_upload) {
+    reset_shader(); shader_test.fail = GL_LINK_STATUS;
+    if (!setjmp(shader_exit)) {
+        R_ModelShaderInstanced(); T_ASSERT(false);
+    }
+    T_EQ(shader_test.exitcode, EXIT_FAILURE); T_EQ(shader_test.uses, 0); T_EQ(shader_test.uploads, 0);
+    T_ASSERT(!instanced_shader_loaded); free(shader_test.memory);
+}
+
+TEST(renderer_shader, failures_remain_fatal_without_a_driver_log_buffer) {
+    FOR_LOOP(i, 2) {
+        reset_shader(); shader_test.fail = GL_LINK_STATUS;
+        shader_test.logsize = i ? 64 : 0; shader_test.noalloc = i;
+        if (!setjmp(shader_exit)) {
+            R_ModelShader(); T_ASSERT(false);
+        }
+        T_EQ(shader_test.exitcode, EXIT_FAILURE); T_EQ(shader_test.logs, 0); T_EQ(shader_test.uses, 0);
+        free(shader_test.memory);
+    }
+}
+
+TEST(renderer_texture, red_blue_swap_preserves_other_channels) {
+    uint8_t rgba[] = { 1, 2, 3, 4, 5, 6, 7, 8 }, rgb[] = { 9, 10, 11 };
+    R_SwapRedBlue(rgba, 2, 4); R_SwapRedBlue(rgb, 1, 3);
+    T_EQ(rgba[0], (uint8_t)3); T_EQ(rgba[1], (uint8_t)2); T_EQ(rgba[2], (uint8_t)1); T_EQ(rgba[3], (uint8_t)4);
+    T_EQ(rgba[4], (uint8_t)7); T_EQ(rgba[7], (uint8_t)8);
+    T_EQ(rgb[0], (uint8_t)11); T_EQ(rgb[1], (uint8_t)10); T_EQ(rgb[2], (uint8_t)9);
+}
+
+TEST(renderer_texture, rgba_upload_preserves_red_blue_and_alpha) {
+    texture_t tex = { .texid = 99 };
+    color32_t pixel = { 241, 37, 9, 123 };
+    upload_count = 0;
+    R_LoadTextureMipLevel(&tex, &(texMip_t){ &pixel, 0, 1, 0, PIXEL_RGBA }); T_EQ(upload_count, 0);
+    R_LoadTextureMipLevel(&tex, &(texMip_t){ &pixel, 1, 1, 0, PIXEL_RGBA });
+    T_EQ(upload_count, 1); T_EQ(upload_format, GL_RGBA);
+    T_ASSERT(tex.has_first_pixel); T_ASSERT(!memcmp(&tex.first_pixel, &pixel, sizeof(pixel)));
+    color32_t other = {9, 7, 5, 3};
+    R_LoadTextureMipLevel(&tex, &(texMip_t){ &other, 1, 1, 1, PIXEL_BGRA });
+    T_ASSERT(!memcmp(&tex.first_pixel, &pixel, sizeof(pixel)));
+    R_LoadTextureMipLevel(&tex, &(texMip_t){ &pixel, 1, 1, 0, PIXEL_RGBA });
+    T_EQ(upload_pixel.r, 241); T_EQ(upload_pixel.g, 37); T_EQ(upload_pixel.b, 9); T_EQ(upload_pixel.a, 123);
+}
+
+/* Emulate the advertised API, not the host OS; check byte order, ownership and the EXT/APPLE format pairs. */
+TEST(renderer_texture, source_format_and_context_select_upload_without_redundant_copies) {
+    static const struct { cstring_t version, extension; GLenum internal; } cases[] = {
+        { "3.1", "", GL_RGBA },
+        { "OpenGL ES 3.0", "GL_EXT_texture_format_BGRA8888", BZ_GL_BGRA },
+        { "OpenGL ES 3.0", "GL_APPLE_texture_format_BGRA8888", GL_RGBA },
+        { "OpenGL ES 3.0", "", 0 },
+    };
+    texture_t tex = { .texid = 99 };
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        test_version = cases[i].version; test_extension = cases[i].extension;
+        R_InitTextureFormats();
+        T_EQ(r_bgra_internal, cases[i].internal);
+        uint32_t queries = ext_count;
+        FOR_LOOP(src, 2) {
+            color32_t pixel = src == PIXEL_BGRA ? (color32_t){9, 37, 241, 123} : (color32_t){241, 37, 9, 123};
+            color32_t saved = pixel;
+            bool convert = src == PIXEL_BGRA && !cases[i].internal;
+            alloc_count = free_count = 0;
+            R_LoadTextureMipLevel(&tex, &(texMip_t){ &pixel, 1, 1, 0, src });
+            T_ASSERT(tex.has_first_pixel); T_EQ(tex.first_pixel.r, 241); T_EQ(tex.first_pixel.g, 37);
+            T_EQ(tex.first_pixel.b, 9); T_EQ(tex.first_pixel.a, 123);
+            T_EQ(upload_format, src == PIXEL_BGRA && !convert ? BZ_GL_BGRA : GL_RGBA);
+            T_EQ(upload_internal, src == PIXEL_BGRA && !convert ? cases[i].internal : GL_RGBA);
+            T_EQ(upload_pixel.r, src == PIXEL_BGRA && !convert ? 9 : 241);
+            T_EQ(upload_pixel.b, src == PIXEL_BGRA && !convert ? 241 : 9);
+            T_EQ(upload_pixel.g, 37); T_EQ(upload_pixel.a, 123);
+            T_EQ(alloc_count, convert ? 1 : 0); T_EQ(free_count, alloc_count);
+            T_ASSERT(!memcmp(&pixel, &saved, sizeof(pixel)));
+            if (!convert) T_ASSERT(upload_data == &pixel);
+            T_EQ(ext_count, queries);
+        }
+        alloc_count = 0;
+        R_LoadTextureMipLevel(&tex, &(texMip_t){ NULL, 1, 1, 0, PIXEL_BGRA });
+        T_NULL(upload_data); T_EQ(alloc_count, 0); T_ASSERT(!tex.has_first_pixel);
+    }
+}
+
+TEST(renderer_texture, blp1_palette_upload_is_rgba) {
+    struct { struct tBLP1Header hdr; color32_t pal[256]; uint8_t index; } file = {0};
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    r_bgra_internal = 0;
+    file.hdr.magic = ID_BLP1; file.hdr.type = 1; file.hdr.width = file.hdr.height = 1;
+    file.hdr.offsets[0] = offsetof(__typeof__(file), index); file.hdr.lengths[0] = 1;
+    file.pal[0] = (color32_t){9, 37, 241, 0};
+    test_free(R_LoadTextureBLP1(&file, sizeof(file)));
+    T_EQ(upload_format, GL_RGBA);
+    T_EQ(upload_pixel.r, 241); T_EQ(upload_pixel.g, 37); T_EQ(upload_pixel.b, 9); T_EQ(upload_pixel.a, 255);
+}
+
+TEST(renderer_texture, blp2_raw_palette_and_dxt_upload_are_rgba) {
+    struct { struct tBLP2Header hdr; uint8_t data[16]; } file = {0};
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    r_bgra_internal = 0;
+    file.hdr.magic = ID_BLP2; file.hdr.type = 1; file.hdr.width = file.hdr.height = 1;
+    file.hdr.offsets[0] = offsetof(__typeof__(file), data); file.hdr.lengths[0] = 4;
+    file.hdr.encoding = 3; file.hdr.alphaDepth = 8;
+    memcpy(file.data, (uint8_t[]){9, 37, 241, 123}, 4);
+    test_free(R_LoadTextureBLP2(&file, sizeof(file)));
+    T_EQ(upload_format, GL_RGBA);
+    T_EQ(upload_pixel.r, 241); T_EQ(upload_pixel.b, 9); T_EQ(upload_pixel.a, 123);
+    file.hdr.encoding = 1; file.hdr.alphaDepth = 0;
+    file.hdr.palette[0] = (color32_t){9, 37, 241, 0}; file.data[0] = 0;
+    test_free(R_LoadTextureBLP2(&file, sizeof(file)));
+    T_EQ(upload_pixel.r, 241); T_EQ(upload_pixel.b, 9); T_EQ(upload_pixel.a, 255);
+    file.hdr.encoding = 2; file.hdr.width = file.hdr.height = 4; file.hdr.lengths[0] = 8;
+    memcpy(file.data, (uint8_t[]){0, 248, 31, 0, 0, 0, 0, 0}, 8);
+    test_free(R_LoadTextureBLP2(&file, sizeof(file)));
+    T_EQ(upload_pixel.r, 255); T_EQ(upload_pixel.g, 0); T_EQ(upload_pixel.b, 0); T_EQ(upload_pixel.a, 255);
+}
+
+TEST(renderer_texture, pcx_palette_upload_is_rgba) {
+    uint8_t file[128 + 1 + 769] = {0};
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    file[0] = 10; file[2] = 1; file[3] = 8; file[65] = 1; file[66] = 1;
+    file[129] = 12; file[130] = 241; file[131] = 37; file[132] = 9;
+    test_free(R_LoadTexturePCX(file, sizeof(file)));
+    T_EQ(upload_format, GL_RGBA);
+    T_EQ(upload_pixel.r, 241); T_EQ(upload_pixel.g, 37); T_EQ(upload_pixel.b, 9); T_EQ(upload_pixel.a, 255);
+}
+
+TEST(renderer_texture, dds_channel_masks_use_the_common_upload_capabilities) {
+    /* DDS header: 124 bytes after magic, 32-bit RGB+alpha, one 1x1 mip. */
+    uint32_t file[33] = { [0] = MAKEFOURCC('D','D','S',' '), [1] = 124, [3] = 1, [4] = 1, [7] = 1,
+        [19] = 32, [20] = 0x41, [22] = 32, [24] = 0xff00, [26] = 0xff000000 };
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    FOR_LOOP(bgra, 2) {
+        file[23] = bgra ? 0xff0000 : 0xff; file[25] = bgra ? 0xff : 0xff0000;
+        color32_t pixel = bgra ? (color32_t){9, 37, 241, 123} : (color32_t){241, 37, 9, 123};
+        memcpy(file + 32, &pixel, sizeof(pixel));
+        FOR_LOOP(support, 2) {
+            r_bgra_internal = support ? GL_RGBA : 0;
+            test_free(R_LoadTextureDDS(file, sizeof(file)));
+            T_EQ(upload_format, bgra && support ? BZ_GL_BGRA : GL_RGBA);
+            T_EQ(upload_pixel.r, bgra && support ? 9 : 241);
+            T_EQ(upload_pixel.b, bgra && support ? 241 : 9);
+            T_EQ(upload_pixel.a, 123);
+        }
+    }
+}
+
+TEST(renderer_stats, triangles_include_instanced_amplification) {
+    T_EQ(R_PrimitiveTriangles(GL_TRIANGLES, 12, 100), (uint64_t)400);
+    T_EQ(R_PrimitiveTriangles(GL_LINES, 12, 100), (uint64_t)0);
+}
+
+/* File lookup probes the exact reference first and only substitutes the supported BLP representation. */
+static cstring_t texture_file;
+static uint32_t texture_reads;
+static int test_texture_read(cstring_t name, void **buffer) {
+    texture_reads++;
+    *buffer = !strcmp(name, texture_file) ? (void *)&texture_reads : NULL;
+    return *buffer ? sizeof(texture_reads) : -1;
+}
+
+TEST(renderer_texture, authored_extensions_resolve_without_losing_real_files) {
+    static const struct { cstring_t name, file; uint32_t reads; bool found; } cases[] = {
+        { "White_mask.tga", "White_mask.blp", 2, true },
+        { "Cliff0.TGA", "Cliff0.blp", 2, true },
+        { "Cliff0.tga", "Cliff0.tga", 1, true },
+        { "Tree", "Tree.blp", 2, true },
+        { "Tree.blp", "Tree.blp", 1, true },
+        { "Missing.tga", "", 2, false },
+        { "Missing.blp", "", 1, false },
+        { "Missing.dds", "", 1, false },
+        { "Missing.pcx", "", 1, false },
+        { "Missing", "", 2, false },
+    };
+    int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+    ri.FS_ReadFile = test_texture_read;
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        PATHSTR path; void *buffer = NULL;
+        texture_file = cases[i].file; texture_reads = 0;
+        T_EQ(R_ReadTextureFile(cases[i].name, path, &buffer) >= 0, cases[i].found);
+        T_EQ(texture_reads, cases[i].reads);
+        if (cases[i].found) { T_NOT_NULL(buffer); T_STREQ(path, cases[i].file); }
+        else T_NULL(buffer);
+    }
+    ri.FS_ReadFile = read_file;
+}
+
+TEST(renderer_terrain, cliff_ramps_require_adjacent_corners_one_level_apart) {
+    static const uint8_t edge[][2] = { {0,1}, {1,3}, {3,2}, {2,0} };
+    war3mapVertex_t tile[4] = {0};
+    T_ASSERT(!R_IsCliffRamp(tile));
+    FOR_LOOP(i, 4) {
+        memset(tile, 0, sizeof(tile));
+        tile[edge[i][0]].ramp = tile[edge[i][1]].ramp = 1;
+        tile[edge[i][0]].level = tile[edge[i][1]].level = 1;
+        T_ASSERT(!R_IsCliffRamp(tile)); /* Human01 HABH had two high corners, not a ramp slope. */
+        tile[edge[i][0]].level = 0;
+        T_ASSERT(R_IsCliffRamp(tile));
+        tile[edge[i][1]].level = 2;
+        T_ASSERT(!R_IsCliffRamp(tile)); /* Native transitions contain LH/HX, never LX. */
+        tile[edge[i][0]].level = 1;
+        T_ASSERT(R_IsCliffRamp(tile));
+        tile[edge[i][0]].level = 2; tile[edge[i][1]].level = 1;
+        T_ASSERT(R_IsCliffRamp(tile));
+    }
+    memset(tile, 0, sizeof(tile));
+    tile[0].ramp = 1; tile[0].level = 1;
+    T_ASSERT(!R_IsCliffRamp(tile));
+    tile[3].ramp = 1;
+    T_ASSERT(!R_IsCliffRamp(tile)); /* Diagonals are not transition edges. */
+    tile[1].ramp = 1;
+    T_ASSERT(!R_IsCliffRamp(tile));
+    tile[2].ramp = 1;
+    T_ASSERT(!R_IsCliffRamp(tile));
+}
+
+TEST(renderer_terrain, cliff_texture_skips_non_cliff_corners) {
+    static const struct { uint8_t cliff[4]; uint32_t want; } cases[] = {
+        { .cliff = {1,15,15,15}, .want = 1 }, /* Human02Interlude (10,29), AACA. */
+        { .cliff = {1,1,1,15}, .want = 1 }, /* Human02Interlude (65,35), ABBA. */
+        { .cliff = {0,1,0,1}, .want = 1 }, /* SW wins over other authored indices. */
+        { .cliff = {0,1,0,15}, .want = 0 }, /* Then SE; zero is a valid texture. */
+        { .cliff = {0,1,15,15}, .want = 1 }, /* Then NW. */
+        { .cliff = {1,15,15,15}, .want = 1 }, /* Then NE. */
+        { .cliff = {15,15,15,15}, .want = 0 }, /* No nearby explicit type: retail's error default. */
+    };
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        war3mapVertex_t verts[4] = {0};
+        war3map_t map = { .width = 2, .height = 2, .vertices = verts };
+        FOR_LOOP(j, 4) verts[3-j].cliff = cases[i].cliff[j];
+        T_EQ(R_CliffTexture(&map, 0, 0), cases[i].want);
+    }
+}
+
+TEST(renderer_terrain, cliff_texture_searches_retail_neighbourhood) {
+    war3mapVertex_t verts[49];
+    war3map_t map = { .width = 7, .height = 7, .vertices = verts };
+    FOR_LOOP(i, 49) verts[i] = (war3mapVertex_t){ .cliff = 15 };
+    /* X-major, not nearest-distance or row-major; include the full radius of two. */
+    verts[1+5*7].cliff = 2; verts[2+1*7].cliff = 1;
+    T_EQ(R_CliffTexture(&map, 3, 3), 2);
+    verts[1+5*7].cliff = 15;
+    T_EQ(R_CliffTexture(&map, 3, 3), 1);
+    verts[2+1*7].cliff = 15; verts[0+3*7].cliff = 2;
+    T_EQ(R_CliffTexture(&map, 3, 3), 0); /* Outside the search radius. */
+    verts[2+2*7].cliff = 1;
+    T_EQ(R_CliffTexture(&map, 0, 0), 1); /* Lower map edge: no unsigned underflow. */
+    verts[4+4*7].cliff = 2;
+    T_EQ(R_CliffTexture(&map, 5, 5), 2); /* Upper map edge: no out-of-bounds read. */
+    verts[5+5*7].cliff = 1;
+    T_EQ(R_CliffTexture(&map, 5, 5), 1); /* Own corners take priority over neighbours. */
+}
+
+TEST(renderer_terrain, undead04_waygate_cliff_type_from_native_corners) {
+    /* W3E byte 6 at x=91..95, y=52..56. Cell (93,54) has four 15s, but (92,56) names CLgr. */
+    static const uint8_t packed[25] = {
+        0xf6, 0xf6, 0xf6, 0xf6, 0xf6,
+        0xf6, 0xf6, 0x06, 0xf6, 0x06,
+        0xf4, 0xf6, 0xf6, 0xf6, 0xf6,
+        0xf4, 0xf4, 0xf4, 0xf4, 0xf6,
+        0xf4, 0x04, 0xf4, 0xf4, 0xf4,
+    };
+    war3mapVertex_t verts[25];
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    FOR_LOOP(i, 25) verts[i] = (war3mapVertex_t){ .cliff = packed[i] >> 4, .level = packed[i] & 15 };
+    T_EQ(R_CliffTexture(&map, 2, 2), 0);
+    verts[1+4*5].cliff = 1;
+    T_EQ(R_CliffTexture(&map, 2, 2), 1); /* Selection follows the data, not grass or ground index. */
+    T_EQ(verts[2+2*5].cliff, 15); /* Resolution must not rewrite authored corner indices. */
+}
+
+/* Exercise the terrain/cliff bakers with real height normals, mocking asset lookup and draw submission. */
+void R_DrawBuffer(buffer_t const *buffer, uint32_t count) {}
+line3_t R_LineForScreenPoint(viewDef_t const *view, float x, float y) { return (line3_t){0}; }
+texture_t const *R_BlightTexture(void) { return texture_load_result; }
+w3TerrainArt_t const *R_TerrainArt(uint32_t id) { (void)id; return NULL; }
+void R_BuildCameraHeightMap(cameraHeightBuild_t const *build) { (void)build; }
+void R_FreeCameraHeightMap(cameraHeightMap_t *map) { (void)map; }
+void R_ShutdownFogOfWar(void) {}
+void R_InitFogOfWar(uint32_t width, uint32_t height) { (void)width; (void)height; }
+/* The real water builder: it returns no layer until a test installs a water style. */
+#include "games/warcraft-3/renderer/w3m/r_war3map_water.c"
+static struct { uint32_t enables, disables, offsets; float factor, units; } splat_bias;
+static void test_splat_enable(GLenum cap) { if (cap == GL_POLYGON_OFFSET_FILL) splat_bias.enables++; }
+static void test_splat_disable(GLenum cap) { if (cap == GL_POLYGON_OFFSET_FILL) splat_bias.disables++; }
+static void test_splat_polygon_offset(GLfloat factor, GLfloat units) {
+    splat_bias.offsets++; splat_bias.factor = factor; splat_bias.units = units;
+}
+#define glEnable test_splat_enable
+#define glDisable test_splat_disable
+#define glPolygonOffset test_splat_polygon_offset
+static struct { uint32_t calls, first, count; float z; } ground_update;
+static void test_ground_update(buffer_t const *buffer, uint32_t first, vertex_t const *vertices, uint32_t count) {
+    (void)buffer;
+    ground_update.calls++; ground_update.first = first; ground_update.count = count;
+    ground_update.z = vertices[0].position.z;
+}
+#define R_RenderRectSplatUV R_TestProductionRenderRectSplatUV
+#define R_RenderFlatRectSplat R_TestProductionRenderFlatRectSplat
+#define R_RenderSplat R_TestProductionRenderSplat
+#define R_UpdateVertexArrayObject test_ground_update
+#define WC3_TERRAIN_NORMAL_TESTS
+#include "games/warcraft-3/renderer/w3m/r_war3map_ground.c"
+#undef WC3_TERRAIN_NORMAL_TESTS
+#undef R_UpdateVertexArrayObject
+#undef glEnable
+#undef glDisable
+#undef glPolygonOffset
+#undef R_RenderRectSplatUV
+#undef R_RenderFlatRectSplat
+#undef R_RenderSplat
+#define _W3M_ClearMap R_TestClearMap
+#define _W3M_RegisterMap R_TestUnusedRegisterMap
+#include "games/warcraft-3/renderer/w3m/r_war3map.c"
+#undef _W3M_ClearMap
+#undef _W3M_RegisterMap
+void _W3M_RegisterMap(char const *map) { (void)map; }
+
+/* Load binary W3E through the production parser, including its computed midpoint pass. */
+static war3map_t *test_ramp_map(cstring_t path) {
+    handle_t archive, nested;
+    void *data = NULL;
+    uint32_t size = 0;
+    war3map_t *map;
+    T_ASSERT(SFileOpenArchive("build/tests/tests.mpq", 0, 0, &archive));
+    T_ASSERT(test_mpq_read(archive, path, &data, &size));
+    T_ASSERT(SFileOpenArchiveFromMemory(data, size, 0, &nested));
+    map = FileReadWar3Map(nested);
+    SFileCloseArchive(nested); SFileCloseArchive(archive); free(data);
+    return map;
+}
+
+TEST(renderer_terrain, nightelfx04_restored_ground_has_no_raised_high_ramp_corner) {
+    texture_t tex = { .width = 256, .height = 256 };
+    static const struct { int cellx, highx, highy, lowx, lowy; float highz; } cases[] = {
+        {2, 2,3, 1,3, 772}, /* Original (55,43), raw height 8723, level 7. */
+        {8, 9,2, 9,1, 673}, /* Original (61,34), raw height 8324, level 7. */
+    };
+    reset_registry(); ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    war3map_t *map = test_ramp_map("Maps/FrozenThrone/Campaign/NightElfX04.w3x");
+    tr.world = map;
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        T_EQ(GetWar3MapVertex(map, cases[i].highx, cases[i].highy)->cliffVariation, 0);
+        T_EQ(GetWar3MapVertex(map, cases[i].lowx, cases[i].lowy)->cliffVariation, 1);
+        T_FEQ(R_GetVertexPosition(map, cases[i].highx, cases[i].highy, true).z, cases[i].highz, 0.001f);
+        ground_current_vertex = ground_vertex_buffer;
+        R_MakeTile(map, cases[i].cellx, 2, 0, &tex);
+        T_EQ(ground_current_vertex - ground_vertex_buffer, 6);
+        T_ASSERT(R_TileAcceptsSplat(map, cases[i].cellx, 2));
+    }
+    ground_current_vertex = NULL; tr.world = NULL; R_FreeWar3Map(map);
+}
+
+/* Historical midpoint markers reproduce #615 ground ownership independently of the corrected #642 loader.
+ * NightElfX04 (55,42)'s neighbouring LHBA mesh extends west, not east. */
+TEST(renderer_terrain, nightelfx04_uncovered_ramp_corner_keeps_ground_and_splats) {
+    war3mapVertex_t verts[16] = {0};
+    war3map_t map = { .width = 4, .height = 4, .vertices = verts };
+    texture_t tex = { .width = 256, .height = 256 };
+    static const uint16_t heights[] = { 8377,8439,8428,8391, 8479,8559,8568,8527,
+                                       8582,8723,8653,8605, 8683,8719,8670,8598 };
+    static const uint8_t levels[] = { 6,7,7,7, 6,7,7,7, 6,7,7,7, 6,6,6,6 };
+    static const uint8_t mids[] = { 0,0,0,0, 0,0,0,0, 1,1,0,0, 0,1,1,1 };
+    FOR_LOOP(i, 16) verts[i] = (war3mapVertex_t){ .accurate_height = heights[i], .level = levels[i],
+                                                .ramp = i >= 8, .cliffVariation = mids[i] };
+    ground_current_vertex = ground_vertex_buffer;
+    R_MakeTile(&map, 1, 1, 0, &tex);
+    T_EQ(ground_current_vertex - ground_vertex_buffer, 6);
+    T_ASSERT(R_TileAcceptsSplat(&map, 1, 1));
+    /* The other reported hole, (60,34), touches a BALH transition extending east into (62,34). */
+    static const uint16_t height2[] = { 8410,8406,8380,8315, 8385,8366,8324,8249,
+                                       8356,8330,8281,8214, 8319,8289,8249,8200 };
+    static const uint8_t level2[] = { 6,6,6,6, 7,7,7,6, 7,7,7,6, 7,7,7,6 };
+    static const uint8_t mid2[] = { 1,1,1,0, 0,0,1,1, 0,0,0,0, 0,0,0,0 };
+    FOR_LOOP(i, 16) verts[i] = (war3mapVertex_t){ .accurate_height = height2[i], .level = level2[i],
+                                                .ramp = i < 8, .cliffVariation = mid2[i] };
+    ground_current_vertex = ground_vertex_buffer;
+    R_MakeTile(&map, 1, 1, 0, &tex);
+    T_EQ(ground_current_vertex - ground_vertex_buffer, 6);
+    T_ASSERT(R_TileAcceptsSplat(&map, 1, 1));
+    /* The actual low cell west of the transition must still belong to its mesh. */
+    FOR_LOOP(i, 16) verts[i] = (war3mapVertex_t){ .accurate_height = 8196, .level = 7 };
+    verts[0+2*4].ramp = verts[1+2*4].ramp = verts[2+2*4].ramp = 1;
+    verts[1+2*4].cliffVariation = 1;
+    verts[2+1*4].level = verts[2+2*4].level = 8;
+    ground_current_vertex = ground_vertex_buffer;
+    R_MakeTile(&map, 0, 1, 0, &tex);
+    T_EQ(ground_current_vertex - ground_vertex_buffer, 0);
+    T_ASSERT(!R_TileAcceptsSplat(&map, 0, 1));
+    ground_current_vertex = NULL;
+}
+
+TEST(renderer_terrain, null_segment_layer_does_not_drop_existing_layers) {
+    maplayer_t first = {0};
+    mapsegment_t segment = { .layers = &first };
+    R_AddMapSegmentLayer(&segment, NULL);
+    T_ASSERT(segment.layers == &first);
+    R_AddMapSegmentLayer(&segment, &(maplayer_t){0});
+    T_ASSERT(segment.layers != &first);
+    T_ASSERT(segment.layers->next == &first);
+}
+
+/* The ground stays one whole-map buffer per layer; a changed segment overwrites exactly its own slice. */
+TEST(renderer_terrain, ground_batch_rebakes_one_segment_slice_in_place) {
+    enum { W = 2 * SEGMENT_SIZE + 1, H = SEGMENT_SIZE + 1, SLICE = SEGMENT_SIZE * SEGMENT_SIZE * 6 };
+    static war3mapVertex_t verts[W * H];
+    war3map_t map = { .width = W, .height = H, .vertices = verts };
+    texture_t texture = { .width = 256, .height = 256 };
+    maplayer_t *layer;
+    float flat_z;
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    memset(verts, 0, sizeof(verts));
+    R_ResetGroundTextures();
+    g_groundTextures[0] = &texture;
+    layer = R_BuildGroundLayerGlobal(&map, 0);
+    T_NOT_NULL(layer);
+    T_EQ(layer->num_vertices, 2 * SLICE);
+    T_EQ(g_groundBatches[0].first[0], 0);
+    T_EQ(g_groundBatches[0].first[1], SLICE);
+    T_EQ(g_groundBatches[0].first[2], 2 * SLICE);
+
+    memset(&ground_update, 0, sizeof(ground_update));
+    R_UpdateGroundSegment(&map, 1, 0);
+    flat_z = ground_update.z;
+    T_EQ(ground_update.calls, 1);
+    T_EQ(ground_update.first, SLICE);
+    T_EQ(ground_update.count, SLICE);
+
+    /* Moving a corner height (what a deformation does) changes the baked height but not the slice size. */
+    verts[SEGMENT_SIZE].accurate_height += 2000;
+    R_UpdateGroundSegment(&map, 1, 0);
+    T_EQ(ground_update.calls, 2);
+    T_EQ(ground_update.count, SLICE);
+    T_ASSERT(ground_update.z > flat_z + 1.0f);
+
+    R_ReleaseVertexArrayObject((buffer_t *)layer->buffer);
+    test_free(layer);
+    R_ResetGroundTextures();
+}
+
+TEST(renderer_terrain, terrain_normal_cache_hits_and_invalidates_between_bakes) {
+    war3mapVertex_t verts[25] = {0};
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    war3map_t const *saved_world = tr.world;
+    vec3_t first, repeated, updated;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    FOR_LOOP(i, 25) verts[i].accurate_height = 8192;
+    tr.world = &map;
+    terrain_normal_cache_hits = terrain_normal_cache_misses = 0;
+    R_BeginTerrainNormalCache(&map);
+    first = R_GetVertexNormal(&map, 2, 2);
+    repeated = R_GetVertexNormal(&map, 2, 2);
+    T_FEQ(first.x, repeated.x, 0.0f);
+    T_FEQ(first.y, repeated.y, 0.0f);
+    T_FEQ(first.z, repeated.z, 0.0f);
+    T_EQ(terrain_normal_cache_misses, 1);
+    T_EQ(terrain_normal_cache_hits, 1);
+
+    R_EndTerrainNormalCache();
+    verts[1 + 2 * 5].accurate_height += 1024;
+    R_BeginTerrainNormalCache(&map);
+    updated = R_GetVertexNormal(&map, 2, 2);
+    T_ASSERT(first.x != updated.x || first.y != updated.y || first.z != updated.z);
+    T_EQ(terrain_normal_cache_misses, 2);
+    T_EQ(terrain_normal_cache_hits, 1);
+    R_EndTerrainNormalCache();
+    R_ResetTerrainNormalCache();
+    tr.world = saved_world;
+}
+
+TEST(renderer_terrain, deformation_updates_and_expires_height_offsets) {
+    war3map_t map = { .width = SEGMENT_SIZE + 1, .height = SEGMENT_SIZE + 1 };
+    war3map_t const *saved_world = tr.world;
+    viewDef_t saved_view = tr.viewDef;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    tr.world = &map;
+    R_W3SetMapTerrainOffsets(&map);
+    tr.viewDef.time = 100;
+    terrainDeform_t deform = { .id = 77, .type = TERRAIN_DEFORM_CRATER,
+        .crater = { .origin = { 16 * TILE_SIZE, 16 * TILE_SIZE }, .radius = 96, .depth = 30 }, .duration_ms = 1000 };
+    R_W3StartTerrainDeformation(&deform);
+    tr.viewDef.time = 600;
+    R_W3UpdateTerrainDeformations();
+    T_ASSERT(R_W3TerrainOffsetAtPoint(16 * TILE_SIZE, 16 * TILE_SIZE) < -20.0f);
+    tr.viewDef.time = 1200;
+    R_W3UpdateTerrainDeformations();
+    T_FEQ(R_W3TerrainOffsetAtPoint(16 * TILE_SIZE, 16 * TILE_SIZE), 0.0f, 0.001f);
+    R_W3ClearTerrainDeformations();
+    tr.world = saved_world; tr.viewDef = saved_view;
+}
+
+/* Blight is baked on terrain heights, so a deformation rebuild must force a rebake. */
+TEST(renderer_terrain, deformation_rebuild_rebakes_blight_layer) {
+    static war3mapVertex_t verts[(SEGMENT_SIZE + 1) * (SEGMENT_SIZE + 1)];
+    war3map_t map = { .width = SEGMENT_SIZE + 1, .height = SEGMENT_SIZE + 1, .vertices = verts };
+    war3map_t const *saved_world = tr.world;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    memset(verts, 0, sizeof(verts));
+    tr.world = &map;
+    R_W3SetMapTerrainOffsets(&map);
+    R_LoadMapSegments(&map);
+    T_NOT_NULL(g_mapSegments);
+
+    blight_layer_generation = 7;
+    R_W3EmitChangedTerrain();
+    T_EQ(blight_layer_generation, 7);
+    w3_terrain_dirty_segments[0] = 1;
+    R_W3EmitChangedTerrain();
+    T_EQ(blight_layer_generation, ~0u);
+    T_EQ(w3_terrain_dirty_segments[0], 0);
+
+    R_FreeMapSegments();
+    R_W3ClearTerrainDeformations();
+    tr.world = saved_world;
+}
+
+/* Water is drawn per segment and culled by the segment box, so a seabed-only box
+ * dropped deep-water segments at the edge of a zoomed-out view (bare seabed). */
+TEST(renderer_terrain, segment_bounds_cover_the_water_surface) {
+    static war3mapVertex_t verts[(SEGMENT_SIZE + 1) * (SEGMENT_SIZE + 1)];
+    war3map_t map = { .width = SEGMENT_SIZE + 1, .height = SEGMENT_SIZE + 1, .vertices = verts };
+    war3map_t const *saved_world = tr.world;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    memset(verts, 0, sizeof(verts));
+    FOR_LOOP(i, (SEGMENT_SIZE + 1) * (SEGMENT_SIZE + 1)) {
+        verts[i].accurate_height = 4096;
+        verts[i].waterlevel = 8192;
+        verts[i].water = 1;
+    }
+    float surface = GetWar3MapVertexWaterLevel(&verts[0]);
+    T_ASSERT(surface > GetWar3MapVertexHeight(&verts[0]) + 100.0f);
+    tr.world = &map;
+    R_W3SetMapTerrainOffsets(&map);
+    R_LoadMapSegments(&map);
+    T_NOT_NULL(g_mapSegments);
+    T_ASSERT(g_mapSegments->bbox.max.z >= surface);
+
+    w3_terrain_dirty_segments[0] = 1;
+    R_W3EmitChangedTerrain();
+    T_ASSERT(g_mapSegments->bbox.max.z >= surface);
+
+    R_FreeMapSegments();
+    R_W3ClearTerrainDeformations();
+    tr.world = saved_world;
+}
+
+/* Maps need not be a whole number of 32-tile segments (Island Command is 156 tiles): the last
+ * segment of each row and column is partial, and every edge tile still gets water, its share of
+ * the culling box and terrain deformation. */
+TEST(renderer_terrain, partial_last_segments_cover_every_edge_tile) {
+    enum { TILES = 156, SIDE = TILES + 1 };
+    static war3mapVertex_t verts[SIDE * SIDE];
+    war3map_t map = { .width = SIDE, .height = SIDE, .vertices = verts };
+    war3map_t const *saved_world = tr.world;
+    wc3WaterStyle_t *style = (wc3WaterStyle_t *)R_WaterStyle(), saved_style = *style;  /* test-only write */
+    texture_t water = { 0 };
+    uint32_t segments = 0, water_vertices = 0;
+    float max_x = -FLT_MAX, max_y = -FLT_MAX;
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    memset(verts, 0, sizeof(verts));
+    FOR_LOOP(i, SIDE * SIDE) { verts[i].accurate_height = 4096; verts[i].waterlevel = 8192; verts[i].water = 1; }
+    style->frames[0] = &water; style->num_frames = 1;
+    tr.world = &map;
+    R_W3SetMapTerrainOffsets(&map);
+    T_NOT_NULL(w3_terrain_offsets);                                   /* deformation enabled */
+    R_LoadMapSegments(&map);
+    FOR_EACH_LIST(mapsegment_t, segment, g_mapSegments) {
+        segments++;
+        max_x = MAX(max_x, segment->bbox.max.x); max_y = MAX(max_y, segment->bbox.max.y);
+        FOR_EACH_LIST(maplayer_t, layer, segment->layers)
+            if (layer->type == MAPLAYERTYPE_WATER) water_vertices += layer->num_vertices;
+    }
+    T_EQ(segments, 25);                                                /* 5 x 5, last row/column partial */
+    T_EQ(water_vertices, TILES * TILES * 6);                           /* every tile, edges included */
+    T_FEQ(max_x, map.center.x + TILES * TILE_SIZE, 0.01f);
+    T_FEQ(max_y, map.center.y + TILES * TILE_SIZE, 0.01f);
+    R_FreeMapSegments();
+    R_W3ClearTerrainDeformations();
+    *style = saved_style;
+    tr.world = saved_world;
+}
+
+/* A full zoom-out at the playable edge sees past the terrain; an opaque ring of open sea at the
+ * map's water level fills it instead of black void, on maps whose border is water. */
+TEST(renderer_terrain, water_skirt_surrounds_a_sea_bordered_map) {
+    enum { SIDE = 9 };
+    static war3mapVertex_t verts[SIDE * SIDE];
+    war3map_t map = { .width = SIDE, .height = SIDE, .vertices = verts, .center = { -512, -512 } };
+    wc3WaterStyle_t *style = (wc3WaterStyle_t *)R_WaterStyle(), saved_style = *style;  /* test-only write */
+    texture_t water = { 0 };
+    war3map_t const *saved_world = tr.world;
+    maplayer_t *skirt;
+    vertex_t v[WATER_SKIRT_VERTICES];
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    memset(verts, 0, sizeof(verts));
+    style->frames[0] = &water; style->num_frames = 1;
+    tr.world = &map;
+    T_EQ(R_WaterSkirtVertices(&map, v), 0);                            /* dry border: no skirt */
+    T_NULL(R_BuildWaterSkirt(&map));
+    FOR_LOOP(i, SIDE * SIDE) { verts[i].waterlevel = 8192; verts[i].water = 1; }
+    T_EQ(R_WaterSkirtVertices(&map, v), 24);                           /* four trapezoids */
+    skirt = R_BuildWaterSkirt(&map);
+    T_NOT_NULL(skirt);
+    T_EQ(skirt->type, MAPLAYERTYPE_WATER);
+    T_EQ(skirt->num_vertices, 24);
+    float lo = FLT_MAX, hi = -FLT_MAX;
+    FOR_LOOP(i, 24) {
+        lo = MIN(lo, v[i].position.x); hi = MAX(hi, v[i].position.x);
+        T_FEQ(v[i].position.z, GetWar3MapVertexWaterLevel(&verts[0]), 0.01f);
+        T_EQ(v[i].color.a, 255);                                       /* nothing below it to blend with */
+    }
+    T_ASSERT(lo <= -512 - WATER_SKIRT_WIDTH + 1);
+    T_ASSERT(hi >= -512 + 8 * TILE_SIZE + WATER_SKIRT_WIDTH - 1);
+    ri.MemFree(skirt);
+    *style = saved_style;
+    tr.world = saved_world;
+}
+
+/* Ground batches are one buffer per texture, laid out segment by segment; only segments in
+ * view are drawn, as merged runs, and the static tail past the last segment always is. */
+TEST(renderer_terrain, ground_layer_draws_visible_segment_runs) {
+    buffer_t buffer = { .vao = 3, .vbo = 4 };
+    maplayer_t layer = { .buffer = &buffer, .num_vertices = 30 };
+    uint32_t first[] = { 0, 6, 12, 18, 24 };
+    groundBatch_t saved = g_groundBatches[0];
+    uint8_t visible[] = { 1, 1, 0, 1 };
+    g_groundBatches[0] = (groundBatch_t){ .layer = &layer, .first = first };
+
+    memset(&draw_test, 0, sizeof(draw_test));
+    T_EQ(R_DrawGroundLayerSegments(&layer, visible, 4), 2);
+    T_EQ(draw_test.calls, 2); T_EQ(draw_test.first, 18); T_EQ(draw_test.count, 12);
+
+    memset(visible, 0, sizeof(visible));
+    memset(&draw_test, 0, sizeof(draw_test));
+    T_EQ(R_DrawGroundLayerSegments(&layer, visible, 4), 1);
+    T_EQ(draw_test.first, 24); T_EQ(draw_test.count, 6);
+
+    /* Without per-segment visibility (or an unknown layer) the whole batch draws. */
+    memset(&draw_test, 0, sizeof(draw_test));
+    T_EQ(R_DrawGroundLayerSegments(&layer, NULL, 0), 1);
+    T_EQ(draw_test.first, 0); T_EQ(draw_test.count, 30);
+    g_groundBatches[0] = saved;
+}
+
+TEST(renderer_terrain, splat_draw_biases_coplanar_terrain_geometry) {
+    memset(&splat_bias, 0, sizeof(splat_bias));
+    R_SetSplatDepthBias(true);
+    T_EQ(splat_bias.enables, 1); T_EQ(splat_bias.offsets, 1);
+    T_FEQ(splat_bias.factor, -1.0f, 0.0f); T_FEQ(splat_bias.units, -1.0f, 0.0f);
+    R_SetSplatDepthBias(false);
+    T_EQ(splat_bias.disables, 1); T_EQ(splat_bias.offsets, 2);
+    T_FEQ(splat_bias.factor, 0.0f, 0.0f); T_FEQ(splat_bias.units, 0.0f, 0.0f);
+}
+
+TEST(renderer_terrain, splat_rect_stops_at_partial_tile_edge) {
+    war3mapVertex_t verts[4] = {0};
+    war3map_t map = { .width = 2, .height = 2, .vertices = verts };
+    struct { vec2_t mins, maxs; } rects[] = {
+        { { 32, 24 }, { 96, 104 } },
+        { { 32, -1000 }, { 1000, 1000 } },
+        { { -1000, -1000 }, { 96, 1000 } },
+        { { -1000, 24 }, { 1000, 1000 } },
+        { { -1000, -1000 }, { 1000, 104 } },
+    };
+    vec2_t uv_mins = { 0, 0 }, uv_maxs = { 1, 1 };
+    FOR_LOOP(i, 4) verts[i].accurate_height = 8192;
+    FOR_LOOP(i, 5) {
+        vec2_t *mins = &rects[i].mins, *maxs = &rects[i].maxs;
+        ground_current_vertex = ground_vertex_buffer;
+        R_MakeSplatTile(&MAKE(splatTileParams_t, .map = &map, .mins = mins,
+            .uv_mins = &uv_mins, .uv_maxs = &uv_maxs, .width = maxs->x - mins->x,
+            .height = maxs->y - mins->y, .color = COLOR32_WHITE));
+        T_ASSERT(ground_current_vertex > ground_vertex_buffer);
+        if (i) T_EQ(ground_current_vertex - ground_vertex_buffer, 9);
+        for (vertex_t *v = ground_vertex_buffer; v < ground_current_vertex; v++) {
+            T_ASSERT(v->position.x >= mins->x && v->position.x <= maxs->x);
+            T_ASSERT(v->position.y >= mins->y && v->position.y <= maxs->y);
+            T_ASSERT(v->texcoord.x >= 0 && v->texcoord.x <= 1);
+            T_ASSERT(v->texcoord.y >= 0 && v->texcoord.y <= 1);
+        }
+    }
+    ground_current_vertex = NULL;
+}
+
+TEST(renderer_terrain, clipped_splat_follows_both_terrain_triangles) {
+    war3mapVertex_t verts[4] = {0};
+    war3map_t map = { .width = 2, .height = 2, .vertices = verts };
+    vec2_t mins = { 24, 20 }, maxs = { 108, 112 };
+    vec2_t uv_mins = { 0, 0 }, uv_maxs = { 1, 1 };
+    FOR_LOOP(i, 4) verts[i].accurate_height = 8192;
+    verts[1].level = 1; verts[2].level = 2;
+    vec3_t p0 = R_GetVertexPosition(&map, 0, 0, true), p1 = R_GetVertexPosition(&map, 1, 0, true);
+    vec3_t p2 = R_GetVertexPosition(&map, 1, 1, true), p3 = R_GetVertexPosition(&map, 0, 1, true);
+    ground_current_vertex = ground_vertex_buffer;
+    R_MakeSplatTile(&MAKE(splatTileParams_t, .map = &map, .mins = &mins,
+        .uv_mins = &uv_mins, .uv_maxs = &uv_maxs, .width = maxs.x - mins.x,
+        .height = maxs.y - mins.y, .color = COLOR32_WHITE));
+    T_ASSERT(ground_current_vertex > ground_vertex_buffer);
+    T_ASSERT(ground_current_vertex - ground_vertex_buffer <= SPLAT_TILE_MAX_VERTICES);
+    for (vertex_t *v = ground_vertex_buffer; v < ground_current_vertex; v++) {
+        float u = v->position.x / TILE_SIZE, t = v->position.y / TILE_SIZE;
+        float z = u >= t ? p0.z + (u-t)*(p1.z-p0.z) + t*(p2.z-p0.z)
+                         : p0.z + u*(p2.z-p0.z) + (t-u)*(p3.z-p0.z);
+        T_FEQ(v->position.z, z, 0.001f);
+    }
+    ground_current_vertex = NULL;
+}
+
+w3CliffType_t const *R_CliffType(uint32_t id) {
+    /* Undead04's authored order is shared by the ROC and TFT CliffTypes.slk rows. */
+    static w3CliffType_t const rows[] = {
+        { .id = MAKEFOURCC('C','L','g','r'), .groundTile = MAKEFOURCC('L','g','r','s'),
+          .texDir = "ReplaceableTextures\\Cliff", .texFile = "Cliff1", .cliffModelDir = "Cliffs", .rampModelDir = "CliffTrans" },
+        { .id = MAKEFOURCC('C','V','d','i'), .groundTile = MAKEFOURCC('V','d','r','t'),
+          .texDir = "ReplaceableTextures\\Cliff", .texFile = "Cliff0", .cliffModelDir = "Cliffs", .rampModelDir = "CliffTrans" },
+        /* TFT Outland abyss cliff: the only row with both a low (groundTile) and high (upperTile) tile. */
+        { .id = MAKEFOURCC('C','O','r','d'), .groundTile = MAKEFOURCC('O','a','b','y'), .upperTile = MAKEFOURCC('O','s','m','b'),
+          .texDir = "ReplaceableTextures\\Cliff", .texFile = "Cliff1", .cliffModelDir = "Cliffs", .rampModelDir = "CliffTrans" },
+    };
+    FOR_LOOP(i, 3)
+        if (rows[i].id == id) return &rows[i];
+    T_ASSERT(false); return NULL;
+}
+#include "games/warcraft-3/renderer/w3m/r_war3map_utils.c"
+
+static void test_tile_uv_cell(uint32_t width, uint32_t height, uint32_t tile, uint8_t variation,
+                              float u0, float v0, float u1, float v1) {
+    texture_t texture = { .width = width, .height = height };
+    war3mapVertex_t vertex = { .groundVariation = variation };
+    vertex_t geom[6] = {0};
+    SetTileUV(&vertex, tile, geom, &texture);
+    FOR_LOOP(i, 6) {
+        T_ASSERT(geom[i].texcoord.x > u0 && geom[i].texcoord.x < u1);
+        T_ASSERT(geom[i].texcoord.y > v0 && geom[i].texcoord.y < v1);
+    }
+}
+
+TEST(renderer_terrain, tile_atlas_cells_follow_texture_shape_not_pixel_size) {
+    /* HumanX04's Outland_Abyss.blp is a 64x64 4x4 atlas; a 64-pixel cell wrapped the whole atlas per tile. */
+    test_tile_uv_cell(64, 64, 5, 0, 0.25f, 0.25f, 0.5f, 0.5f);
+    test_tile_uv_cell(256, 256, 5, 0, 0.25f, 0.25f, 0.5f, 0.5f);
+    test_tile_uv_cell(64, 64, 15, 7, 0.75f, 0.75f, 1.0f, 1.0f); /* Square atlases have no variation half. */
+    /* Extended atlases keep the 16 full-tile variations on the right half at any resolution. */
+    test_tile_uv_cell(512, 256, 15, 3, 0.875f, 0.0f, 1.0f, 0.25f);
+    test_tile_uv_cell(128, 64, 15, 3, 0.875f, 0.0f, 1.0f, 0.25f);
+    test_tile_uv_cell(128, 64, 6, 0, 0.25f, 0.25f, 0.375f, 0.5f);
+}
+
+TEST(renderer_terrain, water_depth_color_follows_water_slk_bands) {
+    wc3WaterStyle_t const outland = {
+        .shallow_min = {0, 0, 0, 255}, .shallow_max = {0, 0, 0, 255},
+        .deep_min = {0, 0, 0, 255}, .deep_max = {0, 0, 0, 255},
+    };
+    wc3WaterStyle_t const custom = {
+        .shallow_min = {1, 2, 3, 4}, .shallow_max = {101, 102, 103, 104},
+        .deep_min = {201, 202, 203, 204}, .deep_max = {251, 252, 253, 254},
+    };
+    color32_t c;
+    FOR_LOOP(i, 4) {
+        c = R_WaterDepthColor(&outland, i * 0.3f); /* The Abyss is opaque black at every depth. */
+        T_EQ(c.r, 0); T_EQ(c.g, 0); T_EQ(c.b, 0); T_EQ(c.a, 255);
+    }
+    c = R_WaterDepthColor(&custom, -1.0f); T_EQ(c.r, 1); T_EQ(c.a, 4);
+    c = R_WaterDepthColor(&custom, 10.f / 128); T_EQ(c.g, 2); T_EQ(c.a, 4);
+    c = R_WaterDepthColor(&custom, 37.f / 128); T_EQ(c.r, 51); T_EQ(c.a, 54);
+    c = R_WaterDepthColor(&custom, 64.f / 128); T_EQ(c.b, 103); T_EQ(c.a, 104);
+    c = R_WaterDepthColor(&custom, 68.f / 128); T_EQ(c.r, 226); T_EQ(c.a, 229);
+    c = R_WaterDepthColor(&custom, 2.0f); T_EQ(c.g, 252); T_EQ(c.a, 254);
+}
+/* The cliff material test needs the real bake/finalize lifecycle, but no OpenGL context. */
+static uint32_t cliff_buffer_upload_count;
+static buffer_t *test_cliff_buffer(vertex_t const *vertices, uint32_t count) {
+    cliff_buffer_upload_count++;
+    return test_alloc(sizeof(buffer_t));
+}
+#define R_MakeVertexArrayObject test_cliff_buffer
+#define WC3_CLIFF_TESTS
+#include "games/warcraft-3/renderer/w3m/r_war3map_cliffs.c"
+#undef WC3_CLIFF_TESTS
+#undef R_MakeVertexArrayObject
+
+TEST(renderer_terrain, cliff_cache_distinguishes_model_directories) {
+    cliffData_t city = { .cliffModelDir = "CityCliffs", .rampModelDir = "CityCliffTrans" };
+    cliffData_t dirt = { .cliffModelDir = "Cliffs", .rampModelDir = "CliffTrans" };
+    reset_registry(); R_SetMapAssetScope(NULL);
+    model_t const *a = R_LoadCliffModel(&city, "AABB", false);
+    model_t const *b = R_LoadCliffModel(&dirt, "AABB", false);
+    T_ASSERT(a != b); T_EQ(load_count, 2);
+    T_STREQ(last_model_load, "Doodads\\Terrain\\Cliffs\\CliffsAABB0.mdx");
+    T_ASSERT(R_LoadCliffModel(&city, "AABB", false) == a); T_EQ(load_count, 2);
+    a = R_LoadCliffModel(&city, "BALH", true);
+    b = R_LoadCliffModel(&dirt, "BALH", true);
+    T_ASSERT(a != b); T_EQ(load_count, 4);
+    T_STREQ(last_model_load, "Doodads\\Terrain\\CliffTrans\\CliffTransBALH0.mdx");
+    T_ASSERT(R_LoadCliffModel(&city, "BALH", true) == a); T_EQ(load_count, 4);
+    R_ResetCliffCache(); T_EQ(release_count, 4);
+}
+
+TEST(renderer_terrain, cliff_baker_samples_each_indexed_vertex_once_per_piece) {
+    war3mapVertex_t verts[25] = {0};
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    vec3_t pos[] = {{-128,0,128}, {-128,256,0}, {0,256,0}};
+    vec3_t norm[] = {{1,0,0}, {1,0,0}, {1,0,0}};
+    vec2_t uv[] = {{0.1f,0.2f}, {0.3f,0.4f}, {0.5f,0.6f}};
+    short tris[] = {0,1,2,2,1,0};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 6,
+        .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo,
+        .bounds.box = { .min = {-128,0,0}, .max = {0,256,128} } };
+    cliffData_t data = { .cliff = 1, .rampModelDir = "CityCliffTrans", .cliffModelDir = "CityCliffs" };
+    float first_height;
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    reset_registry(); R_SetMapAssetScope(NULL);
+    FOR_LOOP(i, 25) verts[i] = (war3mapVertex_t){ .level = 5, .cliff = 1, .accurate_height = 8192 };
+    verts[6].level = verts[11].level = 6;
+    tr.world = &map; cliff_model = &mdx;
+    cliff_vertex_sample_count = cliff_vertex_cache_hit_count = 0;
+    cliff_bake.num_vertices = 0;
+    R_MakeCliff(&map, 1, 1, &data);
+    T_EQ(cliff_bake.num_vertices, 6);
+    T_EQ(cliff_vertex_sample_count, 3);
+    T_EQ(cliff_vertex_cache_hit_count, 3);
+    first_height = cliff_bake.vertices[0].position.z;
+    FOR_LOOP(i, 3) {
+        vertex_t const *a = &cliff_bake.vertices[i];
+        vertex_t const *b = &cliff_bake.vertices[5-i];
+        T_FEQ(a->position.x, b->position.x, 0.0f);
+        T_FEQ(a->position.y, b->position.y, 0.0f);
+        T_FEQ(a->position.z, b->position.z, 0.0f);
+        T_FEQ(a->normal.x, b->normal.x, 0.0f);
+        T_FEQ(a->normal.y, b->normal.y, 0.0f);
+        T_FEQ(a->normal.z, b->normal.z, 0.0f);
+        T_FEQ(a->texcoord.x, b->texcoord.x, 0.0f);
+        T_FEQ(a->texcoord.y, b->texcoord.y, 0.0f);
+    }
+
+    /* A later piece must sample the updated terrain instead of reusing the prior piece's values. */
+    FOR_LOOP(i, 25) verts[i].accurate_height += 128;
+    cliff_bake.num_vertices = 0;
+    R_MakeCliff(&map, 1, 1, &data);
+    T_EQ(cliff_bake.num_vertices, 6);
+    T_EQ(cliff_vertex_sample_count, 6);
+    T_EQ(cliff_vertex_cache_hit_count, 6);
+    T_ASSERT(cliff_bake.vertices[0].position.z != first_height);
+
+    cliff_model = NULL; tr.world = NULL;
+    R_ResetCliffCache(); R_FinishCliffs();
+}
+
+TEST(renderer_terrain, cliff_baker_rejects_out_of_range_triangle_indices) {
+    war3mapVertex_t verts[25] = {0};
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    vec3_t pos[] = {{-128,0,128}, {-128,256,0}, {0,256,0}};
+    vec3_t norm[] = {{1,0,0}, {1,0,0}, {1,0,0}};
+    vec2_t uv[] = {{0.1f,0.2f}, {0.3f,0.4f}, {0.5f,0.6f}};
+    short tris[] = {0,1,-1};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3,
+        .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo };
+    cliffData_t data = { .cliff = 1, .rampModelDir = "CityCliffTrans", .cliffModelDir = "CityCliffs" };
+    cliffData_t other = { .cliff = 1, .rampModelDir = "CliffTrans", .cliffModelDir = "Cliffs" };
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    reset_registry(); R_SetMapAssetScope(NULL);
+    FOR_LOOP(i, 25) verts[i] = (war3mapVertex_t){ .level = 5, .cliff = 1, .accurate_height = 8192 };
+    verts[6].level = verts[11].level = 6;
+    tr.world = &map; cliff_model = &mdx;
+    cliff_bake.num_vertices = 0;
+    cliff_model_warning_count = 0;
+    R_MakeCliff(&map, 1, 1, &data);
+    T_EQ(cliff_bake.num_vertices, 0);
+    T_EQ(cliff_model_warning_count, 1);
+    R_MakeCliff(&map, 1, 1, &data);
+    T_EQ(cliff_model_warning_count, 1);
+    R_MakeCliff(&map, 1, 1, &other);
+    T_EQ(cliff_model_warning_count, 2);
+    T_EQ(cliff_bake.num_vertices, 0);
+    cliff_model = NULL; tr.world = NULL;
+    R_ResetCliffCache(); R_FinishCliffs();
+}
+
+TEST(renderer_terrain, cliff_allocation_failures_leave_caches_and_weld_recoverable) {
+    war3mapVertex_t verts[25] = {0};
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    vec3_t pos[] = {{-128,0,128}, {-128,256,0}, {0,256,0}};
+    vec3_t norm[] = {{1,0,0}, {1,0,0}, {1,0,0}};
+    vec2_t uv[] = {{0.1f,0.2f}, {0.3f,0.4f}, {0.5f,0.6f}};
+    short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3,
+        .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo };
+    cliffData_t data = { .cliff = 1, .rampModelDir = "CityCliffTrans", .cliffModelDir = "CityCliffs" };
+    rCliffBakeList_t list = {0};
+    vertex_t weld_vertices[2] = {0};
+    uint32_t weld_groups[] = {1, 2};
+    int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+    texture_t *saved_texture = texture_load_result;
+    texture_t texture = {0};
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    reset_registry(); R_SetMapAssetScope(NULL);
+    tr.world = &map; cliff_model = &mdx;
+    cliff_vertex_sample_capacity = cliff_vertex_generation = 0;
+    SAFE_DELETE(cliff_vertex_samples, ri.MemFree);
+    SAFE_DELETE(cliff_vertex_sample_generation, ri.MemFree);
+    test_alloc_fail_after = 0;
+    T_ASSERT(!R_GrowCliffVertexSamples(3));
+    T_ASSERT(R_GrowCliffVertexSamples(3));
+    R_ResetCliffCache();
+
+    test_alloc_fail_after = 0;
+    T_NULL(R_CliffBakeVertex(&list));
+    T_EQ(list.num_vertices, 0);
+    T_EQ(list.capacity, 0);
+    T_NOT_NULL(R_CliffBakeVertex(&list));
+    T_EQ(list.num_vertices, 1);
+    ri.MemFree(list.vertices); ri.MemFree(list.groups);
+
+    weld_vertices[0].normal = (vec3_t){1,0,0};
+    weld_vertices[1].normal = (vec3_t){1,0,0};
+    list = (rCliffBakeList_t){ .vertices = weld_vertices, .groups = weld_groups, .num_vertices = 2 };
+    test_alloc_fail_after = 0;
+    R_CliffWeldNormals(&list, 0.01f);
+    T_FEQ(weld_vertices[0].normal.x, 1, 0.0f);
+    R_CliffWeldNormals(&list, 0.01f);
+    T_FEQ(weld_vertices[1].normal.x, 1, 0.0f);
+
+    data.cliffModelDir = "CityCliffs";
+    test_alloc_fail_after = 0;
+    T_NULL(R_LoadCliffModel(&data, "AABB", false));
+    T_ASSERT(cliff_warn_model_cache_alloc);
+    T_NOT_NULL(R_LoadCliffModel(&data, "AABB", false));
+
+    ri.FS_ReadFile = test_texture_read;
+    texture_file = "";
+    texture_load_result = &texture;
+    data.texDir = "ReplaceableTextures\\Cliff";
+    data.texFile = "Cliff";
+    test_alloc_fail_after = 0;
+    T_ASSERT(R_LoadCliffTexture(1, 'L', &data) == &texture);
+    T_ASSERT(cliff_warn_texture_cache_alloc);
+    T_ASSERT(R_LoadCliffTexture(1, 'L', &data) == &texture);
+
+    bool saved_fail_load = fail_load;
+    R_ResetCliffCache();
+    cliff_model_warning_count = 0;
+    fail_load = true;
+    T_NULL(R_LoadCliffModel(&data, "AABB", false));
+    T_NULL(R_LoadCliffModel(&data, "AABB", false));
+    T_EQ(cliff_model_warning_count, 1);
+    fail_load = saved_fail_load;
+    ri.FS_ReadFile = read_file;
+    texture_load_result = saved_texture;
+    cliff_model = NULL; tr.world = NULL;
+    R_ResetCliffCache();
+}
+
+TEST(renderer_terrain, cliff_segment_allocation_failures_recover_without_stale_uploads) {
+    enum { span = SEGMENT_SIZE + 1 };
+    war3mapVertex_t verts[span * span];
+    uint32_t cliffs[] = { MAKEFOURCC('C','L','g','r') };
+    war3map_t map = { .tileset = 'L', .width = span, .height = span,
+        .vertices = verts, .cliffs = cliffs, .num_cliffs = 1 };
+    vec3_t pos[] = {{-128,0,120}, {-128,64,120}, {-128,128,120}};
+    vec3_t norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3,
+        .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo,
+        .bounds.box = { .min = {-128,0,0}, .max = {0,128,128} } };
+    texture_t texture = {0}; texture_t *saved_texture = texture_load_result;
+    int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+    maplayer_t *layer;
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    reset_registry(); R_SetMapAssetScope(NULL);
+    FOR_LOOP(y, span) FOR_LOOP(x, span)
+        verts[x + y * span] = (war3mapVertex_t){ .level = y >= 2 ? 5 : 4, .cliff = 0, .accurate_height = 8192 };
+    tr.world = &map; cliff_model = &mdx; cliff_buffer_upload_count = 0;
+    ri.FS_ReadFile = test_texture_read; texture_file = ""; texture_load_result = &texture;
+
+    test_alloc_fail_after = 0; /* Segment layer descriptor. */
+    T_NULL(R_BuildMapSegmentCliffs(&map, 0, 0, 0));
+    T_ASSERT(cliff_warn_layer_alloc);
+    layer = R_BuildMapSegmentCliffs(&map, 0, 0, 0);
+    T_NOT_NULL(layer);
+    R_FinishCliffs();
+    T_EQ(cliff_buffer_upload_count, 1);
+    test_free((buffer_t *)layer->buffer); test_free(layer);
+
+    /* Warm model/sample/texture caches above. The next four allocations are layer, bake
+     * vertices, bake groups, then pending-layer node; fail only the last one. */
+    test_alloc_fail_after = 3;
+    T_NULL(R_BuildMapSegmentCliffs(&map, 0, 0, 0));
+    T_ASSERT(cliff_warn_pending_alloc);
+    R_FinishCliffs();
+    T_EQ(cliff_buffer_upload_count, 1);
+
+    layer = R_BuildMapSegmentCliffs(&map, 0, 0, 0);
+    T_NOT_NULL(layer);
+    R_FinishCliffs();
+    T_EQ(cliff_buffer_upload_count, 2);
+    test_free((buffer_t *)layer->buffer); test_free(layer);
+
+    ri.FS_ReadFile = read_file; texture_load_result = saved_texture;
+    cliff_model = NULL; tr.world = NULL; R_ResetCliffCache();
+}
+
+TEST(renderer_terrain, cliff_weld_context_does_not_upload_discarded_layers) {
+    enum { span = SEGMENT_SIZE + 1 };
+    war3mapVertex_t verts[span * span];
+    uint32_t cliffs[] = { MAKEFOURCC('C','L','g','r') };
+    war3map_t map = { .width = span, .height = span, .vertices = verts,
+        .cliffs = cliffs, .num_cliffs = 1 };
+    vec3_t pos[] = {{-128,0,120}, {-128,64,120}, {-128,128,120}};
+    vec3_t norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3,
+        .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo,
+        .bounds.box = { .min = {-128,0,0}, .max = {0,128,128} } };
+
+    ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    reset_registry(); R_SetMapAssetScope(NULL);
+    FOR_LOOP(y, span) FOR_LOOP(x, span)
+        verts[x + y * span] = (war3mapVertex_t){ .level = y >= 2 ? 5 : 4, .cliff = 0, .accurate_height = 8192 };
+    tr.world = &map; cliff_model = &mdx; cliff_buffer_upload_count = 0;
+    R_BakeMapSegmentCliffsForWeld(&map, 0, 0, 0);
+    T_ASSERT(cliff_bake.num_vertices > 0);
+    R_FinishCliffs();
+    T_EQ(cliff_buffer_upload_count, 0);
+    T_EQ(cliff_bake.num_vertices, 0);
+
+    cliff_model = NULL; tr.world = NULL; R_ResetCliffCache();
+}
+
+TEST(renderer_terrain, human03_high_ramp_endpoint_joins_ground_without_a_false_midpoint) {
+    texture_t tex = { .width = 256, .height = 256 };
+    /* The LHBA model's native high and middle endpoints, rotated by the production baker. */
+    vec3_t pos[] = {{-128,256,128}, {-128,128,64}, {0,256,128}};
+    vec3_t norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3, .vertices = pos,
+        .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo, .bounds.box = { .min = {-128,0,0}, .max = {0,256,128} } };
+    cliffData_t cliff = { .cliff = 0, .rampModelDir = "CliffTrans", .cliffModelDir = "Cliffs" };
+    reset_registry(); ri.MemAlloc = test_alloc; ri.MemFree = test_free;
+    war3map_t *map = test_ramp_map("Maps/Campaign/Human03.w3m");
+    tr.world = map; cliff_model = &mdx;
+    /* The transposed crop exercises the north/south classification independently. */
+    T_EQ(GetWar3MapVertex(map, 9, 2)->cliffVariation, 1);
+    T_EQ(GetWar3MapVertex(map, 9, 3)->cliffVariation, 0);
+    T_FEQ(R_GetVertexPosition(map, 9, 3, true).z, 147, 0.001f);
+    T_EQ(GetWar3MapVertex(map, 2, 3)->cliffVariation, 1); /* Low corner at the true midpoint. */
+    T_EQ(GetWar3MapVertex(map, 3, 3)->cliffVariation, 0); /* High corner remains on its plateau. */
+    ground_current_vertex = ground_vertex_buffer;
+    R_MakeTile(map, 3, 2, 0, &tex);
+    T_EQ(ground_current_vertex - ground_vertex_buffer, 6);
+    cliff_bake.num_vertices = 0;
+    R_MakeCliff(map, 2, 2, &cliff);
+    T_STREQ(last_model_load, "Doodads\\Terrain\\CliffTrans\\CliffTransLHBA0.mdx");
+    T_EQ(cliff_bake.num_vertices, 3);
+    T_FEQ(cliff_bake.vertices[0].position.z, 147, 0.001f);
+    T_FEQ(R_GetVertexPosition(map, 3, 3, true).z, cliff_bake.vertices[0].position.z, 0.001f);
+    T_FEQ(R_GetVertexPosition(map, 2, 3, true).z, cliff_bake.vertices[1].position.z, 0.001f);
+    T_FEQ(ground_vertex_buffer[5].position.z, cliff_bake.vertices[0].position.z, 0.001f);
+    T_ASSERT(!R_TileHasGround(map, 1, 2)); /* The genuine low ramp cell remains mesh-owned. */
+    ground_current_vertex = NULL; cliff_model = NULL; tr.world = NULL;
+    R_ResetCliffCache(); R_FinishCliffs(); R_FreeWar3Map(map);
+}
+
+TEST(renderer_terrain, cliff_baker_preserves_native_axes_uvs_and_ground_coverage) {
+    /* Human02Interlude (36,36), translated to (1,1) in a small synthetic grid; no retail files required. */
+    war3mapVertex_t verts[25] = {0};
+    uint32_t grounds[5] = {0};
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts, .grounds = grounds, .num_grounds = 5 };
+    vec3_t pos[] = {{-128,0,128}, {-128,256,0}, {0,256,0}}, norm[] = {{1,0,0}, {1,0,0}, {1,0,0}};
+    vec2_t uv[] = {{0.1f,0.2f}, {0.3f,0.4f}, {0.5f,0.6f}};
+    short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3, .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo, .bounds.box = { .min = {-128,0,0}, .max = {0,256,128} } };
+    cliffData_t data = { .cliff = 1, .groundTile = MAKEFOURCC('X','s','q','d'), .rampModelDir = "CityCliffTrans", .cliffModelDir = "CityCliffs" };
+    reset_registry(); R_SetMapAssetScope(NULL);
+    map.grounds[4] = data.groundTile;
+    tr.world = &map; cliff_model = &mdx;
+    FOR_LOOP(pass, 2) {
+        FOR_LOOP(i, 25) verts[i] = (war3mapVertex_t){ .level = 5, .cliff = 1, .accurate_height = 8192 };
+        verts[6].level = verts[11].level = 6;
+        verts[6].ramp = verts[7].ramp = !pass;
+        mdx.bounds.box.max.y = pass ? 128 : 256;
+        pos[1].y = pos[2].y = mdx.bounds.box.max.y;
+        cliff_bake.num_vertices = 0;
+        R_MakeCliff(&map, 1, 1, &data);
+        T_STREQ(last_model_load, pass ? "Doodads\\Terrain\\CityCliffs\\CityCliffsBAAB0.mdx" : "Doodads\\Terrain\\CityCliffTrans\\CityCliffTransBALH0.mdx");
+        T_EQ(cliff_bake.num_vertices, 3);
+        FOR_LOOP(y, 5) FOR_LOOP(x, 5)
+            T_EQ(verts[x+y*5].ground, x >= 1 && x <= (pass ? 2 : 3) && y >= 1 && y <= 2 ? 4 : 0);
+        FOR_LOOP(i, 3) {
+            vertex_t const *v = &cliff_bake.vertices[i];
+            T_FEQ(v->position.x, 128 + pos[i].y, 0.001f);
+            T_FEQ(v->position.y, 128 - pos[i].x, 0.001f);
+            T_FEQ(v->position.z, 384 + pos[i].z, 0.001f);
+            T_FEQ(v->normal.x, 0, 0.001f); T_FEQ(v->normal.y, -1, 0.001f); T_FEQ(v->normal.z, 0, 0.001f);
+            T_FEQ(v->texcoord.x, uv[i].x, 0.001f); T_FEQ(v->texcoord.y, uv[i].y, 0.001f);
+        }
+    }
+    cliff_model = NULL; tr.world = NULL; R_ResetCliffCache(); R_FinishCliffs();
+}
+
+TEST(renderer_terrain, cliff_welding_ignores_triangle_multiplicity_and_stacked_faces) {
+    vertex_t vertices[] = {
+        { .position = {128,256,384}, .normal = {1,0,0} },
+        { .position = {128,256,384}, .normal = {1,0,0} },
+        { .position = {128,256,384}, .normal = {0.6f,0.8f,0} },
+        { .position = {128,256,385}, .normal = {0,1,0} },
+        { .position = {128,256,384}, .normal = {-1,0,0} },
+        { .position = {128,256,384} },
+    };
+    uint32_t groups[] = { 1,1,2,3,4,5 };
+    rCliffBakeList_t list = { .vertices = vertices, .groups = groups, .num_vertices = 6 };
+    reset_registry(); R_CliffWeldNormals(&list, 0.01f);
+    T_FEQ(vertices[0].normal.x, vertices[2].normal.x, 0.0001f);
+    T_FEQ(vertices[0].normal.y, vertices[2].normal.y, 0.0001f);
+    T_FEQ(vertices[3].normal.y, 1, 0.0001f); T_FEQ(vertices[4].normal.x, -1, 0.0001f);
+    T_FEQ(Vector3_len(&vertices[5].normal), 0, 0.0001f);
+}
+
+TEST(renderer_terrain, undead04_implicit_cliff_and_ground_join) {
+    war3mapVertex_t verts[25];
+    uint32_t grounds[] = { MAKEFOURCC('V','d','r','t') };
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts, .grounds = grounds, .num_grounds = 1 };
+    /* AABB native mesh: north edge is high; exterior lip is slightly below the terrain. */
+    vec3_t pos[] = {{-128,0,120}, {-128,64,120}, {-128,128,120}};
+    vec3_t norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3, .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo, .bounds.box = { .min = {-128,0,0}, .max = {0,128,128} } };
+    cliffData_t data = { .cliff = 1, .groundTile = grounds[0], .rampModelDir = "CliffTrans", .cliffModelDir = "Cliffs" };
+    reset_registry(); R_SetMapAssetScope(NULL); tr.world = &map; cliff_model = &mdx;
+    FOR_LOOP(y, 5) FOR_LOOP(x, 5)
+        verts[x+y*5] = (war3mapVertex_t){ .level = y >= 2 ? 5 : 4, .cliff = 15, .accurate_height = 8192 + x*16 };
+    verts[1].cliff = 1; /* Authored neighbour outside the cell's four corners. */
+    cliff_bake.num_vertices = 0;
+    R_MakeCliff(&map, 1, 1, &data);
+    T_EQ(cliff_bake.num_vertices, 3);
+    FOR_LOOP(i, 3) {
+        T_FEQ(cliff_bake.vertices[i].position.z, 384 + 4 + i*2, 0.001f);
+        T_FEQ(cliff_bake.vertices[i].normal.x, R_GetVertexNormal(&map, 1, 2).x, 0.001f);
+    }
+    cliff_model = NULL; tr.world = NULL; R_ResetCliffCache(); R_FinishCliffs();
+}
+
+TEST(renderer_terrain, undead04_cliff_material_inherits_nearby_authored_slot) {
+    enum { span = SEGMENT_SIZE + 1 };
+    war3mapVertex_t verts[span * span];
+    uint32_t grounds[] = { MAKEFOURCC('V','d','r','t'), MAKEFOURCC('V','d','r','r'), MAKEFOURCC('V','c','b','p'),
+        MAKEFOURCC('L','g','r','s'), MAKEFOURCC('L','g','r','d'), MAKEFOURCC('Y','b','t','l'), MAKEFOURCC('Y','r','t','l') };
+    uint32_t cliffs[] = { MAKEFOURCC('C','L','g','r'), MAKEFOURCC('C','V','d','i') };
+    war3map_t map = { .tileset = 'L', .custom = 1, .width = span, .height = span, .vertices = verts,
+        .grounds = grounds, .num_grounds = 7, .cliffs = cliffs, .num_cliffs = 2 };
+    vec3_t pos[] = {{-128,0,120}, {-128,64,120}, {-128,128,120}}, norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3, .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo, .bounds.box = { .min = {-128,0,0}, .max = {0,128,128} } };
+    texture_t texture = {0}; texture_t *saved = texture_load_result;
+    int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+    reset_registry(); R_SetMapAssetScope(NULL); tr.world = &map; cliff_model = &mdx;
+    ri.FS_ReadFile = test_texture_read; texture_file = ""; texture_load_result = &texture;
+    FOR_LOOP(slot, 2) {
+        /* All-15 river cells inherit a nearby explicit cliff, not a fixed second palette slot.
+         * Undead04 (93,54) finds CLgr at (92,56); also exercise a neighbour naming dirt. */
+        FOR_LOOP(y, span) FOR_LOOP(x, span)
+            verts[x+y*span] = (war3mapVertex_t){ .level = y >= 2 ? 5 : 4, .cliff = y ? 15 : slot,
+                .ground = 4, .accurate_height = 8192 };
+        T_NULL(R_BuildMapSegmentCliffs(&map, 0, 0, 1-slot));
+        maplayer_t *layer = R_BuildMapSegmentCliffs(&map, 0, 0, slot);
+        T_NOT_NULL(layer); T_EQ(layer->num_vertices, SEGMENT_SIZE*3); T_ASSERT(layer->texture == &texture);
+        T_STREQ(last_texture_load, slot ? "ReplaceableTextures\\Cliff\\Cliff0.blp" : "ReplaceableTextures\\Cliff\\Cliff1.blp");
+        FOR_LOOP(y, span) FOR_LOOP(x, span)
+            T_EQ(verts[x+y*span].ground, y == 1 || y == 2 ? (slot ? 0 : 3) : 4);
+        R_FinishCliffs(); test_free((buffer_t *)layer->buffer); test_free(layer);
+        R_ResetCliffCache();
+    }
+    ri.FS_ReadFile = read_file; texture_load_result = saved; cliff_model = NULL; tr.world = NULL;
+}
+
+TEST(renderer_terrain, abyss_cliff_paints_low_corners_with_ground_and_high_corners_with_upper_tile) {
+    enum { span = SEGMENT_SIZE + 1 };
+    war3mapVertex_t verts[span * span];
+    /* HumanX04 palette order: Odrt, ..., Osmb (2), ..., Oaby (7). */
+    uint32_t grounds[] = { MAKEFOURCC('O','d','r','t'), MAKEFOURCC('O','d','t','r'), MAKEFOURCC('O','s','m','b'),
+        MAKEFOURCC('O','f','s','t'), MAKEFOURCC('O','l','g','b'), MAKEFOURCC('O','r','o','k'), MAKEFOURCC('O','f','s','l'),
+        MAKEFOURCC('O','a','b','y') };
+    uint32_t cliffs[] = { MAKEFOURCC('C','O','r','d') };
+    war3map_t map = { .tileset = 'O', .custom = 1, .width = span, .height = span, .vertices = verts,
+        .grounds = grounds, .num_grounds = 8, .cliffs = cliffs, .num_cliffs = 1 };
+    vec3_t pos[] = {{-128,0,120}, {-128,64,120}, {-128,128,120}}, norm[] = {{0,0,1}, {0,0,1}, {0,0,1}};
+    vec2_t uv[3] = {0}; short tris[] = {0,1,2};
+    mdxGeoset_t geo = { .num_vertices = 3, .num_triangles = 3, .vertices = pos, .normals = norm, .texcoord = uv, .triangles = tris };
+    mdxModel_t mdx = { .geosets = &geo, .bounds.box = { .min = {-128,0,0}, .max = {0,128,128} } };
+    texture_t texture = {0}; texture_t *saved = texture_load_result;
+    int (*read_file)(cstring_t, void **) = ri.FS_ReadFile;
+    reset_registry(); R_SetMapAssetScope(NULL); tr.world = &map; cliff_model = &mdx;
+    ri.FS_ReadFile = test_texture_read; texture_file = ""; texture_load_result = &texture;
+    FOR_LOOP(pass, 2) {
+        /* Pass 1 drops Osmb from the palette: high corners must keep their authored ground, never the abyss. */
+        grounds[2] = pass ? MAKEFOURCC('O','d','t','x') : MAKEFOURCC('O','s','m','b');
+        /* A two-level abyss cliff between row 1 (level 0) and row 2 (level 2), authored Odrt everywhere. */
+        FOR_LOOP(y, span) FOR_LOOP(x, span)
+            verts[x+y*span] = (war3mapVertex_t){ .level = y >= 2 ? 2 : 0, .cliff = 0, .ground = 0, .accurate_height = 8192 };
+        maplayer_t *layer = R_BuildMapSegmentCliffs(&map, 0, 0, 0);
+        T_NOT_NULL(layer);
+        FOR_LOOP(y, span) FOR_LOOP(x, span)
+            T_EQ(verts[x+y*span].ground, y == 1 ? 7 : y == 2 ? (pass ? 0 : 2) : 0);
+        R_FinishCliffs(); test_free((buffer_t *)layer->buffer); test_free(layer);
+        R_ResetCliffCache();
+    }
+    ri.FS_ReadFile = read_file; texture_load_result = saved; cliff_model = NULL; tr.world = NULL;
+}
+
+TEST(renderer_terrain, blight_preserves_cliff_corners) {
+    war3mapVertex_t verts[25]; uint8_t cells[256];
+    war3map_t map = { .width = 5, .height = 5, .vertices = verts };
+    reset_registry(); tr.world = &map; memset(cells, 1, sizeof(cells));
+    FOR_LOOP(y, 5) FOR_LOOP(x, 5)
+        verts[x+y*5] = (war3mapVertex_t){ .level = x < 2 ? 4 : 5, .accurate_height = 8192 };
+    viewDef_t view = { .terrain_mask = { .cells = cells, .width = 16, .height = 16, .cell_size = 32, .generation = 1 } };
+    T_ASSERT(R_BlightTileCacheUpdate(&view));
+    FOR_LOOP(y, 5) {
+        T_EQ(blight_tiles.corners[1+y*5], 0); T_EQ(blight_tiles.corners[2+y*5], 0);
+        T_EQ(blight_tiles.corners[3+y*5], 1);
+    }
+    /* A later network generation must preserve the boundary too. */
+    view.terrain_mask.generation++; T_ASSERT(R_BlightTileCacheUpdate(&view));
+    T_EQ(blight_tiles.corners[2+2*5], 0);
+    R_ResetBlightCache(); tr.world = NULL;
+}
+
+TEST(renderer_terrain, ramp_footprints_cover_the_low_neighbour) {
+    /* Levels use GetTileVertices' NE,NW,SE,SW order. Bounds are native MDX tile-space bounds. */
+    static const struct { uint8_t level[4]; bool eastwest; vec2_t low; } cases[] = {
+        { .level = {5,5,5,6}, .eastwest = true, .low = {1,0} }, /* (36,33) AALH -> (37,33). */
+        { .level = {5,6,5,5}, .eastwest = true, .low = {1,0} }, /* (36,34) HLAA -> (37,34). */
+        { .level = {5,6,5,6}, .eastwest = true, .low = {1,0} }, /* BALH/HLAB: rows 36,37,41,42. */
+        { .level = {6,5,6,5}, .eastwest = true, .low = {-1,0} }, /* East-high, west-low. */
+        { .level = {6,5,5,5}, .eastwest = true, .low = {-1,0} }, /* East-high tapered edge. */
+        { .level = {5,5,6,6}, .low = {0,1} }, /* South-high, north-low. */
+        { .level = {6,6,5,5}, .low = {0,-1} }, /* North-high, south-low. */
+    };
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        war3mapVertex_t tile[4] = {0};
+        box3_t box = { .min = {-TILE_SIZE,0,0}, .max = {0,TILE_SIZE,TILE_SIZE} };
+        if (cases[i].eastwest) box.max.y *= 2;
+        else box.min.x *= 2;
+        FOR_LOOP(j, 4) tile[j].level = cases[i].level[j];
+        vec2_t shift = R_CliffRampOffset(tile, &box);
+        vec3_t a = Matrix4_multiply_vector3(&r_cliff_axes, &box.min);
+        vec3_t b = Matrix4_multiply_vector3(&r_cliff_axes, &box.max);
+        /* The mesh must cover this cliff cell plus exactly the low-side cell skipped by R_MakeTile. */
+        T_FEQ((MIN(a.x, b.x) + shift.x) / TILE_SIZE, MIN(0, cases[i].low.x), 0.001f);
+        T_FEQ((MAX(a.x, b.x) + shift.x) / TILE_SIZE, MAX(0, cases[i].low.x) + 1, 0.001f);
+        T_FEQ((MIN(a.y, b.y) + shift.y) / TILE_SIZE, MIN(0, cases[i].low.y), 0.001f);
+        T_FEQ((MAX(a.y, b.y) + shift.y) / TILE_SIZE, MAX(0, cases[i].low.y) + 1, 0.001f);
+    }
+}
+
+/* The shadow and non-shadow builds share lighting; only the key's direct contribution is occluded.
+   The descriptor always emits the receiver wiring and gates it behind GLSL `#ifdef USE_SHADOWMAPS`,
+   so the raw source carries the same body in both builds. */
+TEST(renderer_shader, shadow_receiver_contract) {
+    test_shader_source(1, &sd_model, true, NULL);
+    T_NOT_NULL(strstr(shader_src, "return lighting;")); /* clamp moved out of vertex_lighting */
+#ifdef BZ_GLSL_120
+    /* GLSL 120 uses varying for both stages; the old test incorrectly required 140+ in/out syntax. */
+    T_NOT_NULL(strstr(shader_src, "varying vec3 v_shadowlight;"));
+#else
+    T_NOT_NULL(strstr(shader_src, "out vec3 v_shadowlight;"));
+#endif
+    T_NOT_NULL(strstr(shader_src, "v_shadowlight = vec3(0.0);"));
+    T_NOT_NULL(strstr(shader_src, "contribution - u_lights[i][3].rgb * u_lights[i][3].a"));
+
+    test_shader_source(1, &sd_model, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "light = min(light, vec3(1.0));")); /* clamp applied after occlusion */
+#ifdef BZ_GLSL_120
+    T_NOT_NULL(strstr(shader_src, "varying vec3 v_shadowlight;"));
+#else
+    T_NOT_NULL(strstr(shader_src, "in vec3 v_shadowlight;"));
+#endif
+    T_NOT_NULL(strstr(shader_src, "light -= v_shadowlight * (1.0 - shadow_visibility(u_shadowmap, v_shadow));"));
+    T_NOT_NULL(strstr(shader_src, "textureSize(depths, 0)"));
+}
+
+/* Fog of war dims and desaturates terrain instead of blacking it out, so land and water stay
+   readable in unexplored and fogged areas; units still vanish there (model shader discard). */
+TEST(renderer_shader, fogged_terrain_keeps_a_dim_readable_silhouette) {
+    test_shader_source(1, &sd_default, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "float grey = dot(col.rgb, vec3(0.299, 0.587, 0.114));"));
+    T_NOT_NULL(strstr(shader_src, "col.rgb = mix(vec3(grey), col.rgb, FOW_SATURATION) * FOW_BRIGHTNESS;"));
+    T_NULL(strstr(shader_src, "col.rgb *= get_fogofwar() * get_lighting();"));
+    test_shader_source(1, &sd_minimap_fog, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "float alpha = clamp(1.0 - visibility, 0.0, 1.0) * 0.62 * v_color.a;"));
+    test_shader_source(1, &sd_model, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "if (fog <= 0.0) discard;"));
+}
+
+/* The sun shadow map covers a fixed square around the camera target. Zoomed out, the view
+   reaches past it: terrain beyond the light's depth range must read as lit, and shadows fade
+   out toward the map's edge instead of ending in a hard dark line. */
+TEST(renderer_shader, terrain_shadow_fades_at_the_shadow_map_edge) {
+    test_shader_source(1, &sd_default, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "v_shadow.z > 1.0) return 1.0;"));
+    T_NOT_NULL(strstr(shader_src, "vec2 edge = min(uv, 1.0 - uv);"));
+    T_NOT_NULL(strstr(shader_src, "mix(1.0, lit / 9.0, clamp(min(edge.x, edge.y) * 20.0, 0.0, 1.0))"));
+    test_shader_source(1, &sd_model, false, NULL);
+    T_NOT_NULL(strstr(shader_src, "vec2 edge = min(p.xy, 1.0 - p.xy);"));
+}
+
+/* -----------------------------------------------------------------------
+ * shader_desc: UNIFORM/ATTRIB/SHARED macro expansion, R_BuildShaderDeclarations,
+ * and R_LoadShaderDescInto for each supported GLSL dialect.
+ * ----------------------------------------------------------------------- */
+
+typedef struct sdTestState_s {
+    mat4_t mvp;
+    int texture;
+    vec4_t color;
+} sdTestState_t;
+
+
+typedef struct sdTestProg_s { shaderProg_t prog; sdTestState_t state; } sdTestProg_t;
+
+
+
+#define SHADER_TYPE sdTestState_t
+static const shader_desc_t sd_test = {
+    .Name = "test",
+    .Uniforms = {
+        UNIFORM(mvp,     UT_FLOAT_MAT4, PRECISION_HIGH),
+        UNIFORM(texture, UT_SAMPLER_2D, PRECISION_LOW),
+        UNIFORM(color,   UT_FLOAT_VEC4, PRECISION_LOW),
+    },
+    .Attributes = {
+        ATTRIB(position, attrib_position, UT_FLOAT_VEC3),
+        ATTRIB(texcoord, attrib_texcoord, UT_FLOAT_VEC2),
+    },
+    .Shared = {
+        SHARED(texcoord, UT_FLOAT_VEC2),
+    },
+    .VertexBody =
+        "vec4 vert() {\n"
+        "  v_texcoord = a_texcoord;\n"
+        "  return u_mvp * vec4(a_position, 1.0);\n"
+        "}\n",
+    .FragmentBody =
+        "vec4 frag() {\n"
+        "  return texture(u_texture, v_texcoord) * u_color;\n"
+        "}\n",
+};
+#undef SHADER_TYPE
+
+typedef struct { mat4_t fixed[2], counted[3]; uint32_t count; } sdArrayTestState_t;
+#define SHADER_TYPE sdArrayTestState_t
+static const shader_desc_t sd_array_test = { .Uniforms = {
+    UNIFORM(fixed,   UT_FLOAT_MAT4, PRECISION_HIGH, 2),
+    UNIFORM(counted, UT_FLOAT_MAT4, PRECISION_HIGH, 3, count),
+} };
+#undef SHADER_TYPE
+
+/* UNIFORM(field) stores offsetof(SHADER_TYPE, field); attrib/shared names get a_/v_ prefix. */
+TEST(renderer_shader_desc, macro_expansion_records_offsets_and_prefixed_names) {
+    T_EQ(sd_test.Uniforms[0].offset, offsetof(sdTestState_t, mvp));
+    T_EQ(sd_test.Uniforms[1].offset, offsetof(sdTestState_t, texture));
+    T_EQ(sd_test.Uniforms[2].offset, offsetof(sdTestState_t, color));
+    T_STREQ(sd_test.Uniforms[0].name, "u_mvp");
+    T_STREQ(sd_test.Uniforms[1].name, "u_texture");
+    T_STREQ(sd_test.Uniforms[2].name, "u_color");
+    T_EQ(sd_array_test.Uniforms[0].count, 2u); T_ASSERT(!sd_array_test.Uniforms[0].counted);
+    T_EQ(sd_array_test.Uniforms[1].count, 3u);
+    T_EQ(sd_array_test.Uniforms[1].count_offset, offsetof(sdArrayTestState_t, count));
+    T_ASSERT(sd_array_test.Uniforms[1].counted);
+    T_STREQ(sd_test.Attributes[0].name, "a_position");
+    T_STREQ(sd_test.Attributes[1].name, "a_texcoord");
+    T_STREQ(sd_test.Shared[0].name, "v_texcoord");
+    T_EQ(sd_test.Attributes[0].attrib, attrib_position);
+    T_EQ(sd_test.Attributes[1].attrib, attrib_texcoord);
+    T_NULL(sd_test.Uniforms[3].name);
+    T_NULL(sd_test.Attributes[2].name);
+    T_NULL(sd_test.Shared[1].name);
+}
+
+/* GLSL 120: attribute/varying keywords, no o_color declaration in FS. */
+TEST(renderer_shader_desc, declarations_120_vertex_uses_attribute_and_varying) {
+    char buf[1024];
+    R_BuildShaderDeclarations(buf, sizeof(buf), &sd_test, true, GLSL_DIALECT_120);
+    T_NOT_NULL(strstr(buf, "uniform mat4 u_mvp;\n"));
+    T_NOT_NULL(strstr(buf, "uniform sampler2D u_texture;\n"));
+    T_NOT_NULL(strstr(buf, "attribute vec3 a_position;\n"));
+    T_NOT_NULL(strstr(buf, "attribute vec2 a_texcoord;\n"));
+    T_NOT_NULL(strstr(buf, "varying vec2 v_texcoord;\n"));
+    T_NULL(strstr(buf, " in "));
+    T_NULL(strstr(buf, " out "));
+    T_NULL(strstr(buf, "#define texture"));
+}
+
+TEST(renderer_shader_desc, declarations_120_fragment_aliases_texture) {
+    char buf[1024];
+    R_BuildShaderDeclarations(buf, sizeof(buf), &sd_test, false, GLSL_DIALECT_120);
+    T_NOT_NULL(strstr(buf, "varying vec2 v_texcoord;\n"));
+    T_NOT_NULL(strstr(buf, "#define texture texture2D\n"));
+    T_NULL(strstr(buf, "out vec4 o_color"));
+    T_NULL(strstr(buf, " in "));
+}
+
+/* GLSL 140: in/out keywords, o_color declared in FS. */
+TEST(renderer_shader_desc, declarations_140_vertex_uses_in_out) {
+    char buf[1024];
+    R_BuildShaderDeclarations(buf, sizeof(buf), &sd_test, true, GLSL_DIALECT_140);
+    T_NOT_NULL(strstr(buf, "uniform mat4 u_mvp;\n"));
+    T_NOT_NULL(strstr(buf, "in vec3 a_position;\n"));
+    T_NOT_NULL(strstr(buf, "in vec2 a_texcoord;\n"));
+    T_NOT_NULL(strstr(buf, "out vec2 v_texcoord;\n"));
+    T_NULL(strstr(buf, "attribute "));
+    T_NULL(strstr(buf, "varying "));
+}
+
+TEST(renderer_shader_desc, declarations_140_fragment_declares_o_color) {
+    char buf[1024];
+    R_BuildShaderDeclarations(buf, sizeof(buf), &sd_test, false, GLSL_DIALECT_140);
+    T_NOT_NULL(strstr(buf, "in vec2 v_texcoord;\n"));
+    T_NOT_NULL(strstr(buf, "out vec4 o_color;\n"));
+    T_NULL(strstr(buf, "attribute "));
+    T_NULL(strstr(buf, "varying "));
+    T_NULL(strstr(buf, "#define texture"));
+}
+
+/* GLSL 150 uses the same declaration keywords as 140; only the version line differs. */
+TEST(renderer_shader_desc, declarations_150_identical_to_140) {
+    char buf140[1024], buf150[1024];
+    R_BuildShaderDeclarations(buf140, sizeof(buf140), &sd_test, true,  GLSL_DIALECT_140);
+    R_BuildShaderDeclarations(buf150, sizeof(buf150), &sd_test, true,  GLSL_DIALECT_150);
+    T_STREQ(buf140, buf150);
+    R_BuildShaderDeclarations(buf140, sizeof(buf140), &sd_test, false, GLSL_DIALECT_140);
+    R_BuildShaderDeclarations(buf150, sizeof(buf150), &sd_test, false, GLSL_DIALECT_150);
+    T_STREQ(buf140, buf150);
+}
+
+/* GLES3 uses the same declaration keywords as 140; the precision prologue is in the version string. */
+TEST(renderer_shader_desc, declarations_es3_identical_to_140) {
+    char buf140[1024], bufES3[1024];
+    R_BuildShaderDeclarations(buf140, sizeof(buf140), &sd_test, true, GLSL_DIALECT_140);
+    R_BuildShaderDeclarations(bufES3, sizeof(bufES3), &sd_test, true, GLSL_DIALECT_ES3);
+    T_STREQ(buf140, bufES3);
+    R_BuildShaderDeclarations(buf140, sizeof(buf140), &sd_test, false, GLSL_DIALECT_140);
+    R_BuildShaderDeclarations(bufES3, sizeof(bufES3), &sd_test, false, GLSL_DIALECT_ES3);
+    T_STREQ(buf140, bufES3);
+}
+
+/* main() is generated: bodies define vert()/frag(), never gl_Position/o_color. */
+TEST(renderer_shader_desc, main_vertex_assigns_gl_position) {
+    char buf[128];
+    FOR_LOOP(i, 4) {
+        R_BuildShaderMain(buf, sizeof(buf), true, (glsl_dialect_t)i);
+        T_STREQ(buf, "void main() { gl_Position = vert(); }\n");
+    }
+}
+
+TEST(renderer_shader_desc, main_fragment_120_assigns_gl_fragcolor) {
+    char buf[128];
+    R_BuildShaderMain(buf, sizeof(buf), false, GLSL_DIALECT_120);
+    T_STREQ(buf, "void main() { gl_FragColor = frag(); }\n");
+}
+
+TEST(renderer_shader_desc, main_fragment_140_assigns_o_color) {
+    char buf[128];
+    R_BuildShaderMain(buf, sizeof(buf), false, GLSL_DIALECT_140);
+    T_STREQ(buf, "void main() { o_color = frag(); }\n");
+    R_BuildShaderMain(buf, sizeof(buf), false, GLSL_DIALECT_150);
+    T_STREQ(buf, "void main() { o_color = frag(); }\n");
+    R_BuildShaderMain(buf, sizeof(buf), false, GLSL_DIALECT_ES3);
+    T_STREQ(buf, "void main() { o_color = frag(); }\n");
+}
+
+/* Locations stay private to the program and loading preserves caller-owned non-sampler values. */
+TEST(renderer_shader_desc, load_writes_locations_and_initializes_samplers) {
+    sdTestProg_t shader = { .state.color = { 1, 2, 3, 4 } };
+    reset_shader();
+    R_LoadShader(&sd_test, NULL, &shader);
+    T_EQ(shader.prog.progid, (GLuint)GL_LINK_STATUS);
+    FOR_LOOP(i, 3) T_EQ(shader.prog.locs[i], 0);
+    T_EQ(shader.state.texture, 0); T_EQ(shader.state.color.w, 4);
+    T_EQ(shader_test.creates, 2); T_EQ(shader_test.links, 1); T_EQ(shader_test.deleted, 2);
+    T_NOT_NULL(shader.prog.cache);
+    R_DeleteShader(&shader.prog);
+}
+
+/* The program cache preserves complete typed state while unchanged draw fields issue no driver uploads.
+   The first submission uploads every active field; subsequent submissions compare exact stored values. */
+TEST(renderer_shader_desc, apply_uploads_only_changed_uniforms) {
+    sdTestProg_t shader = { .state.color = { 1, 2, 3, 4 }, .state.mvp = { .v = { 1 } } };
+    reset_shader(); R_LoadShader(&sd_test, NULL, &shader); memset(&upload, 0, sizeof(upload));
+    int uses = shader_test.uses;
+    R_ApplyShader(&shader); T_EQ(upload.calls, 3); T_EQ(shader_test.uses, uses + 1);
+    R_ApplyShader(&shader); T_EQ(upload.calls, 3);
+    shader.state.color.x = 5; R_ApplyShader(&shader); T_EQ(upload.calls, 4);
+    shader.state.mvp.v[0] = 2; R_ApplyShader(&shader); T_EQ(upload.calls, 5);
+    R_DeleteShader(&shader.prog);
+}
+
+/* Fixed-capacity GLSL arrays upload only the active CPU prefix named by their count field. */
+TEST(renderer_shader_desc, counted_array_uses_runtime_upload_count) {
+    typedef struct { mat4_t values[4]; uint32_t count; } testCountState_t;
+    testCountState_t state = { .count = 2 };
+    shader_desc_t desc = { .Name = "counted", .Uniforms = {{
+        .name = "values", .type = UT_FLOAT_MAT4, .count = 4, .count_offset = offsetof(testCountState_t, count), .counted = true,
+    }} };
+    shaderProg_t prog = { .progid = 1, .desc = &desc, .locs = { 0 }, .state_size = sizeof(state) };
+    memset(&upload, 0, sizeof(upload)); R_UploadShader(&prog, &state);
+    T_EQ(upload.calls, 1); T_EQ(upload.count, 2);
+}
+
+/* The descriptor chooses upload shape; arrays stay blocks and bools are not read as GLint storage. */
+TEST(renderer_shader_desc, upload_dispatches_values_arrays_and_inactive_inputs) {
+    union { float f[32]; int i[32]; bool b; } state = { 0 };
+    shader_desc_t desc = { .Name = "upload" };
+    float scratch[64];
+    shaderProg_t prog = { .progid = 1, .desc = &desc, .state_size = sizeof(state), .scratch = scratch };
+    static const int widths[] = { 1, 2, 3, 4, 4, 0, 0, 0, 9, 9, 16, 0, 0, 0 };
+    FOR_LOOP(type, UT_COUNT) {
+        desc.Uniforms[0] = (shaderUniform_t){ .name = "value", .type = type };
+        memset(&upload, 0, sizeof(upload));
+        if (widths[type]) {
+            FOR_LOOP(i, 32) state.f[i] = i + 1;
+            desc.Uniforms[0].count = 2;
+        } else if (type == UT_BOOL) state.b = true;
+        else state.i[0] = state.i[1] = 7;
+        R_UploadShader(&prog, &state);
+        T_EQ(upload.calls, 1);
+        if (widths[type]) {
+            T_EQ(upload.width, widths[type]); T_EQ(upload.count, 2);
+            T_EQ(upload.data[widths[type] * 2 - 1], widths[type] * 2);
+        } else T_EQ(upload.integer, type == UT_BOOL ? 1 : 7);
+    }
+    desc.Uniforms[0] = (shaderUniform_t){ .name = "bool", .type = UT_BOOL };
+    state.b = false; R_UploadShader(&prog, &state); T_EQ(upload.integer, 0);
+    desc.Uniforms[0].type = UT_FLOAT_MAT3_TRANSPOSE;
+    R_UploadShader(&prog, &state); T_EQ(upload.transpose, GL_FALSE);
+    int calls = upload.calls; prog.locs[0] = -1;
+    R_UploadShader(&prog, &state); T_EQ(upload.calls, calls);
+}
+
+TEST(renderer_shader_desc, sampler_order_and_program_release) {
+    struct { shaderProg_t prog; int state[3]; } shader = { 0 };
+    /* A linked descriptor requires shader bodies even when the test only inspects sampler setup. */
+    shader_desc_t desc = { .Name = "samplers", .VertexBody = sd_test.VertexBody, .FragmentBody = sd_test.FragmentBody };
+    reset_shader();
+    FOR_LOOP(i, 3) desc.Uniforms[i] = (shaderUniform_t){ .offset = i * sizeof(int), .name = "sampler", .type = UT_SAMPLER_2D };
+    R_LoadShader(&desc, NULL, &shader);
+    FOR_LOOP(i, 3) T_EQ(shader.state[i], i);
+    int deleted = deleted_programs;
+    R_DeleteShader(&shader.prog); T_EQ(deleted_programs, deleted + 1);
+    T_EQ(shader.prog.progid, 0); T_NULL(shader.prog.desc);
+    R_DeleteShader(&shader.prog); T_EQ(deleted_programs, deleted + 1);
+}
+
+/* Packed array batches preserve their non-zero first vertex and skip empty ranges. */
+TEST(renderer_buffer, array_range_uses_first_and_count) {
+    buffer_t buffer = { .vao = 3, .vbo = 4 };
+    drawRange_t draw = { .first = 17, .count = 12 };
+    memset(&draw_test, 0, sizeof(draw_test));
+    R_DrawBufferRange(&buffer, &draw);
+    T_EQ(draw_test.calls, 1); T_EQ(draw_test.first, 17); T_EQ(draw_test.count, 12); T_EQ(draw_test.instances, 1);
+    T_EQ(draw_test.stats_count, 12); T_EQ(draw_test.stats_instances, 1);
+    draw.count = 0; R_DrawBufferRange(&buffer, &draw); T_EQ(draw_test.calls, 1);
+}
+
+/* Instanced packed batches use the same range and reject an empty instance stream. */
+TEST(renderer_buffer, instanced_array_range_uses_first_count_and_instances) {
+    buffer_t buffer = { .vbo = 4 };
+    instanceBuffer_t instances = { .vbo = 5, .count = 9 };
+    drawRange_t draw = { .first = 23, .count = 18 };
+    memset(&draw_test, 0, sizeof(draw_test));
+    R_DrawBufferRangeInstanced(&buffer, &draw, &instances);
+    T_EQ(draw_test.calls, 1); T_EQ(draw_test.first, 23); T_EQ(draw_test.count, 18); T_EQ(draw_test.instances, 9);
+    T_EQ(draw_test.stats_count, 18); T_EQ(draw_test.stats_instances, 9);
+    instances.count = 0; R_DrawBufferRangeInstanced(&buffer, &draw, &instances); T_EQ(draw_test.calls, 1);
+}
+
+/* Capture backdrop UV generation before GPU submission, including mirrored repeat. */
+static size2_t test_backdrop_size(texture_t const *tex) { (void)tex; return backdrop_size; }
+static vertex_t *test_backdrop_quad(vertex_t *buf, rect_t const *rect, rect_t const *uv, color32_t color, float z) {
+    (void)color; (void)z; backdrop_uv = *uv; backdrop_rect = *rect; return buf + 6;
+}
+static void test_backdrop_batch(texture_t const *tex, SHADERTYPE shader, BLEND_MODE blend, float glow, float radialShade, bool hasclip, rect_t const *clip, vertex_t const *verts, uint32_t count, bool repeat) {
+    (void)tex; (void)shader; (void)blend; (void)glow; (void)radialShade; (void)hasclip; (void)clip; (void)verts;
+    T_EQ(count, 6); backdrop_repeat = repeat; backdrop_calls++;
+}
+static void test_backdrop_batch_ex(drawImageBatchParams_t const *params) {
+    T_NOT_NULL(params); T_EQ(params->vertexCount, 6);
+    backdrop_repeat = params->repeat; params->opaque ? backdrop_opaque_calls++ : backdrop_calls++;
+}
+#define R_GetTextureSize test_backdrop_size
+#define R_AddQuad test_backdrop_quad
+#define R_DrawImageBatch test_backdrop_batch
+#define R_DrawImageBatchEx test_backdrop_batch_ex
+#include "renderer/r_backdrop.c"
+#undef R_GetTextureSize
+#undef R_AddQuad
+#undef R_DrawImageBatch
+#undef R_DrawImageBatchEx
+
+/* Q2 Draw_Pic never drops alpha: WoW-style backdrops (only DRAW_TILE) and translucent tints must blend. */
+TEST(renderer_backdrop, default_and_translucent_backgrounds_blend) {
+    drawBackdrop_t draw = { .screen = {0, 0, .2f, .1f}, .bg.texture = (texture_t const *)1, .bg.color = COLOR32_WHITE };
+    backdrop_calls = backdrop_opaque_calls = 0;
+    R_DrawBackdrop(&draw);
+    draw.flags = DRAW_TILE;
+    R_DrawBackdrop(&draw);
+    draw.flags = 0; draw.bg.color.a = 128;
+    R_DrawBackdrop(&draw);
+    T_EQ(backdrop_calls, 3); T_EQ(backdrop_opaque_calls, 0);
+    /* A translucent tint keeps blending even when the FDF frame lacks BackdropBlendAll. */
+    draw.flags = DRAW_BG_OPAQUE;
+    R_DrawBackdrop(&draw);
+    T_EQ(backdrop_calls, 4); T_EQ(backdrop_opaque_calls, 0);
+}
+
+/* WC3 FDF backdrops without BackdropBlendAll ignore texture alpha; DRAW_BG_OPAQUE is the only opt-in. */
+TEST(renderer_backdrop, fdf_opaque_flag_selects_opaque_background_path) {
+    drawBackdrop_t draw = { .screen = {0, 0, .2f, .1f}, .bg.texture = (texture_t const *)1, .bg.color = COLOR32_WHITE, .flags = DRAW_BG_OPAQUE | DRAW_TILE };
+    backdrop_calls = backdrop_opaque_calls = 0;
+    R_DrawBackdrop(&draw);
+    T_EQ(backdrop_calls, 0); T_EQ(backdrop_opaque_calls, 1);
+}
+
+TEST(renderer_backdrop, mirrored_background_is_independent_of_tiling) {
+    drawBackdrop_t draw = { .screen = {0, 0, .512f, .032f}, .bg.texture = (texture_t const *)1 };
+    const struct { uint32_t flags; float x, w; bool repeat; } cases[] = {
+        {0, 0, 1, false},
+        {DRAW_MIRRORED, 1, -1, false},
+        {DRAW_TILE, 0, 2, true},
+        {DRAW_TILE | DRAW_MIRRORED, 2, -2, true},
+    };
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        draw.flags = cases[i].flags;
+        R_DrawBackdrop(&draw);
+        T_FEQ(backdrop_uv.x, cases[i].x, 0.00001f);
+        T_FEQ(backdrop_uv.w, cases[i].w, 0.00001f);
+        T_EQ(backdrop_repeat, cases[i].repeat);
+    }
+}
+
+/* Authored tile spans include the insets: a button interior displays one complete icon, not a cropped corner. */
+TEST(renderer_backdrop, authored_tile_size_keeps_inset_icons_centered) {
+    size2_t saved = backdrop_size;
+    drawBackdrop_t draw = {
+        .screen = {.1f, .2f, .032f, .032f}, .bg.texture = (texture_t const *)1,
+        .backgroundSize = .032f, .insets = {.007f, .007f, .007f, .007f}, .flags = DRAW_TILE,
+    };
+    /* The stock 32px icon and a higher-resolution variant must produce identical UVs. */
+    FOR_LOOP(i, 2) {
+        backdrop_size = (size2_t){32 << i, 32 << i};
+        R_DrawBackdrop(&draw);
+        T_FEQ(backdrop_uv.w, 1, .00001f); T_FEQ(backdrop_uv.h, 1, .00001f);
+        T_FEQ(backdrop_rect.x + backdrop_rect.w / 2, .116f, .00001f);
+        T_FEQ(backdrop_rect.y + backdrop_rect.h / 2, .216f, .00001f);
+        T_ASSERT(!backdrop_repeat);
+    }
+    /* Non-stock dimensions and unequal insets exercise the authored span rather than pixel-size guesses. */
+    draw.backgroundSize = .05f;
+    draw.insets = (typeof(draw.insets)){.002f, .004f, .006f, .008f};
+    draw.screen.w = .09f; draw.screen.h = .03f;
+    R_DrawBackdrop(&draw);
+    T_FEQ(backdrop_uv.w, 2, .00001f); T_FEQ(backdrop_uv.h, .5f, .00001f);
+    T_ASSERT(backdrop_repeat);
+    draw.flags |= DRAW_MIRRORED;
+    R_DrawBackdrop(&draw);
+    T_FEQ(backdrop_uv.x, 2, .00001f); T_FEQ(backdrop_uv.w, -2, .00001f);
+    T_FEQ(backdrop_uv.h, .5f, .00001f); T_ASSERT(backdrop_repeat);
+    draw.flags = 0;
+    R_DrawBackdrop(&draw);
+    T_FEQ(backdrop_uv.w, 1, .00001f); T_FEQ(backdrop_uv.h, 1, .00001f);
+    T_ASSERT(!backdrop_repeat);
+    draw.flags = DRAW_TILE;
+    draw.backgroundSize = .001f;
+    backdrop_calls = 0;
+    R_DrawBackdrop(&draw);
+    T_EQ(backdrop_calls, 0);
+    backdrop_size = saved;
+}
+
+TEST(renderer_shader, commandbutton_supports_generic_radial_shade) {
+    T_NOT_NULL(strstr(sd_commandbutton.FragmentBody, "u_radialShade"));
+    T_NOT_NULL(strstr(sd_commandbutton.FragmentBody, "atan(radial.x, -radial.y)"));
+}
+
+/* The campaign sun is an authored YZ quad on a root billboard bone. */
+TEST(renderer_model, mdx_billboard_faces_actual_camera_and_preserves_pivot) {
+    mdxNode_t node = { .node_id = 0, .parent_id = UINT32_MAX, .flags = MDLXNODE_Billboarded };
+    vec3_t pivot = {13, 29, 41};
+    mdxModel_t model = { .num_nodes = 1, .node_list = {&node}, .num_pivots = 1, .pivots = &pivot };
+    mat4_t transform, view, proj;
+    viewDef_t saved = tr.viewDef;
+    vec3_t eyes[] = {{400, 700, 200}, {-600, 100, 350}, {200, -500, 80}};
+    model.nodes[0] = &node;
+    Matrix4_perspective(&proj, 43, 1.4f, 1, 5000);
+    FOR_LOOP(i, 3) {
+        vec3_t dir = Vector3_unm(&eyes[i]), up = {0, 0, 1};
+        up = Vector3_rotateAroundAxis(&up, &dir, i * .27f);
+        Matrix4_lookAt(&view, &eyes[i], &dir, &up);
+        Matrix4_multiply(&proj, &view, &tr.viewDef.viewProjectionMatrix);
+        Matrix4_identity(&transform);
+        Matrix4_rotate(&transform, &(vec3_t){0, 0, i * 37.0f}, ROTATE_XYZ);
+        float scale = 1 + i * .5f;
+        Matrix4_scale(&transform, &(vec3_t){scale, scale, scale});
+        MDLX_BindBoneMatrices(&model, &transform, 0, 0);
+        mat4_t world;
+        Matrix4_multiply(&transform, &node_matrices[0], &world);
+        vec3_t normal = {world.v[0], world.v[1], world.v[2]};
+        Vector3_normalize(&normal);
+        vec3_t expected = eyes[i];
+        Vector3_normalize(&expected);
+        T_FEQ(Vector3_dot(&normal, &expected), 1, .0001f);
+        vec3_t right = {world.v[4], world.v[5], world.v[6]}, camright = {view.v[0], view.v[4], view.v[8]};
+        vec3_t top = {world.v[8], world.v[9], world.v[10]}, camup = {view.v[1], view.v[5], view.v[9]};
+        Vector3_normalize(&right); Vector3_normalize(&top);
+        T_FEQ(Vector3_dot(&right, &camright), 1, .0001f);
+        T_FEQ(Vector3_dot(&top, &camup), 1, .0001f);
+        vec3_t actual = Matrix4_multiply_vector3(&world, &pivot);
+        vec3_t before = Matrix4_multiply_vector3(&transform, &pivot);
+        T_FEQ(actual.x, before.x, .001f);
+        T_FEQ(actual.y, before.y, .001f);
+        T_FEQ(actual.z, before.z, .001f);
+    }
+    tr.viewDef = saved;
+}

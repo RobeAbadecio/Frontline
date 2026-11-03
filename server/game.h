@@ -1,0 +1,237 @@
+#ifndef game_h
+#define game_h
+
+#include "../common/shared.h"
+#include "../common/mpq.h"
+
+#define SVF_NOCLIENT 0x00000001    // don't send entity to clients, even if it has effects
+#define SVF_DEADMONSTER 0x00000002    // treat as CONTENTS_DEADMONSTER for collision
+#define SVF_MONSTER 0x00000004    // treat as CONTENTS_MONSTER for collision
+#define SVF_STATIC_SCENERY 0x00000008 // snapshot visibility; client fog shades map doodads/destructibles independently of unit sight
+#define SVF_OWNER_ONLY 0x00000010 // snapshot visibility; send only to the client selected by entityState_t.player
+
+KNOWN_AS(client_s, gameClient_t);
+KNOWN_AS(edict_s, edict_t);
+KNOWN_AS(link_s, link_t);
+
+typedef struct edict_s edict_t;
+
+struct link_s {
+    link_t *prev, *next;
+};
+
+typedef enum {
+    PF_BYTE,
+    PF_SHORT,
+    PF_LONG,
+    PF_FLOAT,
+    PF_STRING,
+    PF_POSITION,
+    PF_DIRECTION,
+    PF_ANGLE,
+    PF_ENTITY,
+    PF_UIFRAME,
+    PF_UIWINDOWFRAME,
+    PF_DATA,
+} pfWriteType_t;
+
+typedef struct {
+    void const *data;
+    uint32_t size;
+} pfWriteData_t;
+
+struct game_import {
+    handle_t (*MemAlloc)(long size);
+    void (*MemFree)(handle_t);
+    int (*ModelIndex)(cstring_t modelName);
+    int (*SoundIndex)(cstring_t soundName);
+    int (*SoundIndexAlias)(cstring_t soundName, cstring_t alias);
+    void (*Sound)(edict_t *ent, int channel, int sound_index, float volume, float attenuation, float timeofs);
+    void (*PositionedSound)(vec3_t const *origin, edict_t *ent, int channel, int sound_index, float volume,
+                            float attenuation, float timeofs);
+    void (*SoundPolicy)(vec3_t const *origin, edict_t *ent, int channel, int sound_index, float volume,
+                         float attenuation, float timeofs, soundPolicy_t const *policy);
+    void (*MinimapPing)(edict_t *ent, vec2_t const *position, float duration, color32_t color, uint32_t flags);
+    int (*ImageIndex)(cstring_t imageName);
+    int (*FontIndex)(cstring_t fontName, uint32_t fontSize);
+    void (*LinkEntity)(edict_t *ent);
+    void (*UnlinkEntity)(edict_t *ent);
+    uint32_t (*BoxEdicts)(box2_t const *area, edict_t * *list, uint32_t maxcount, bool (*pred)(edict_t const *));
+    void (*MenuAction)(cstring_t action, cstring_t arg);
+    /* Resolve the same map identity used by queued map/level actions. The
+     * game may use it to bind transient state to one resolved destination. */
+    bool (*ResolveMap)(cstring_t arg, string_t out, uint32_t out_size);
+    /* Queue a client-side movie to interpose the next deferred session action. */
+    void (*QueueMovie)(cstring_t path);
+    /* JASS PlayModelCinematic: path only, client owns MDX playback/lifecycle. */
+    void (*QueueModelCinematic)(cstring_t path);
+    void (*ClearWorld)(void);
+    /* Keep the native window responsive during synchronous map loading without
+     * advancing commands, client simulation, or server simulation. */
+    void (*LoadingFrame)(void);
+    /* VFS existence probe; follows the same map/import/archive precedence as ReadFile. */
+    bool (*FileExists)(cstring_t filename);
+    handle_t (*ReadFile)(cstring_t filename, uint32_t *size);
+    /* Calls callback for every archive copy of filename, lowest priority first.
+     * Useful for merging layered data files (e.g. GameData/Assets.txt). */
+    void (*ReadFileAll)(cstring_t filename, void (*callback)(handle_t buf, uint32_t size, void *ud), void *ud);
+    /* Mount/clear the highest-priority FS archive (current map MPQ). NULL clears. */
+    void (*SetPriorityArchive)(handle_t archive);
+    uint32_t (*GetTime)(void);
+    /* Monotonic wall clock for optional subsystem diagnostics; milliseconds. */
+    double (*MonotonicMilliseconds)(void);
+    /* Rewind/advance the simulation clock only. sv.framenum indexes the snapshot delta
+     * ring and is process state, so a loaded game must not move it. */
+    void (*SetGameTime)(uint32_t time);
+    /* Freeze only authoritative simulation advancement. The server keeps
+     * packet processing and client transport alive while paused. */
+    void (*SetPaused)(bool paused);
+    /*Request a map/session transition without re-entering server teardown from
+     *inside a game callback. The server performs it after the callback returns. */
+    bool (*RequestMap)(cstring_t map);
+    void (*RequestQuit)(void);
+    void (*multicast)(vec3_t const *origin, multicast_t to);
+    void (*unicast)(edict_t *ent);
+    void (*Write)(pfWriteType_t type, void const *value);
+
+    void (*configstring)(uint32_t index, cstring_t string);
+    void (*confignstring)(uint32_t index, cstring_t string, uint32_t len);
+    cstring_t (*GetConfigstring)(uint32_t index);
+    void (*error)(cstring_t fmt, ...);
+    void (*ApplyLobbySettings)(mapInfo_t *info);
+
+    /* Cvar access — allows the game library to read command-line/config values
+     * without linking directly against common.  Returns fallback if not set. */
+    cstring_t (*CvarString)(cstring_t name, cstring_t fallback);
+
+    /* Resolve writable per-game config/state without linking game modules against engine common. */
+    void (*UserPath)(cstring_t rel, string_t out, uint32_t out_size);
+    /* Resolve save files under the platform's per-user data directory. */
+    void (*SavePath)(cstring_t rel, string_t out, uint32_t out_size);
+    /*Enumerate available map paths through the engine filesystem. */
+    uint32_t (*ListMaps)(void (*callback)(cstring_t path, void *userData), void *userData);
+    /* Untrusted JASS save natives are confined to an engine-owned session
+     * sandbox. The game cannot choose its root or access manual saves. */
+    bool (*ScriptSavePath)(cstring_t name, string_t out, uint32_t out_size);
+    /* Read-only cache lookup never creates a workspace; the write path does. */
+    bool (*ScriptCachePath)(cstring_t name, string_t out, uint32_t out_size);
+    bool (*ScriptCacheReadPath)(cstring_t name, string_t out, uint32_t out_size);
+    /* Trusted engine-only operations, never exposed to JASS. */
+    bool (*BindScriptSaveScope)(cstring_t manual_name);
+    cstring_t (*ScriptScopeIdentity)(void);
+    bool (*ScriptSaveExists)(cstring_t name);
+    bool (*ScriptCopySave)(cstring_t source, cstring_t target);
+    bool (*ScriptRenameSaveDirectory)(cstring_t source, cstring_t target);
+    bool (*ScriptRemoveSaveDirectory)(cstring_t name);
+    /* Enumerate save basenames as a double-NUL-terminated list. */
+    uint32_t (*ListSaves)(string_t out, uint32_t out_size);
+    /* Delete one save basename from the writable save directory. */
+    bool (*DeleteSave)(cstring_t rel);
+    /* Persist local input conveniences alongside a committed manual save. */
+    bool (*SaveLocalClientState)(cstring_t name);
+};
+
+struct client;
+
+/* Unit UI query result (Phase 8) */
+typedef struct {
+    char art[256];
+    char tooltip[256];
+    char ubertip[512];
+    char command[256];
+    char hotkey;
+    uint8_t x;
+    uint8_t y;
+    uint8_t research;
+    uint8_t building_upgrade; /* unit-type morph command; uses target unit data/costs */
+    uint32_t level; /* authored research level used for owner-specific tooltip costs */
+    uint8_t active;
+    uint8_t engaged; /* ability is active; drives the command button's edge glow */
+    uint8_t disabled;
+    uint32_t number; /* optional command-button numeric overlay; 0 hides it */
+    float cooldown; /* fraction of the ability's cooldown still remaining (0=ready, 1=just used) */
+    float manacost; /* mana cost to cast this ability at its current level (0 if not a spell) */
+    char alternate[256]; /* optional secondary command, normally activated by right click */
+    uint8_t alternate_active; /* presentation state for the secondary command */
+    uint8_t queueable; /* Shift queues this command when the game supports it */
+    uint32_t cooldown_start_time; /* authoritative server milliseconds; zero when ready */
+    uint32_t cooldown_end_time;   /* authoritative server milliseconds; zero when ready */
+} gameCommandButton_t;
+
+typedef struct {
+    char art[256];
+    char tooltip[256];
+    char ubertip[512];
+    uint8_t slot;
+    uint32_t charges;
+} gameInventoryItem_t;
+
+typedef struct {
+    char art[256];
+    uint32_t starttime;
+    uint32_t endtime;
+    uint16_t flags;
+    float progress;
+} gameQueueItem_t;
+
+struct game_export {
+    void (*Init)(void);
+    void (*Shutdown)(void);
+    void (*RunFrame)(void);
+    /*Optional external-controller hooks. The server polls ExternalFrame even
+     *while the simulation clock is externally owned; returned steps are
+     *advanced by the server through the normal RunFrame boundary. */
+    bool (*ExternalActive)(void);
+    bool (*ExternalOwnsClock)(void);
+    uint32_t (*ExternalFrame)(void);
+    bool (*ExternalCanAdvance)(void);
+    void (*ExternalStepComplete)(uint32_t steps);
+    void (*ExternalMapComplete)(cstring_t map, bool success);
+    cstring_t (*GetThemeValue)(cstring_t filename);
+    void (*ClientCommand)(edict_t *ent, uint32_t argc, cstring_t argv[]);
+    void (*ClientInput)(edict_t *ent, inputCmd_t const *cmd);
+    /* Read destination metadata and write the loading layout into the multicast buffer, before LoadMap. */
+    bool (*PrepareMap)(cstring_t mapFilename);
+    void (*ClientBegin)(edict_t *ent);
+    /* Quake 2 ClientDisconnect: a client that completed ClientBegin has left; release what it owned. */
+    void (*ClientDisconnect)(edict_t *ent);
+    bool (*CanSeeEntity)(uint32_t player, edict_t const *ent);
+    /* Cheap predicate, called for each visible candidate to preserve it under saturation. */
+    bool (*IsSnapshotPriorityEntity)(uint32_t player, edict_t const *ent);
+    void (*CustomizeEntity)(uint32_t player, edict_t const *ent, entityState_t *state);
+    uint32_t (*WriteClientDatagram)(edict_t *ent, uint8_t *data, uint32_t size);
+    uint32_t (*PlayerCreateMap)(void);
+    bool (*LoadMap)(cstring_t mapFilename);
+    bool (*SaveGame)(cstring_t filename);
+    bool (*LoadGame)(cstring_t filename);
+    bool (*GetSaveMap)(cstring_t filename, string_t map, uint32_t map_size);
+    /* Optional map-owned JASS events around player save/load operations.
+     * The server passes the virtual filename, never its absolute disk path. */
+    bool (*BeforeSaveGame)(cstring_t name);
+    void (*AfterLoadGame)(cstring_t name);
+    box2_t (*GetWorldBounds)(void);
+    bool (*PathingEntityIsIgnored)(edict_t const *ent);
+    
+    edict_t *edicts;
+    int num_edicts;
+    int max_edicts;
+    int max_clients;
+    int edict_size;
+    /* Internal scripted zone restores notify the map after its snapshot has
+     * been applied, separately from user save-slot loads. */
+    void (*AfterScriptLoadGame)(cstring_t name);
+};
+
+struct game_export *GetGameAPI(struct game_import *game_import);
+
+/* Invisible controllers use the same movement axes as actors, with a game-owned focus speed. */
+static inline vec2_t input_move_focus(inputCmd_t const *cmd, player_t const *ps, float speed) {
+    uint32_t bits = cmd->move.buttons;
+    vec3_t dir = { !!(bits & BZ_MOVE_FORWARD) - !!(bits & BZ_MOVE_BACK),
+        !!(bits & BZ_MOVE_LEFT) - !!(bits & BZ_MOVE_RIGHT), 0 };
+    dir = Vector3_rotateAroundAxis(&dir, &(vec3_t){0, 0, 1}, DEG2RAD(ps->viewangles.z));
+    vec3_t pos = Vector3_mad(&ps->vieworigin, speed * cmd->move.msec / 1000.0f, &dir);
+    return (vec2_t){ pos.x, pos.y };
+}
+
+#endif

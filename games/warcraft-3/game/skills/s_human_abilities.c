@@ -1,0 +1,856 @@
+#include "s_skills.h"
+
+#define HUMAN_AUTOCAST_RADIUS 900.0f // world units; fallback acquisition radius when the spell range is zero
+#define BZ_AVATAR_BUFF MAKEFOURCC('B', 'H', 'a', 'v') // rawcode; timed Avatar buff that owns immunity and bonuses
+#define BZ_ANTI_MAGIC_SHELL_BUFF MAKEFOURCC('B', 'a', 'm', 's') // rawcode; timed Anti-Magic Shell immunity buff
+#define BZ_POLYMORPH MAKEFOURCC('A', 'p', 'l', 'y') // rawcode; stock Polymorph ability code
+#define BZ_POLYMORPH_GROUND_SLOT 2 // data slot; authored Ply2 ground morph form
+#define BZ_POLYMORPH_FLY_SLOT 3 // data slot; authored Ply3 flying morph form
+#define BZ_POLYMORPH_AMPH_SLOT 4 // data slot; authored Ply4 amphibious morph form
+#define BZ_POLYMORPH_FLOAT_SLOT 5 // data slot; authored Ply5 floating morph form
+
+typedef struct {
+    cstring_t name;
+    uint32_t slot;
+} polymorphMoveType_t;
+
+static polymorphMoveType_t const polymorph_move_types[] = {
+    { "fly", BZ_POLYMORPH_FLY_SLOT },
+    { "amph", BZ_POLYMORPH_AMPH_SLOT },
+    { "float", BZ_POLYMORPH_FLOAT_SLOT }
+};
+static uint32_t const polymorph_move_types_count = sizeof(polymorph_move_types) / sizeof(polymorph_move_types[0]);
+
+void human_ability_think(edict_t *thinker);
+
+static cstring_t human_buff(abilityitem_t const *spell, uint32_t level) {
+    cstring_t buff = S_SpellBuffId(spell->code, level);
+    if (buff) return buff;
+    /* ROC omits BuffID; Aply/ACpy share the TFT token. */
+    return G_AbilityCode(spell->code) == BZ_POLYMORPH ? "Bply" : NULL;
+}
+
+static bool human_has_status(edict_t const *ent, uint32_t code) { return G_UnitStatusLevel(ent, code) != 0; }
+
+static void human_remove_status(edict_t *ent, uint32_t code) {
+    FOR_LOOP(i, ent->unit_state ? MAX_UNIT_STATUSES : 0)
+        if (ent->unit_state->statuses[i].level && ent->unit_state->statuses[i].code == code)
+            unit_removestatus(ent, ent->unit_state->statuses + i, STATUS_REMOVE_SCRIPT);
+}
+
+static bool defend_projectile_reaction(edict_t *projectile);
+
+static heroabilitystatus_t *human_status_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    cstring_t buff = human_buff(spell, level);
+    if (!st.entity || !buff) return NULL;
+    heroabilitystatus_t *status = S_SpellApplyTimedTargetStatus(st.entity, spell->code, level, buff,
+                                         S_SpellHeroDuration(spell->code, level, st.entity));
+    /* First verified transfer family: Inner Fire.  Other buffs remain legacy
+     * dispellable but are not transferable until their cleanup is audited. */
+    if (status && status->code == MAKEFOURCC('B','i','n','f')) {
+        status->buff_flags = WC3_STATUS_BUFF_POSITIVE | WC3_STATUS_BUFF_MAGICAL |
+                             WC3_STATUS_BUFF_TRANSFERABLE;
+        status->source_ability = spell->code;
+        status->rank = level;
+    }
+    return status;
+}
+
+static void human_toggle_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    float duration = S_SpellHeroDuration(spell->code, level, caster);
+    (void)st;
+    if (human_has_status(caster, spell->code)) {
+        human_remove_status(caster, FS_SLKKey(GetClassName(spell->code))); return;
+    }
+    (void)S_SpellApplyTimedStatus(caster, GetClassName(spell->code), level, duration);
+    if (G_AbilityCode(spell->code) == MAKEFOURCC('A','d','e','f'))
+        G_AddUnitAnimationProperties(caster, "defend", true);
+}
+
+/* Retail timed immunity buffs block spell targeting and impacts, independently of physical damage. */
+bool S_UnitSpellImmune(edict_t const *unit) {
+    static uint32_t const passive[] = {
+        MAKEFOURCC('A','m','i','m'), MAKEFOURCC('A','C','m','i'),
+        MAKEFOURCC('A','C','m','2'), MAKEFOURCC('A','C','m','3')
+    };
+    if (!unit) return false;
+    FOR_LOOP(i, sizeof(passive) / sizeof(*passive)) if (G_UnitAbilityLevel(unit, passive[i])) return true;
+    return unit_hasstatusstate(unit, WC3_STATUS_STATE_MAGIC_IMMUNE) || S_PossessionSpellImmune(unit);
+}
+
+/* Spell impacts recheck immunity because a missile may have launched before Avatar was cast.
+ * Bam2 absorption is not targeting immunity: leftover damage after the shell breaks still applies. */
+bool S_SpellDamage(edict_t *target, edict_t *caster, int damage) {
+    if (!target || S_UnitSpellImmune(target)) return false;
+    if (unit_hasstatusstate(target, WC3_STATUS_STATE_ETHEREAL))
+        damage = (int)((float)damage * 1.66f);
+    damage = S_AntiMagicShellAbsorb(target, damage);
+    if (damage <= 0) return false;
+    T_Damage(target, caster, damage); return true;
+}
+
+/* Retail removes the stored deltas and clamps current health instead of subtracting it. */
+static void avatar_expire_internal(edict_t *unit, bool remove_buff) {
+    if (!unit || !unit->avatar || !unit->avatar->level) return;
+    G_ApplyTemporaryArmorBonus(unit, -unit->avatar->armor);
+    G_ApplyTemporaryAttackDamageBonus(unit, -(float)unit->avatar->damage);
+    unit->unit_state->temporary_health_bonus -= unit->avatar->health;
+    unit->health.max_value = MAX(1.0f, unit->health.max_value - unit->avatar->health);
+    G_SetHealth(unit, MIN(unit->health.value, unit->health.max_value));
+    G_FreeAvatar(unit);
+    if (remove_buff) human_remove_status(unit, BZ_AVATAR_BUFF);
+    G_AddUnitAnimationProperties(unit, "alternate", false); G_InvalidateUnitInfoPanel(unit);
+}
+
+void S_AvatarExpire(edict_t *unit) {
+    avatar_expire_internal(unit, true);
+}
+
+/* Reserve the Avatar buff slot before spell_commit spends mana; cooldowns have independent storage. */
+static bool avatar_validate(edict_t *caster, spellTarget_t target, abilityitem_t const *spell) {
+    wc3_status_apply_check_t check;
+    (void)spell;
+    (void)target; unit_updatestatuses(caster);
+    if (!S_SpellIsAliveTarget(caster) || (caster->avatar && caster->avatar->level)) return false;
+    check = unit_status_checkapplication(caster, &(status_application_t){ .buff = "BHav", .level = 1 });
+    if (check == WC3_STATUS_APPLY_REUSE || check == WC3_STATUS_APPLY_FREE_SLOT) return true;
+    fprintf(stderr, "WC3 Avatar: status capacity exhausted for unit %u\n", caster->s.number); return false;
+}
+
+/* CAbilityAvatar creates BHav, then CBuffAvatar applies the authored A/B/C deltas. */
+static void avatar_execute(edict_t *caster, spellTarget_t target, abilityitem_t const *spell) {
+    uint32_t rank = S_SpellLevel(caster, spell->code);
+    (void)target;
+    if ((caster->avatar && caster->avatar->level)) return;
+    if (!S_SpellApplyTimedStatus(caster, "BHav", rank, S_SpellDuration(spell->code, rank, false))) {
+        fprintf(stderr, "WC3 Avatar: failed to allocate BHav status\n"); return;
+    }
+    if (!caster->avatar) caster->avatar = G_AllocAvatar();
+    assert(caster->avatar);
+    caster->avatar->level = rank; caster->avatar->armor = S_SpellData(spell->code, rank, 1);
+    caster->avatar->health = S_SpellData(spell->code, rank, 2); caster->avatar->damage = (int32_t)S_SpellData(spell->code, rank, 3);
+    G_ApplyTemporaryArmorBonus(caster, caster->avatar->armor);
+    G_ApplyTemporaryAttackDamageBonus(caster, (float)caster->avatar->damage);
+    caster->unit_state->temporary_health_bonus += caster->avatar->health;
+    caster->health.max_value = MAX(1.0f, caster->health.max_value + caster->avatar->health);
+    G_SetHealth(caster, MIN(caster->health.max_value, caster->health.value + MAX(0.0f, caster->avatar->health)));
+    G_AddUnitAnimationProperties(caster, "alternate", true); G_InvalidateUnitInfoPanel(caster);
+}
+
+/* BuffID orders the caster and victim markers; only the victim marker owns movement/attack locks. */
+static uint32_t shackles_buff(uint32_t code, uint32_t rank) {
+    cstring_t buffs = G_AbilityLevel(code, rank)->buffID;
+    char source[5], target[5];
+    if (buffs && sscanf(buffs, "%4[^,],%4s", source, target) == 2) return FS_SLKKey(target);
+    fprintf(stderr, "WC3 Shackles: missing caster/target buff pair for %08x\n", code);
+    return 0;
+}
+
+static heroabilitystatus_t *shackles_find_status_instance(edict_t *target, uint32_t code, uint32_t instance_id) {
+    if (!target || !code || !instance_id) return NULL;
+    FOR_LOOP(i, target->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t *slot = target->unit_state->statuses + i;
+        if (slot->level && slot->code == code && slot->instance_id == instance_id) return slot;
+    }
+    return NULL;
+}
+
+static bool aerial_shackles_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level, buff;
+    wc3_status_apply_check_t check;
+    if (!caster || !spell || !st.entity || !S_SpellIsAliveTarget(st.entity) ||
+        st.entity->targtype != TARG_AIR || !S_SpellIsEnemy(caster, st.entity)) return false;
+    level = S_SpellLevel(caster, spell->code);
+    buff = shackles_buff(spell->code, level);
+    if (!buff) return false;
+    check = unit_status_checkapplication(st.entity, &(status_application_t){
+        .buff = GetClassName(buff), .level = level
+    });
+    return check == WC3_STATUS_APPLY_REUSE || check == WC3_STATUS_APPLY_FREE_SLOT;
+}
+
+static bool control_magic_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    return st.entity && st.entity->owner && S_SpellIsEnemy(caster, st.entity) &&
+           caster->mana.value >= st.entity->health.value * S_SpellData(spell->code, level, 2);
+}
+
+static void control_magic_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    caster->mana.value -= st.entity->health.value * S_SpellData(spell->code, level, 2);
+    G_SetUnitPlayer(st.entity, caster->s.player); st.entity->owner = caster; st.entity->combatentity = NULL;
+    if (st.entity->stand) st.entity->stand(st.entity);
+}
+
+static bool cloud_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    (void)spell;
+    return st.entity && G_UnitIsStructure(st.entity) && st.entity->unit_state->attack1.type != ATK_NONE &&
+           S_SpellIsEnemy(caster, st.entity);
+}
+
+static bool inner_fire_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level;
+    cstring_t buff;
+    wc3_status_apply_check_t check;
+    if (!spell || !st.entity || !S_SpellIsFriend(caster, st.entity)) return false;
+    level = S_SpellLevel(caster, spell->code);
+    buff = human_buff(spell, level);
+    if (!buff) return false;
+    check = unit_status_checkapplication(st.entity, &(status_application_t){ .buff = buff, .level = level });
+    return check == WC3_STATUS_APPLY_REUSE || check == WC3_STATUS_APPLY_FREE_SLOT;
+}
+
+static bool heal_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    (void)spell;
+    return st.entity && st.entity->targtype != TARG_MECHANICAL && S_SpellIsFriend(caster, st.entity) &&
+           st.entity->health.value < st.entity->health.max_value;
+}
+
+static void heal_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    S_SpellHeal(st.entity, S_SpellData(spell->code, S_SpellLevel(caster, spell->code), 1));
+    G_SpawnAbilityEffectTarget(spell->code, WC3_EFFECT_TARGET, 0, st.entity, NULL, true);
+}
+
+static bool slow_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    (void)spell;
+    return st.entity && S_SpellIsEnemy(caster, st.entity);
+}
+
+static bool invisibility_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level;
+    cstring_t buff;
+    bool has_slot;
+
+    if (!spell || !st.entity || !S_SpellIsAliveTarget(st.entity) ||
+        !S_SpellIsFriend(caster, st.entity)) return false;
+    level = S_SpellLevel(caster, spell->code);
+    buff = human_buff(spell, level);
+    if (!buff || strlen(buff) != 4 ||
+        S_SpellHeroDuration(spell->code, level, st.entity) <= 0.0f) return false;
+    has_slot = unit_findstatus(st.entity, *((uint32_t const *)buff)) != NULL;
+    if (has_slot) return true;
+    FOR_LOOP(i, st.entity->unit_state ? MAX_UNIT_STATUSES : 0)
+        if (!st.entity->unit_state->statuses[i].level) return true;
+    return false;
+}
+
+static void invisibility_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level;
+    cstring_t buff;
+    heroabilitystatus_t *status;
+
+    if (!caster || !st.entity || !spell) return;
+    level = S_SpellLevel(caster, spell->code);
+    buff = human_buff(spell, level);
+    if (!buff || strlen(buff) != 4) return;
+    status = human_status_execute(caster, st, spell);
+    if (!status) {
+        fprintf(stderr, "WC3 Invisibility: authored status %.4s missing after cast on unit %u\n",
+                buff, st.entity->s.number);
+        return;
+    }
+    status->data = spell->code;
+    st.entity->s.renderfx |= RF_HIDDEN;
+}
+
+/* Record presence is the authoritative Polymorph state for orders and JASS. */
+bool S_UnitPolymorphed(edict_t const *unit) {
+    return unit && unit->polymorph;
+}
+
+/* Select the authored Ply2-Ply5 form from the target's movement class. */
+static uint32_t polymorph_form_type(edict_t const *target, uint32_t level, uint32_t code) {
+    cstring_t movetp;
+    uint32_t data_slot = BZ_POLYMORPH_GROUND_SLOT;
+
+    if (!target || !target->data.UnitData) return 0;
+    movetp = target->data.UnitData->moveTypeName;
+    if (movetp) {
+        FOR_LOOP(i, polymorph_move_types_count)
+            if (!strcmp(movetp, polymorph_move_types[i].name)) {
+                data_slot = polymorph_move_types[i].slot;
+                break;
+            }
+    }
+    /* AbilityData stores Ply1..Ply5 in DataA..DataE.  The typed FOURCC view
+     * deliberately keeps the first rawcode from Warcraft's unit-list string;
+     * stock Aply uses one morph unit for each movement class. */
+    return S_SpellDataId(code, level, data_slot);
+}
+
+/* Reject invalid targets and authored morph forms before spell resources commit. */
+static bool polymorph_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level, max_creep_level, form_type;
+    UnitBalance_t const *balance;
+    wc3_status_apply_check_t check;
+
+    if (!st.entity || !S_SpellIsEnemy(caster, st.entity) || G_UnitIsHero(st.entity) ||
+        st.entity->summon_ability || (st.entity->aiflags & AI_ILLUSION) ||
+        st.entity->targtype == TARG_MECHANICAL) return false;
+    level = S_SpellLevel(caster, spell->code);
+    max_creep_level = (uint32_t)MAX(0.0f, S_SpellData(spell->code, level, 1)); /* Ply1 */
+    balance = st.entity->data.UnitBalance;
+    if (st.entity->s.player == PLAYER_NEUTRAL_AGGRESSIVE && max_creep_level && balance &&
+        balance->level > (int32_t)max_creep_level) return false;
+    form_type = polymorph_form_type(st.entity, level, spell->code);
+    if (!form_type) {
+        fprintf(stderr, "WC3 Polymorph: no authored morph form for target %08x\n", st.entity->class_id);
+        return false;
+    }
+    if (!G_UnitUI(form_type)->modelFile) {
+        fprintf(stderr, "WC3 Polymorph: morph form %08x has no model data\n", form_type);
+        return false;
+    }
+    check = unit_status_checkapplication(st.entity, &(status_application_t){
+        .buff = human_buff(spell, level), .level = level
+    });
+    return check == WC3_STATUS_APPLY_REUSE || check == WC3_STATUS_APPLY_FREE_SLOT;
+}
+
+/* Restore the target's saved presentation and movement state when Polymorph ends. */
+void S_PolymorphRemove(edict_t *unit) {
+    gameClient_t *client;
+
+    if (!unit || !unit->polymorph) return;
+    unit->s.model = unit->polymorph->original_model;
+    unit->s.scale = unit->polymorph->original_scale;
+    unit->unitinfo.MoveSpeed = unit->polymorph->original_move_speed;
+    G_FreePolymorph(unit);
+    unit->animation = NULL;
+    if (!M_IsDead(unit)) {
+        G_ClearUnitOrderQueue(unit);
+        unit_leavecombat(unit);
+        unit->goalentity = NULL;
+        unit->orders->resource_goal = NULL;
+        unit_stand(unit);
+    }
+    client = G_GetPlayerClientByNumber(unit->s.player);
+    if (client) G_InvalidateCommands(client);
+    G_InvalidateUnitInfoPanel(unit);
+    G_InvalidateUnitPortrait(unit);
+}
+
+/* Apply the authored morph presentation while preserving the target edict and stats. */
+static void polymorph_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level, form_type, buff_code = 0;
+    cstring_t buff;
+    UnitUI_t const *ui;
+    UnitBalance_t const *balance;
+    PATHSTR model_filename;
+    int model;
+    float duration;
+
+    if (!st.entity) return;
+    level = S_SpellLevel(caster, spell->code);
+    form_type = polymorph_form_type(st.entity, level, spell->code);
+    buff = human_buff(spell, level);
+    if (!form_type) {
+        fprintf(stderr, "WC3 Polymorph: no authored morph form for target %08x\n", st.entity->class_id);
+        return;
+    }
+    if (!buff) {
+        fprintf(stderr, "WC3 Polymorph: ability %08x has no configured buff\n", spell->code);
+        return;
+    }
+    memcpy(&buff_code, buff, MIN((size_t)4, strlen(buff)));
+    ui = G_UnitUI(form_type);
+    balance = G_UnitBalance(form_type);
+    if (!ui->modelFile) {
+        fprintf(stderr, "WC3 Polymorph: morph form %08x has no model data\n", form_type);
+        return;
+    }
+    G_NormalizeModelFilename(ui->modelFile, model_filename, sizeof(model_filename));
+    model = G_RegisterModel(model_filename);
+    if (!model) {
+        fprintf(stderr, "WC3 Polymorph: failed to register model '%s' for form %08x\n",
+                model_filename, form_type);
+        return;
+    }
+
+    duration = S_SpellDuration(spell->code, level, false);
+    if (!S_SpellApplyTimedStatus(st.entity, buff, level, duration)) {
+        fprintf(stderr, "WC3 Polymorph: failed to apply buff %08x to target %08x\n",
+                buff_code, st.entity->class_id);
+        return;
+    }
+
+    if (!st.entity->polymorph) {
+        st.entity->polymorph = G_AllocPolymorph();
+        assert(st.entity->polymorph);
+        st.entity->polymorph->original_model = st.entity->s.model;
+        st.entity->polymorph->original_scale = st.entity->s.scale;
+        st.entity->polymorph->original_move_speed = st.entity->unitinfo.MoveSpeed;
+    }
+    assert(st.entity->polymorph);
+    st.entity->polymorph->ability = spell->code;
+    st.entity->polymorph->buff = buff_code;
+    st.entity->polymorph->form_type = form_type;
+    st.entity->s.model = model;
+    st.entity->s.scale = ui->modelScale > 0.0f ? ui->modelScale : 1.0f;
+    if (balance->speed > 0.0f) st.entity->unitinfo.MoveSpeed = balance->speed;
+
+    /* Polymorph interrupts actions that require the original unit's attacks or
+     * command abilities.  The transformed unit remains the same edict/JASS
+     * handle and may receive fresh movement orders while the buff is active. */
+    G_ClearUnitOrderQueue(st.entity);
+    S_SpellCancelChannel(st.entity);
+    unit_leavecombat(st.entity);
+    st.entity->goalentity = NULL;
+    st.entity->orders->resource_goal = NULL;
+    st.entity->animation = NULL;
+    unit_stand(st.entity);
+    {
+        gameClient_t *client = G_GetPlayerClientByNumber(st.entity->s.player);
+        if (client) G_InvalidateCommands(client);
+    }
+    G_InvalidateUnitInfoPanel(st.entity);
+    G_InvalidateUnitPortrait(st.entity);
+    G_SpawnAbilityEffectTarget(spell->code, WC3_EFFECT_TARGET, 0, st.entity, NULL, true);
+}
+
+static void aerial_shackles_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    uint32_t buff = shackles_buff(spell->code, level);
+    float duration;
+    edict_t *thinker;
+    heroabilitystatus_t *slot;
+    if (!st.entity || !buff) return;
+    duration = S_SpellHeroDuration(spell->code, level, st.entity);
+    /* Reserve the thinker before status mutation; if status insertion fails,
+     * discard it before it can begin a channel or deal its first damage tick. */
+    thinker = S_SpellChannelTargetThinker(caster, spell->code, st.entity);
+    if (!thinker) return;
+    slot = S_SpellApplyTimedStatus(st.entity, GetClassName(buff), level, duration);
+    if (!slot) {
+        G_FreeEdict(thinker);
+        return;
+    }
+    thinker->variation = slot->instance_id;
+    thinker->resources = buff;
+    thinker->damage = (uint32_t)S_SpellData(spell->code, level, 1);
+    thinker->spawn_time = G_Time() + (uint32_t)(duration * 1000.0f);
+    thinker->think = human_ability_think;
+    human_ability_think(thinker);
+}
+
+/* A cancelled cast must release its lock without erasing a replacement cast's lock on the same victim. */
+static void shackles_end(edict_t *thinker) {
+    edict_t *target = S_SpellChannelTarget(thinker);
+    bool retained = false;
+    if (target) {
+        heroabilitystatus_t *slot = shackles_find_status_instance(target, thinker->resources, thinker->variation);
+        /* Never remove a replacement or independently owned status. */
+        if (slot) {
+            FILTER_EDICTS(other, other != thinker && other->think == human_ability_think &&
+                S_SpellChannelTarget(other) == target && other->resources == thinker->resources &&
+                other->variation == thinker->variation) {
+                if (S_SpellChannelActive(other)) { retained = true; break; }
+            }
+            if (!retained) unit_removestatus(target, slot, STATUS_REMOVE_SCRIPT);
+        }
+    }
+    S_SpellEndChannel(thinker);
+}
+
+void human_ability_think(edict_t *thinker) {
+    uint32_t now = G_Time();
+    edict_t *target;
+    if (S_AbilityItem(thinker->class_id).ability->proc == CAbilityFlare) {
+        edict_t *owner = S_SpellChannelOwner(thinker);
+        if (now >= thinker->spawn_time || !owner) { G_FreeEdict(thinker); return; }
+        G_FowSetStateRadius(&(fogWrite_t){ owner->s.player, WC3_FOG_STATE_VISIBLE, true }, &thinker->s.origin2,
+                            S_SpellNumber(thinker->class_id, ABILITY_NUMBER_AREA, 1));
+        return;
+    }
+    target = S_SpellChannelTarget(thinker);
+    if (now >= thinker->spawn_time || !S_SpellChannelActive(thinker) || !S_SpellIsAliveTarget(target)) {
+        shackles_end(thinker); return;
+    }
+    /* A dispel or replacement ends this cast; rawcode alone is not ownership. */
+    {
+        heroabilitystatus_t *slot = shackles_find_status_instance(target, thinker->resources, thinker->variation);
+        if (!slot || (slot->timestamp && slot->timestamp <= now)) {
+            shackles_end(thinker); return;
+        }
+    }
+    if (!thinker->freetime || now >= thinker->freetime) {
+        S_SpellDamage(target, thinker->owner, thinker->damage); thinker->freetime = now + 1000;
+    }
+}
+
+/* Find a transferable source/recipient pair before committing a Spell Steal cast.
+ * Keep validation and execution on the same eligibility policy. A candidate
+ * with a full array or an already-owned buff must not hide a later candidate. */
+static bool spell_steal_select(edict_t *caster, spellTarget_t st, abilityitem_t const *spell,
+                               heroabilitystatus_t **selected, edict_t **recipient) {
+    uint32_t now, level;
+    float area;
+    bool positive, negative;
+    if (!caster || !spell || st.type != SPELL_TARGET_UNIT || !st.entity ||
+        !S_SpellIsAliveTarget(st.entity) ||
+        !S_SpellAllowsTarget(spell->code, caster, st.entity)) return false;
+    positive = S_SpellIsEnemy(caster, st.entity);
+    negative = S_SpellIsFriend(caster, st.entity);
+    if (!positive && !negative) return false;
+    now = G_Time(); level = S_SpellLevel(caster, spell->code);
+    area = S_SpellNumber(spell->code, ABILITY_NUMBER_AREA, level);
+    FOR_LOOP(i, st.entity->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t *status = st.entity->unit_state->statuses + i;
+        char buff[5];
+        edict_t *receiver = NULL;
+        bool source_positive;
+        if (!unit_status_can_steal(status) || status->timestamp <= now) continue;
+        source_positive = (status->buff_flags & WC3_STATUS_BUFF_POSITIVE) != 0;
+        if (source_positive != positive) continue;
+        memcpy(buff, &status->code, 4); buff[4] = '\0';
+        FILTER_EDICTS(unit, unit != st.entity && S_SpellIsAliveTarget(unit) &&
+                      (positive ? S_SpellIsFriend(caster, unit) : S_SpellIsEnemy(caster, unit)) &&
+                      Vector2_distance(&unit->s.origin2, &st.entity->s.origin2) <= area) {
+            if (unit_status_checkapplication(unit, &(status_application_t){
+                .buff = buff, .level = status->level
+            }) == WC3_STATUS_APPLY_FREE_SLOT) { receiver = unit; break; }
+        }
+        if (!receiver && positive && caster != st.entity && S_SpellIsAliveTarget(caster) &&
+            unit_status_checkapplication(caster, &(status_application_t){
+                .buff = buff, .level = status->level
+            }) == WC3_STATUS_APPLY_FREE_SLOT) receiver = caster;
+        if (!receiver) continue;
+        if (selected) *selected = status;
+        if (recipient) *recipient = receiver;
+        return true;
+    }
+    return false;
+}
+
+static bool spell_steal_validate(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    return spell_steal_select(caster, st, spell, NULL, NULL);
+}
+
+static void spell_steal_execute(edict_t *caster, spellTarget_t st, abilityitem_t const *spell) {
+    heroabilitystatus_t *source, *destination;
+    heroabilitystatus_t snapshot;
+    edict_t *receiver;
+    status_application_t app;
+    char buff[5];
+    uint32_t now = G_Time();
+    if (!spell_steal_select(caster, st, spell, &source, &receiver)) return;
+    snapshot = *source;
+    if (snapshot.timestamp <= now) return;
+    memcpy(buff, &snapshot.code, 4); buff[4] = '\0';
+    /* This is an exact, fresh allocation: never replace recipient ownership. */
+    if (unit_status_checkapplication(receiver, &(status_application_t){
+        .buff = buff, .level = snapshot.level
+    }) != WC3_STATUS_APPLY_FREE_SLOT) return;
+    app = (status_application_t){
+        .buff = buff, .level = snapshot.level,
+        .duration = (snapshot.timestamp - now) / 1000.0f,
+        .source_ability = snapshot.source_ability, .data = snapshot.data,
+        .state_mask = snapshot.state_mask, .buff_flags = snapshot.buff_flags,
+        .source = caster, .rank = snapshot.rank
+    };
+    destination = unit_applystatus(receiver, &app);
+    if (!destination) return;
+    destination->modifier_count = MIN(snapshot.modifier_count, WC3_STATUS_MAX_MODIFIERS);
+    memcpy(destination->modifiers, snapshot.modifiers, sizeof(destination->modifiers));
+    unit_removestatus(st.entity, source, STATUS_REMOVE_STEAL);
+}
+
+/* The message selects the union member: boolean toggles must never be decoded as target pointers. */
+#define BZ_HUMAN_AUTOCAST_SPELL(NAME, VALIDATE, EXECUTE, FRIENDLY, WOUNDED) \
+    BZ_ABILITY_PROC(C##NAME) { \
+        spellTarget_t target = (msg == A_VALIDATE || msg == A_EXECUTE) && call && call->target ? \
+            *call->target : MAKE(spellTarget_t, .type = SPELL_TARGET_NONE); \
+        uint32_t code = call && call->item ? call->item->code : 0; \
+        switch (msg) { \
+        case A_VALIDATE: return VALIDATE; \
+        case A_EXECUTE: EXECUTE(ent, target, call ? call->item : NULL); return true; \
+        case A_AUTOCAST_ON: return ent && ent->unit_state->autocast == code; \
+        case A_AUTOCAST_SET: return true; \
+        case A_AUTOCAST_ACQUIRE: return S_AutocastAcquireUnit(ent, code, FRIENDLY, WOUNDED, 900.0f); \
+        default: return CAbilitySimpleSpell(ent, msg, call); \
+        } \
+    }
+
+/* Name=Aerial Shackles
+ * Ubertip="Magically binds a target enemy air unit, so that it cannot move or attack and takes <Amls,DataA1> damage per second. Lasts <Amls,Dur1> seconds."
+ */
+BZ_VALIDATED_SPELL_PROC(AbilityMagicLeash, aerial_shackles_validate, aerial_shackles_execute)
+/* Name=Control Magic
+ * Ubertip="Takes control of an enemy summoned unit. The mana cost is <Acmg,DataB1,%>% of the summoned unit's current hit points."
+ */
+BZ_VALIDATED_SPELL_PROC(AbilityControlMagic, control_magic_validate, control_magic_execute)
+/* Name=Magic Defense; Untip=Stop Magic Defense */
+BZ_SIMPLE_SPELL_PROC(AbilityMagicDefense) { human_toggle_execute(caster, st, spell); }
+/* Name=Spell Steal; Untip="Right-click to activate auto-casting." */
+BZ_HUMAN_AUTOCAST_SPELL(AbilitySpellSteal, spell_steal_validate(ent, target, call ? call->item : NULL), spell_steal_execute, false, false)
+/* Name=Cloud; Ubertip="Cast on enemy buildings with ranged attacks to stop the buildings from attacking. Lasts <Aclf,Dur1> seconds." */
+BZ_VALIDATED_SPELL_PROC(AbilityCloudOfFog, cloud_validate, human_status_execute)
+/* Name=Defend; Untip=Stop Defend */
+BZ_ABILITY_PROC(CAbilityDefend) {
+    spellTarget_t target = msg == A_EXECUTE && call && call->target ?
+        *call->target : MAKE(spellTarget_t, .type = SPELL_TARGET_NONE);
+    uint32_t const code = call && call->item ? call->item->code : 0;
+    switch (msg) {
+    case A_TOGGLE_ON: return ent && human_has_status(ent, code);
+    case A_EXECUTE:
+        if (!call || !call->item || !G_UnitAbilityResearchAvailable(ent, code)) return false;
+        human_toggle_execute(ent, target, call->item);
+        return true;
+    case A_PROJECTILE_HIT: return defend_projectile_reaction(call ? call->entity : NULL);
+    default: return CAbilitySimpleSpell(ent, msg, call);
+    }
+}
+/* Name=Flare; Ubertip="Launches a Dwarven flare above a target point, which reveals that area for <Afla,Dur1> seconds." */
+BZ_SIMPLE_SPELL_PROC(AbilityFlare) {
+    uint32_t level = S_SpellLevel(caster, spell->code);
+    edict_t *thinker = G_Spawn();
+    thinker->owner = caster; thinker->class_id = spell->code; thinker->s.origin2 = st.point;
+    thinker->channel = G_AllocChannel();
+    assert(thinker->channel);
+    thinker->channel->owner_spawn_time = caster->spawn_time;
+    thinker->spawn_time = G_Time() + (uint32_t)(S_SpellDuration(spell->code, level, false) * 1000.0f);
+    thinker->think = human_ability_think; human_ability_think(thinker);
+}
+/* Name=Inner Fire; Untip="Right-click to activate auto-casting." */
+BZ_HUMAN_AUTOCAST_SPELL(AbilityInnerFire, inner_fire_validate(ent, target, call ? call->item : NULL), human_status_execute, true, false)
+/* Dispel Magic family (Adis/Adch/Advm): area timed-status clear; Advm also heals per buff.
+ * Adis/Adch author summoned damage in DataB; Advm authors heals in DataA/DataB and damage in DataE.
+ * Summons are marked with owner (S_SummonAt), and optionally summon_ability / AI_ILLUSION. */
+static bool dispel_is_summoned(edict_t const *unit) {
+    return unit && (unit->owner || unit->summon_ability || (unit->aiflags & AI_ILLUSION));
+}
+
+/* Shared point-area dispel for ordinary spells and item power-ups.  Use the
+ * authored code's own DataB/Area rather than borrowing the Priest's values.
+ * Timed-life and other non-dispellable lifecycle statuses are protected by
+ * unit_status_can_magic_dispel; resurrected/animated dispel-immune summons
+ * are separately protected from summoned damage. */
+void S_DispelMagicArea(edict_t *caster, uint32_t code, uint32_t level, vec2_t const *point) {
+    uint32_t removed = 0;
+    float area = S_SpellNumber(code, ABILITY_NUMBER_AREA, level);
+    float data_a = S_SpellData(code, level, 1), data_b = S_SpellData(code, level, 2);
+    float data_e = S_SpellData(code, level, 5);
+    float summon_dmg = data_e > 0.0f ? data_e : data_b;
+    float heal_hp = data_e > 0.0f ? data_a : 0.0f, heal_mana = data_e > 0.0f ? data_b : 0.0f;
+    if (!caster || !point || !(area >= 0.0f)) return;
+    FILTER_EDICTS(target, S_SpellIsAliveTarget(target) &&
+                  Vector2_distance(&target->s.origin2, point) <= area) {
+        uint32_t target_removed = 0;
+        FOR_LOOP(i, target->unit_state ? MAX_UNIT_STATUSES : 0) {
+            if (target->unit_state->statuses[i].level && target->unit_state->statuses[i].timestamp) {
+                if (!unit_status_can_magic_dispel(&target->unit_state->statuses[i])) continue;
+                unit_removestatus_deferred(target, target->unit_state->statuses + i, STATUS_REMOVE_DISPEL);
+                removed++; target_removed++;
+            }
+        }
+        if (target_removed) {
+            unit_refreshstatusflags(target);
+            G_InvalidateUnitInfoPanel(target);
+        }
+        /* Retail dispel damages hostile summons, not friendly summons. */
+        if (!S_SpellIsFriend(caster, target) && dispel_is_summoned(target) &&
+            !S_SummonIsDispelImmune(target) && summon_dmg > 0.0f)
+            S_SpellDamage(target, caster, (int)summon_dmg);
+    }
+    if (removed && heal_hp > 0.0f) S_SpellHeal(caster, heal_hp * (float)removed);
+    if (removed && heal_mana > 0.0f)
+        caster->mana.value = MIN(caster->mana.max_value, caster->mana.value + heal_mana * (float)removed);
+}
+
+BZ_SIMPLE_SPELL_PROC(AbilityDispelMagic) {
+    S_DispelMagicArea(caster, spell->code, S_SpellLevel(caster, spell->code), &st.point);
+}
+/* Name=Heal; Ubertip="Heals a target friendly non-mechanical wounded unit for <Ahea,DataA1> hit points." */
+BZ_HUMAN_AUTOCAST_SPELL(AbilityHeal, heal_validate(ent, target, call ? call->item : NULL), heal_execute, true, true)
+/* Name=Slow; Untip="Right-click to activate auto-casting." */
+BZ_HUMAN_AUTOCAST_SPELL(AbilitySlow, slow_validate(ent, target, call ? call->item : NULL), human_status_execute, false, false)
+/* Name=Invisibility; Ubertip="Makes a unit invisible. If the unit attacks, uses an ability or casts a spell, it will become visible." */
+BZ_ABILITY_PROC(CAbilityInvisibility) {
+    spellTarget_t target = (msg == A_VALIDATE || msg == A_EXECUTE) && call && call->target ?
+        *call->target : MAKE(spellTarget_t, .type = SPELL_TARGET_NONE);
+
+    switch (msg) {
+    case A_VALIDATE:
+        return invisibility_validate(ent, target, call ? call->item : NULL);
+    case A_EXECUTE:
+        invisibility_execute(ent, target, call ? call->item : NULL);
+        return true;
+    case A_STATUS_REMOVE:
+        if (ent && call && call->status.slot &&
+            !S_UnitHasTemporaryInvisibility(ent, call->status.slot))
+            ent->s.renderfx &= ~RF_HIDDEN;
+        return true;
+    default:
+        return CAbilitySimpleSpell(ent, msg, call);
+    }
+}
+/* Name=Polymorph; Ubertip="Turns a target enemy unit into a sheep. Cannot be cast on Heroes. Lasts <Aply,Dur1> seconds." */
+BZ_VALIDATED_SPELL_PROC(AbilityPolymorph, polymorph_validate, polymorph_execute)
+/* Name=Avatar */
+BZ_ABILITY_PROC(CAbilityAvatar) {
+    spellTarget_t target = (msg == A_VALIDATE || msg == A_EXECUTE) && call && call->target ?
+        *call->target : MAKE(spellTarget_t, .type = SPELL_TARGET_NONE);
+    switch (msg) {
+    case A_VALIDATE: return avatar_validate(ent, target, call ? call->item : NULL);
+    case A_EXECUTE: avatar_execute(ent, target, call ? call->item : NULL); return true;
+    case A_DISABLE: S_AvatarExpire(ent); return true;
+    default: return CAbilitySimpleSpell(ent, msg, call);
+    }
+}
+
+bool S_HumanCanAttack(edict_t const *unit) {
+    return unit && !human_has_status(unit, MAKEFOURCC('B','m','l','t')) &&
+           !human_has_status(unit, MAKEFOURCC('B','c','l','f')) && !S_UnitPolymorphed(unit);
+}
+
+float S_HumanMoveFactor(edict_t const *unit) {
+    uint32_t level;
+    float factor = 1.0f;
+    if ((level = G_UnitStatusLevel(unit, MAKEFOURCC('B','s','l','o')))) factor *= 1.0f - S_SpellData(MAKEFOURCC('A','s','l','o'), level, 1);
+    if ((level = G_UnitStatusLevel(unit, MAKEFOURCC('A','d','e','f')))) factor *= 1.0f - S_SpellData(MAKEFOURCC('A','d','e','f'), level, 3);
+    if ((level = G_UnitStatusLevel(unit, MAKEFOURCC('A','m','d','f')))) factor *= 1.0f - S_SpellData(MAKEFOURCC('A','m','d','f'), level, 3);
+    factor *= 1.0f - S_SlowAuraMoveReduction(unit);
+    if (human_has_status(unit, MAKEFOURCC('B','m','l','t'))) return 0.0f;
+    return factor;
+}
+
+float S_DefendAttackReduction(edict_t const *unit) {
+    uint32_t level = G_UnitStatusLevel(unit, MAKEFOURCC('A','d','e','f'));
+    /* Adef DataD is an attack-speed reduction fraction. Warsmash installs it
+     * as a negative ATKSPD non-stacking stat buff while Defend is active. */
+    return level ? S_SpellData(MAKEFOURCC('A','d','e','f'), level, 4) : 0.0f;
+}
+
+float S_HumanArmorBonus(edict_t const *unit) {
+    uint32_t level;
+    float bonus = 0.0f;
+    if ((level = G_UnitStatusLevel(unit, MAKEFOURCC('B','i','n','f')))) bonus += S_SpellData(MAKEFOURCC('A','i','n','f'), level, 2);
+    return bonus;
+}
+
+static int defend_damage_taken(edict_t *target, uint32_t attack_type, int damage) {
+    uint32_t const level = G_UnitStatusLevel(target, MAKEFOURCC('A','d','e','f'));
+    float factor = 1.0f;
+    if (!level || damage <= 0) return damage;
+    if (attack_type == ATK_PIERCE)
+        factor = S_SpellData(MAKEFOURCC('A','d','e','f'), level, 1);
+    else if (attack_type == ATK_MAGIC || attack_type == ATK_SPELLS)
+        factor = S_SpellData(MAKEFOURCC('A','d','e','f'), level, 5);
+    return (int)((float)damage * MAX(0.0f, factor));
+}
+
+/* Reflect a basic attack missile while the target's Defend ability owns the reaction. */
+static bool defend_projectile_reaction(edict_t *projectile) {
+    uint32_t level, attack_type;
+    float chance, deflect_factor;
+    edict_t *attacker, *target;
+    vec3_t dir;
+
+    /* Spell missiles install their own move/end callback; Defend reacts only
+     * to the shared basic-attack projectile contract. A returned missile may
+     * hit its source, but cannot be reflected recursively. */
+    if (!projectile || projectile->movetype != MOVETYPE_FLYMISSILE || projectile->currentmove ||
+        !projectile->missile || projectile->missile->reflected || !(attacker = projectile->owner) || !attacker->inuse ||
+        !(target = projectile->goalentity) || !target->inuse ||
+        !(level = G_UnitStatusLevel(target, MAKEFOURCC('A','d','e','f')))) return false;
+    if (game.constants.combatConstantsLoaded && !game.constants.defendDeflection) return false;
+
+    attack_type = projectile->missile->attack_type;
+    if (attack_type == ATK_PIERCE)
+        deflect_factor = S_SpellData(MAKEFOURCC('A','d','e','f'), level, 7);
+    else if (attack_type == ATK_MAGIC || attack_type == ATK_SPELLS)
+        deflect_factor = S_SpellData(MAKEFOURCC('A','d','e','f'), level, 8);
+    else
+        return false;
+
+    /* Warsmash/WC3 stores Defend Data F on a 0..100 scale, unlike normal
+     * percentage multipliers. Data G/H >= 1 disables deflection for the
+     * corresponding attack class. */
+    if (deflect_factor >= 1.0f) return false;
+    chance = S_SpellData(MAKEFOURCC('A','d','e','f'), level, 6);
+    if (chance <= 0.0f || (chance < 100.0f && ((float)rand() / (float)RAND_MAX) * 100.0f >= chance))
+        return false;
+
+    /* A deflected hit can still leak authored damage through Data G/H. It is
+     * ordinary non-attack damage with the original attack type, so apply the
+     * target's Defend damage-taken multiplier and armor/type table but do not
+     * replay attack on-hit passives. Stock Footman Defend has Data G=0. */
+    if (deflect_factor > 0.0f) {
+        int damage = G_AttackDamageWithType(attacker, target, (int)((float)projectile->damage * deflect_factor), attack_type);
+        damage = defend_damage_taken(target, attack_type, damage);
+        if (damage > 0) T_Damage(target, attacker, damage);
+    }
+
+    projectile->missile->reflected = true;
+    if (G_UnitIsStructure(attacker)) {
+        /* Retail Defend may block a tower's shot but does not send the missile
+         * back into the structure. The successful reaction consumes the shot. */
+        G_FreeEdict(projectile);
+        return true;
+    }
+
+    projectile->goalentity = attacker;
+    dir = Vector3_sub(&attacker->s.origin, &projectile->s.origin);
+    if (Vector3_len(&dir) > 0.0f) projectile->s.angle = atan2f(dir.y, dir.x);
+    return true;
+}
+
+int S_HumanAttackDamage(edict_t *attacker, edict_t *target, int damage) {
+    uint32_t level;
+    if ((level = G_UnitStatusLevel(attacker, MAKEFOURCC('B','i','n','f'))))
+        damage = (int)(damage * (1.0f + S_SpellData(MAKEFOURCC('A','i','n','f'), level, 1)));
+    damage = S_FeedbackDamage(attacker, target, damage);
+    if ((level = G_UnitAbilityLevel(attacker, MAKEFOURCC('A','f','s','h'))) && target->unit_state->defense_type <= 2)
+        damage += (int)S_SpellData(MAKEFOURCC('A','f','s','h'), level, 3 + target->unit_state->defense_type);
+    /* Defend Data B scales the defender's own attacks while the stance is
+     * active. Data A reduces non-deflected Piercing hits; Data E does the same
+     * for Magic/Spells. Projectile deflection itself happens in g_phys.c so a
+     * successful shot can keep travelling back to its source. */
+    if ((level = G_UnitStatusLevel(attacker, MAKEFOURCC('A','d','e','f'))))
+        damage = (int)((float)damage * MAX(0.0f, S_SpellData(MAKEFOURCC('A','d','e','f'), level, 2)));
+    return defend_damage_taken(target, attacker->unit_state->attack1.type, damage);
+}
+
+void S_HumanAttackSplash(edict_t *attacker, edict_t *target, int damage) {
+    uint32_t flak = G_UnitAbilityLevel(attacker, MAKEFOURCC('A','f','l','k'));
+    uint32_t barrage = G_UnitAbilityLevel(attacker, MAKEFOURCC('A','r','o','c'));
+    uint32_t storm = G_UnitAbilityLevel(attacker, MAKEFOURCC('A','s','t','h'));
+    float radius = storm ? attacker->unit_state->attack1.areaSmall : flak ? S_SpellData(MAKEFOURCC('A','f','l','k'), flak, 2) :
+                   barrage ? S_SpellNumber(MAKEFOURCC('A','r','o','c'), ABILITY_NUMBER_AREA, barrage) : 0.0f;
+    uint32_t count = 0, limit = barrage ? (uint32_t)S_SpellData(MAKEFOURCC('A','r','o','c'), barrage, 3) : UINT_MAX;
+    if (radius <= 0.0f) return;
+    FILTER_EDICTS(other, count < limit && other != target && S_SpellIsAliveTarget(other) && S_SpellIsEnemy(attacker, other) &&
+                  S_AttackHitAllowed(attacker, target, other) &&
+                  (!flak || other->targtype == TARG_AIR) && Vector2_distance(&other->s.origin2, &target->s.origin2) <= radius) {
+        float distance = Vector2_distance(&other->s.origin2, &target->s.origin2), splash = damage;
+        if (flak) splash = distance <= S_SpellData(MAKEFOURCC('A','f','l','k'), flak, 1) ?
+            S_SpellData(MAKEFOURCC('A','f','l','k'), flak, 3) : S_SpellData(MAKEFOURCC('A','f','l','k'), flak, 4);
+        else if (barrage) splash = S_SpellData(MAKEFOURCC('A','r','o','c'), barrage, 1);
+        else if (distance > attacker->unit_state->attack1.areaMedium) splash *= attacker->unit_state->attack1.factorSmall;
+        else if (distance > attacker->unit_state->attack1.areaFull) splash *= attacker->unit_state->attack1.factorMedium;
+        T_Damage(other, attacker, (int)MAX(1.0f, splash)); count++;
+    }
+}
+
+void S_HumanBreakInvisibility(edict_t *unit) {
+    if (!unit) return;
+    FOR_LOOP(i, unit->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t *status = unit->unit_state->statuses + i;
+        if (status->level && status->code != MAKEFOURCC('B','O','w','k') &&
+            S_UnitStatusIsTemporaryInvisibility(status))
+            unit_expirestatus(unit, status);
+    }
+}
+
+void S_HumanStatusExpired(edict_t *unit, uint32_t code, uint32_t level) {
+    (void)level;
+    if (!unit) return;
+    if (G_AbilityCode(code) == MAKEFOURCC('A','d','e','f')) G_AddUnitAnimationProperties(unit, "defend", false);
+    if (code == MAKEFOURCC('B','i','n','v') &&
+        !S_UnitHasTemporaryInvisibility(unit, unit_findstatus(unit, code)))
+        unit->s.renderfx &= ~RF_HIDDEN;
+    if (code == BZ_AVATAR_BUFF) avatar_expire_internal(unit, false);
+    if (unit->polymorph && code == unit->polymorph->buff) S_PolymorphRemove(unit);
+}

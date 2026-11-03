@@ -1,0 +1,129 @@
+#include "r_mdx.h"
+#include "renderer/r_emit.h"
+
+#define GET_PARTICLE_ANIM_PARAM(model_t, EMITTER, NAME) \
+float NAME = EMITTER->NAME; \
+if (EMITTER->keytracks.NAME) { \
+    MDLX_GetModelKeytrackValue(model_t, EMITTER->keytracks.NAME, frame, &NAME); \
+}
+
+/* Context for the R_EmitParticles spawn callback — carries the evaluated tracks
+   and emitter metadata needed to fill a cparticle_t on each spawn. */
+typedef struct {
+    mdxModel_t const *model; mdxParticleEmitter_t const *emitter;
+    mat4_t const *matrix; uint32_t team_id;
+    float speed, varia, lat, grav, life, length, width;
+} mdx_pctx_t;
+
+static color32_t MDLX_GetEmitterColor(mdxParticleEmitter_t const *emitter, uint32_t seg) {
+    return (color32_t) {
+        emitter->SegmentColor[seg*3+0] * 0xff,
+        emitter->SegmentColor[seg*3+1] * 0xff,
+        emitter->SegmentColor[seg*3+2] * 0xff,
+        emitter->Alpha[seg],
+    };
+}
+
+static void mdx_spawn_particle(void *raw) {
+    mdx_pctx_t *ctx = (mdx_pctx_t *)raw;
+    cparticle_t *p = R_SpawnParticle(); if (!p) return;
+    float r = (float)rand() / (float)RAND_MAX;
+    vec3_t origin = {
+        (r - 0.5f) * ctx->length,
+        ((float)rand() / (float)RAND_MAX - 0.5f) * ctx->width,
+        0.0f,
+    };
+    vec3_t pivot = { 0, 0, 0 };
+    if (ctx->emitter->node.node_id < (uint32_t)ctx->model->num_pivots)
+        pivot = ctx->model->pivots[ctx->emitter->node.node_id];
+    vec3_t pivoted = Vector3_add(&origin, &pivot);
+    vec3_t dir = FX_GenerateRandomDirection(ctx->lat * (float)M_PI / 180.0f);
+    mat4_t orientation_matrix = *ctx->matrix;
+    orientation_matrix.v[12] = orientation_matrix.v[13] = orientation_matrix.v[14] = 0.0f;
+    vec3_t world_dir = Matrix4_multiply_vector3(&orientation_matrix, &dir);
+    p->org = Matrix4_multiply_vector3(ctx->matrix, &pivoted);
+    p->vel = Vector3_scale(&world_dir, ctx->speed + (r - 0.5f) * ctx->varia);
+    p->accel = (vec3_t){ 0, 0, -ctx->grav };
+    if (ctx->emitter->node.flags & MDLXNODE_XYQuad) {
+        p->quad_right = Matrix4_multiply_vector3(&orientation_matrix, &(vec3_t){1, 0, 0});
+        p->quad_up = Matrix4_multiply_vector3(&orientation_matrix, &(vec3_t){0, 1, 0});
+    }
+    p->lifespan = ctx->life; p->time = 0;
+    p->midtime = ctx->emitter->Time * 0xff;
+    p->texture = MDLX_GetTexture(ctx->model, ctx->team_id, ctx->emitter->TextureID, ctx->emitter->ReplaceableId, NULL, 0);
+    p->blend_mode = MDLX_ParticleBlendMode(ctx->emitter->FilterMode);
+    p->columns = ctx->emitter->Columns; p->rows = ctx->emitter->Rows;
+    p->color[0] = MDLX_GetEmitterColor(ctx->emitter, 0);
+    p->color[1] = MDLX_GetEmitterColor(ctx->emitter, 1);
+    p->color[2] = MDLX_GetEmitterColor(ctx->emitter, 2);
+    R_EncodeParticleSize(p, ctx->emitter->ParticleScaling);
+    if (ctx->emitter->FrameFlags == BZ_MDX_PARTICLE_BOTH) {
+        cparticle_t *tail = R_SpawnParticle();
+        if (tail) { cparticle_t *next = tail->next; *tail = *p; tail->next = next; p = tail; }
+        else return;
+    }
+    if (ctx->emitter->FrameFlags != BZ_MDX_PARTICLE_HEAD)
+        p->tail = Vector3_scale(&p->vel, ctx->emitter->TailLength);
+}
+
+/* Frame-relative accumulator emission via R_EmitParticles — replaces the old
+   whole-second time-anchored loop.  Uses emitter->accumulator to track fractional
+   emission across frames (same pattern as WoW's M2_DrawParticles). */
+static void MDLX_RenderHeadEmitter(mdxModel_t const *model,
+                                   mdxParticleEmitter_t *emitter,
+                                   mat4_t const *modelMatrix,
+                                   float frame,
+                                   uint32_t teamID)
+{
+    GET_PARTICLE_ANIM_PARAM(model, emitter, EmissionRate);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Speed);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Variation);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Latitude);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Gravity);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Width);
+    GET_PARTICLE_ANIM_PARAM(model, emitter, Length);
+    if (EmissionRate <= 0.0f) return;
+    if (emitter->node.node_id >= MDX_MAX_NODES) return;
+    mat4_t matrix;
+    Matrix4_multiply(modelMatrix, &node_matrices[emitter->node.node_id], &matrix);
+    mdx_pctx_t ctx = { model, emitter, &matrix, teamID,
+        Speed, Variation, Latitude, Gravity, emitter->LifeSpan, Length, Width };
+    R_EmitParticles(EmissionRate, &emitter->accumulator, tr.viewDef.deltaTime, mdx_spawn_particle, &ctx);
+}
+
+/* Only one-shot animations stop emitting when held on their final frame.
+ * Still emit from idle/Stand loops with equal snapshot frames (e.g. waterfalls
+ * and persistent auras), and during the transition into a final frame. */
+static bool MDLX_OneShotEmitterFinished(renderEntity_t const *entity, mdxModel_t const *model) {
+    mdxSequence_t const *seq;
+
+    if (entity->oldframe != entity->frame) return false;
+    seq = R_FindSequenceAtTime(model, entity->frame);
+    return seq && (seq->flags & 1) && seq->interval[1] > seq->interval[0] &&
+           entity->frame == seq->interval[1] - 1;
+}
+
+void MDLX_RenderParticleEmitters(renderEntity_t const *entity, mdxModel_t const *model, mat4_t const *model_matrix) {
+    /* Paused Human construction is explicitly marked by the game. The older
+     * non-selectable hold also protects dead destructables whose model is
+     * missing a suitable one-shot sequence. Existing particles still drain. */
+    if ((entity->flags & RF_MDX_EMISSION_PAUSED) ||
+        ((entity->flags & RF_NOT_SELECTABLE) && entity->oldframe == entity->frame) ||
+        MDLX_OneShotEmitterFinished(entity, model)) {
+        return;
+    }
+    float const frame = LerpNumber(entity->oldframe, entity->frame, tr.viewDef.lerpfrac);
+
+    FOR_EACH_LIST(mdxParticleEmitter_t, emitter, model->emitters) {
+        float visibility = 1.0f, rate = emitter->EmissionRate;
+
+        if (emitter->keytracks.Visibility) {
+            MDLX_GetModelKeytrackValue(model, emitter->keytracks.Visibility, entity->frame, &visibility);
+            if (visibility < EPSILON)
+                continue;
+        }
+        if (emitter->keytracks.EmissionRate)
+            MDLX_GetModelKeytrackValue(model, emitter->keytracks.EmissionRate, frame, &rate);
+        MDLX_RenderHeadEmitter(model, emitter, model_matrix, frame, entity->team&TEAM_MASK);
+    }
+}

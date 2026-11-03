@@ -1,0 +1,130 @@
+#include "test.h"
+#include "keys_name.h"
+
+TEST(keys, parse_plain_and_named_keys) {
+    keyCode_t key;
+    uint32_t mods;
+
+    T_ASSERT(Key_ParseName("1", &key, &mods));
+    T_EQ(key, (keyCode_t)'1');
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("q", &key, &mods));
+    T_EQ(key, (keyCode_t)'q');
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("Q", &key, &mods));
+    T_EQ(key, (keyCode_t)'q');
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("ESCAPE", &key, &mods));
+    T_EQ(key, (keyCode_t)K_ESCAPE);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("MOUSE1", &key, &mods));
+    T_EQ(key, (keyCode_t)K_MOUSE1);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("TAB", &key, &mods));
+    T_EQ(key, (keyCode_t)K_TAB);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("LEFTARROW", &key, &mods));
+    T_EQ(key, (keyCode_t)K_LEFTARROW);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("left", &key, &mods));
+    T_EQ(key, (keyCode_t)K_LEFTARROW);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("MWHEELUP", &key, &mods));
+    T_EQ(key, (keyCode_t)K_MWHEELUP);
+    T_EQ(mods, 0u);
+
+    T_ASSERT(Key_ParseName("MWHEELDOWN", &key, &mods));
+    T_EQ(key, (keyCode_t)K_MWHEELDOWN);
+
+    T_ASSERT(Key_ParseName("PAGEUP", &key, &mods));
+    T_EQ(key, (keyCode_t)K_PAGEUP);
+    T_ASSERT(Key_ParseName("PAGEDOWN", &key, &mods));
+    T_EQ(key, (keyCode_t)K_PAGEDOWN);
+    T_ASSERT(Key_ParseName("PGUP", &key, &mods));
+    T_EQ(key, (keyCode_t)K_PAGEUP);
+    T_ASSERT(Key_ParseName("PGDN", &key, &mods));
+    T_EQ(key, (keyCode_t)K_PAGEDOWN);
+    T_EQ(mods, 0u);
+}
+
+TEST(keys, parse_modifier_combos) {
+    keyCode_t key;
+    uint32_t mods;
+
+    T_ASSERT(Key_ParseName("SHIFT+1", &key, &mods));
+    T_EQ(key, (keyCode_t)'1');
+    T_EQ(mods, KEY_MOD_SHIFT);
+
+    T_ASSERT(Key_ParseName("shift+n", &key, &mods));
+    T_EQ(key, (keyCode_t)'n');
+    T_EQ(mods, KEY_MOD_SHIFT);
+
+    T_ASSERT(Key_ParseName("CTRL+1", &key, &mods));
+    T_EQ(key, (keyCode_t)'1');
+    T_EQ(mods, KEY_MOD_CTRL);
+
+    T_ASSERT(Key_ParseName("CONTROL+9", &key, &mods));
+    T_EQ(key, (keyCode_t)'9');
+    T_EQ(mods, KEY_MOD_CTRL);
+
+    T_ASSERT(Key_ParseName("ALT+MOUSE1", &key, &mods));
+    T_EQ(key, (keyCode_t)K_MOUSE1);
+    T_EQ(mods, KEY_MOD_ALT);
+
+    T_ASSERT(Key_ParseName("CTRL+SHIFT+1", &key, &mods));
+    T_EQ(key, (keyCode_t)'1');
+    T_EQ(mods, KEY_MOD_CTRL | KEY_MOD_SHIFT);
+
+    T_ASSERT(Key_ParseName("CTRL+ALT+SHIFT+1", &key, &mods));
+    T_EQ(key, (keyCode_t)'1');
+    T_EQ(mods, KEY_MOD_CTRL | KEY_MOD_ALT | KEY_MOD_SHIFT);
+}
+
+TEST(keys, parse_rejects_unknown_names) {
+    keyCode_t key = 0;
+    uint32_t mods = 0;
+
+    T_ASSERT(!Key_ParseName("", &key, &mods));
+    T_ASSERT(!Key_ParseName("SHIFT+", &key, &mods));
+    T_ASSERT(!Key_ParseName("SHIFT++1", &key, &mods));
+    T_ASSERT(!Key_ParseName("SHIFT+CTRL", &key, &mods));
+    T_ASSERT(!Key_ParseName("SHIFT+CTRL+1", &key, &mods));
+    T_ASSERT(!Key_ParseName("ALT+CTRL+1", &key, &mods));
+    T_ASSERT(!Key_ParseName("NOTAKEY", &key, &mods));
+}
+
+TEST(keys, format_canonical_modifier_order) {
+    char name[64];
+
+    Key_FormatName((keyCode_t)'1', 0, name, sizeof(name));
+    T_STREQ(name, "1");
+    Key_FormatName((keyCode_t)'1', KEY_MOD_SHIFT, name, sizeof(name));
+    T_STREQ(name, "SHIFT+1");
+    Key_FormatName(K_MOUSE1, KEY_MOD_ALT, name, sizeof(name));
+    T_STREQ(name, "ALT+MOUSE1");
+    Key_FormatName((keyCode_t)'1', KEY_MOD_CTRL | KEY_MOD_SHIFT, name, sizeof(name));
+    T_STREQ(name, "CTRL+SHIFT+1");
+}
+
+TEST(keys, modified_mouse_binding_falls_back_to_plain) {
+    Key_SetBinding((keyCode_t)'1', 0, "group 1");
+    Key_SetBinding((keyCode_t)'1', KEY_MOD_SHIFT, "group add 1");
+    Key_SetBinding(K_MOUSE1, 0, "+select");
+    Key_SetBinding(K_MOUSE2, 0, "+smart");
+    Key_SetBinding(K_MOUSE1, KEY_MOD_ALT, "+pan");
+
+    T_STREQ(Key_FindBindingForTest((keyCode_t)'1', KEY_MOD_SHIFT), "group add 1");
+    T_ASSERT(Key_FindBindingForTest((keyCode_t)'1', KEY_MOD_ALT) == NULL);
+    T_STREQ(Key_FindBindingForTest(K_MOUSE1, KEY_MOD_SHIFT), "+select");
+    T_STREQ(Key_FindBindingForTest(K_MOUSE2, KEY_MOD_CTRL | KEY_MOD_SHIFT), "+smart");
+    T_STREQ(Key_FindBindingForTest(K_MOUSE1, KEY_MOD_ALT), "+pan");
+    T_ASSERT(Key_FindBindingForTest(K_MOUSE3, KEY_MOD_SHIFT) == NULL);
+}

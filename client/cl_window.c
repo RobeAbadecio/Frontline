@@ -1,0 +1,1513 @@
+#include "client.h"
+#include "menu_text_input.h"
+#include <ctype.h>
+#include <SDL2/SDL.h>
+
+#define MAX_WINDOW_SCROLL_VALUES 32 // entries; bounds retained scroll state; used per transient window
+#define MAX_WINDOW_EDIT_VALUES 8 // entries; bounds retained edit state; used per transient window
+#define MAX_WINDOW_LIST_VALUES 16 // entries; bounds retained list state; used per transient window
+
+typedef struct {
+    uint32_t frame;
+    float value;
+} clientWindowValue_t;
+
+typedef struct {
+    uint32_t frame;
+    uint32_t text_frame;
+    uint32_t max_chars;
+    uint32_t cursor;
+    uint32_t anchor;
+    char text[256];
+} clientWindowEdit_t;
+
+typedef struct {
+    uint32_t frame;
+    int16_t selected;
+} clientWindowList_t;
+
+typedef struct {
+    string_t data;
+    uint32_t size;
+} windowTextOut_t;
+
+typedef struct clientWindow_s {
+    uint32_t id, class_id, flags;
+    uintptr_t camera_namespace;
+    handle_t layout;
+    vec2_t offset;
+    bool debug_draw_logged;
+    bool blackout; /* local presentation dismissal pending the server-authorized transition */
+    uint32_t blackout_start_ms;
+    bool blackout_command_sent;
+    char blackout_command[CMDARG_LEN * 4];
+    clientWindowValue_t scroll_values[MAX_WINDOW_SCROLL_VALUES];
+    uint32_t num_scroll_values;
+    clientWindowEdit_t edit_values[MAX_WINDOW_EDIT_VALUES];
+    uint32_t num_edit_values;
+    clientWindowList_t list_values[MAX_WINDOW_LIST_VALUES];
+    uint32_t num_list_values;
+    struct clientWindow_s *prev, *next;
+} clientWindow_t;
+
+static struct {
+    clientWindow_t *first, *last, *focus, *drag, *scroll_drag, *slider_drag, *edit_window;
+    uint32_t scroll_drag_frame;
+    uint32_t slider_drag_frame;
+    uint32_t edit_frame;
+    clientWindow_t *pressed_window, *edit_drag_window;
+    uint32_t pressed_frame, edit_drag_frame;
+    vec2_t drag_point, drag_offset;
+    bool modal_paused;
+} cl_windows;
+static uintptr_t CL_WindowNewCameraNamespace(void) {
+    uintptr_t const max_namespace = (((uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1)) - 1) >> 10;
+    uintptr_t candidate;
+
+    for (candidate = MAX_LAYOUT_LAYERS; candidate <= max_namespace; candidate++) {
+        clientWindow_t const *window;
+        for (window = cl_windows.first; window; window = window->next)
+            if (window->camera_namespace == candidate) break;
+        if (!window) return candidate;
+    }
+    {
+        fprintf(stderr, "Client: exhausted portrait camera namespaces for transient windows\n");
+        return 0;
+    }
+}
+
+#define CVAR_TX_MAX 32
+
+/* Cvars edited since transaction Begin, with the value each held on first edit. */
+static struct {
+    bool active;
+    uint32_t count;
+    struct { char name[64]; char value[32]; } saved[CVAR_TX_MAX];
+} cl_cvar_transaction;
+
+static rect_t CL_WindowRoot(clientWindow_t const *window);
+static bool CL_WindowIsEditBox(uiFrame_t const *frame);
+static uiFrame_t *CL_WindowEditTextFrame(uiFrame_t const *edit);
+
+static bool CL_WindowDebugEnabled(void) {
+    return Cvar_Integer("ui_window_debug", 0) != 0;
+}
+
+typedef struct { cstring_t name; bool slider; } windowCvar_t;
+
+/* Decode "<prefix><cvar>" from a control's action. The client knows no preference names, but it only binds
+ * cvars that their owning subsystem registered with CVAR_UI: a server cannot edit or create any other cvar. */
+static bool CL_WindowCvarBinding(uiFrame_t const *frame, windowCvar_t *out) {
+    cstring_t const action = frame ? frame->onclick : NULL;
+    size_t const check_len = sizeof(UI_WINDOW_CVAR_CHECKBOX_PREFIX) - 1;
+    size_t const slider_len = sizeof(UI_WINDOW_CVAR_SLIDER_PREFIX) - 1;
+
+    if (!action || !out) return false;
+    if (!strncmp(action, UI_WINDOW_CVAR_CHECKBOX_PREFIX, check_len)) *out = (windowCvar_t){ action + check_len, false };
+    else if (!strncmp(action, UI_WINDOW_CVAR_SLIDER_PREFIX, slider_len)) *out = (windowCvar_t){ action + slider_len, true };
+    else return false;
+    if (out->name[0] == '\0' || strlen(out->name) >= sizeof(cl_cvar_transaction.saved[0].name)) return false;
+    return (Cvar_Flags(out->name) & CVAR_UI) != 0;
+}
+
+/* Any action the client consumes as a cvar edit or transaction step, whether or not the binding is permitted. */
+static bool CL_WindowIsCvarAction(cstring_t action) {
+    static cstring_t const prefixes[] = {
+        UI_WINDOW_CVAR_CHECKBOX_PREFIX, UI_WINDOW_CVAR_SLIDER_PREFIX, UI_WINDOW_CVAR_TX_BEGIN_COMMAND_PREFIX,
+        UI_WINDOW_CVAR_TX_ACCEPT_COMMAND_PREFIX, UI_WINDOW_CVAR_TX_CANCEL_COMMAND_PREFIX,
+    };
+
+    if (!action) return false;
+    FOR_LOOP(i, sizeof(prefixes) / sizeof(*prefixes))
+        if (!strncmp(action, prefixes[i], strlen(prefixes[i]))) return true;
+    return false;
+}
+
+static bool CL_WindowCvarIsSlider(uiFrame_t const *frame) {
+    windowCvar_t binding;
+    return CL_WindowCvarBinding(frame, &binding) && binding.slider;
+}
+
+/* Remember a cvar's value the first time an open transaction edits it. */
+static void CL_WindowCvarRemember(cstring_t name) {
+    if (!cl_cvar_transaction.active) return;
+    FOR_LOOP(i, cl_cvar_transaction.count)
+        if (!strcmp(cl_cvar_transaction.saved[i].name, name)) return;
+    if (cl_cvar_transaction.count >= CVAR_TX_MAX) return;
+    snprintf(cl_cvar_transaction.saved[cl_cvar_transaction.count].name,
+             sizeof(cl_cvar_transaction.saved[0].name), "%s", name);
+    snprintf(cl_cvar_transaction.saved[cl_cvar_transaction.count].value,
+             sizeof(cl_cvar_transaction.saved[0].value), "%s", Cvar_String(name, ""));
+    cl_cvar_transaction.count++;
+}
+
+/* Convert a normalized frame value to the cvar representation. */
+static void CL_WindowSetCvar(windowCvar_t const *binding, float value) {
+    char text[32];
+
+    if (!binding) return;
+    CL_WindowCvarRemember(binding->name);
+    if (!binding->slider)
+        snprintf(text, sizeof(text), "%u", value >= 0.5f ? 1u : 0u);
+    else
+        snprintf(text, sizeof(text), "%.3f", (double)MIN(1.0f, MAX(0.0f, value)));
+    Cvar_Set(binding->name, text);
+}
+
+/* Reflect current cvar values in bound controls after parsing the transient window's wire layout. */
+static void CL_WindowApplyCvarBindings(void) {
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t *frame = SCR_Frame(i);
+        windowCvar_t binding;
+
+        if (!CL_WindowCvarBinding(frame, &binding)) continue;
+        if (!binding.slider)
+            frame->value = Cvar_Integer(binding.name, 0) != 0 ? 1.0f : 0.0f;
+        else
+            frame->value = MIN(1.0f, MAX(0.0f, Cvar_Value(binding.name, 0.0f)));
+    }
+}
+
+static cstring_t CL_WindowImageName(RESOURCE image) {
+    if (!image) return "<none>";
+    if (image >= MAX_IMAGES) return "<out-of-range>";
+    return cl.configstrings[CS_IMAGES + image];
+}
+
+static void CL_WindowDebugLayout(clientWindow_t const *window) {
+    rect_t root;
+    uiFrame_t const *root_frame;
+
+    if (!window || !CL_WindowDebugEnabled()) return;
+    root = CL_WindowRoot(window);
+    SCR_WindowPrepare(window->layout, &root);
+    root_frame = SCR_Frame(1);
+    fprintf(stderr,
+            "UI_WINDOW_DEBUG window=%08x class=%08x flags=%08x frames=%u "
+            "offset=(%.4f,%.4f) root=(%.4f,%.4f %.4fx%.4f)\n",
+            (unsigned)window->id, (unsigned)window->class_id, (unsigned)window->flags,
+            (unsigned)SCR_NumFrames(), window->offset.x, window->offset.y,
+            root.x, root.y, root.w, root.h);
+    if (root_frame) {
+        rect_t const *r = SCR_LayoutRect(root_frame);
+        fprintf(stderr,
+                "UI_WINDOW_DEBUG window=%08x root_frame number=%u parent=%u type=%u "
+                "rect=(%.4f,%.4f %.4fx%.4f) color=(%u,%u,%u,%u) buffer=%u\n",
+                (unsigned)window->id, (unsigned)root_frame->number, (unsigned)root_frame->parent,
+                (unsigned)root_frame->flags.type, r->x, r->y, r->w, r->h,
+                (unsigned)root_frame->color.r, (unsigned)root_frame->color.g,
+                (unsigned)root_frame->color.b, (unsigned)root_frame->color.a,
+                (unsigned)root_frame->buffer.size);
+    }
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t const *frame = SCR_Frame(i);
+        uiBackdrop_t const *bd;
+        rect_t const *r;
+        cstring_t bg_name, edge_name;
+        if (!frame || frame->flags.type != FT_BACKDROP) continue;
+        r = SCR_LayoutRect(frame);
+        if (frame->buffer.size < sizeof(uiBackdrop_t) || !frame->buffer.data) {
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x backdrop frame=%u parent=%u "
+                    "rect=(%.4f,%.4f %.4fx%.4f) INVALID_BUFFER size=%u\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    r->x, r->y, r->w, r->h, (unsigned)frame->buffer.size);
+            continue;
+        }
+        bd = frame->buffer.data;
+        bg_name = CL_WindowImageName(bd->Background);
+        edge_name = CL_WindowImageName(bd->EdgeFile);
+        fprintf(stderr,
+                "UI_WINDOW_DEBUG window=%08x backdrop frame=%u parent=%u "
+                "rect=(%.4f,%.4f %.4fx%.4f) color=(%u,%u,%u,%u) "
+                "bg=%u path=\"%s\" loaded=%p edge=%u path=\"%s\" loaded=%p "
+                "cornerFlags=%d corner=%.4f bgSize=%.4f insets=(%.4f,%.4f,%.4f,%.4f) "
+                "tile=%u opaque=%u mirrored=%u\n",
+                (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                r->x, r->y, r->w, r->h,
+                (unsigned)frame->color.r, (unsigned)frame->color.g,
+                (unsigned)frame->color.b, (unsigned)frame->color.a,
+                (unsigned)bd->Background, bg_name ? bg_name : "",
+                bd->Background < MAX_IMAGES ? (void *)cl.pics[bd->Background] : NULL,
+                (unsigned)bd->EdgeFile, edge_name ? edge_name : "",
+                bd->EdgeFile < MAX_IMAGES ? (void *)cl.pics[bd->EdgeFile] : NULL,
+                (int)bd->CornerFlags, bd->CornerSize, bd->BackgroundSize,
+                bd->BackgroundInsets[0], bd->BackgroundInsets[1],
+                bd->BackgroundInsets[2], bd->BackgroundInsets[3],
+                (unsigned)bd->TileBackground, (unsigned)bd->Opaque, (unsigned)bd->Mirrored);
+    }
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t const *frame = SCR_Frame(i);
+        rect_t const *r;
+        if (!frame) continue;
+        r = SCR_LayoutRect(frame);
+        if (CL_WindowIsEditBox(frame) && frame->buffer.data &&
+            frame->buffer.size >= sizeof(uiEditBox_t)) {
+            uiEditBox_t const *edit = frame->buffer.data;
+            uiFrame_t *text = CL_WindowEditTextFrame(frame);
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=edit frame=%u parent=%u id=\"%s\" "
+                    "rect=(%.4f,%.4f %.4fx%.4f) font=%u maxChars=%u focused=%d "
+                    "textFrame=%u textRect=(%.4f,%.4f %.4fx%.4f) text=\"%s\"\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    edit->id, r->x, r->y, r->w, r->h, (unsigned)edit->font,
+                    (unsigned)edit->maxChars,
+                    cl_windows.edit_window == window && cl_windows.edit_frame == frame->number,
+                    text ? (unsigned)text->number : 0u,
+                    text ? SCR_LayoutRect(text)->x : 0.0f,
+                    text ? SCR_LayoutRect(text)->y : 0.0f,
+                    text ? SCR_LayoutRect(text)->w : 0.0f,
+                    text ? SCR_LayoutRect(text)->h : 0.0f,
+                    text && text->text ? text->text : "");
+        } else if (frame->flags.type == FT_LISTBOX && frame->buffer.data &&
+                   frame->buffer.size >= sizeof(uiListBox_t)) {
+            uiListBox_t const *list = frame->buffer.data;
+            float item_height = list->itemHeight > 0.0f ? list->itemHeight : 0.018f;
+            float inner_height = MAX(0.0f, r->h - list->border * 2.0f);
+            int visible_rows = item_height > 0.0f ? (int)floorf(inner_height / item_height) : 0;
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=list frame=%u parent=%u id=\"%s\" "
+                    "rect=(%.4f,%.4f %.4fx%.4f) font=%u itemHeight=%.4f border=%.4f "
+                    "visibleRows=%d selected=%d scroll=%.3f text=\"%s\"\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    list->id, r->x, r->y, r->w, r->h, (unsigned)list->text.font,
+                    list->itemHeight, list->border, visible_rows,
+                    (int)list->selectedIndex, frame->value, frame->text ? frame->text : "");
+        } else if ((frame->flags.type == FT_STRING || frame->flags.type == FT_TEXT) &&
+                   frame->text && *frame->text) {
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=text frame=%u parent=%u type=%u "
+                    "rect=(%.4f,%.4f %.4fx%.4f) text=\"%s\"\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    (unsigned)frame->flags.type, r->x, r->y, r->w, r->h, frame->text);
+        } else if (frame->flags.type == FT_SCROLLBAR) {
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=scrollbar frame=%u parent=%u "
+                    "rect=(%.4f,%.4f %.4fx%.4f) value=%.3f payload=%u",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    r->x, r->y, r->w, r->h, frame->value, (unsigned)frame->buffer.size);
+            if (frame->buffer.data && frame->buffer.size >= sizeof(uiScrollBar_t)) {
+                uiScrollBar_t const *sb = frame->buffer.data;
+                fprintf(stderr,
+                        " track=%u path=\"%s\" inc=%u path=\"%s\" "
+                        "dec=%u path=\"%s\" thumb=%u path=\"%s\"",
+                        (unsigned)sb->background.Background, CL_WindowImageName(sb->background.Background),
+                        (unsigned)sb->incButton.Background, CL_WindowImageName(sb->incButton.Background),
+                        (unsigned)sb->decButton.Background, CL_WindowImageName(sb->decButton.Background),
+                        (unsigned)sb->thumbButton.Background, CL_WindowImageName(sb->thumbButton.Background));
+            }
+            fputc('\n', stderr);
+        } else if ((frame->flags.type == FT_CHECKBOX || frame->flags.type == FT_GLUECHECKBOX ||
+             frame->flags.type == FT_SIMPLECHECKBOX) &&
+            frame->buffer.data && frame->buffer.size >= sizeof(uiCheckBox_t)) {
+            uiCheckBox_t const *cb = frame->buffer.data;
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=checkbox frame=%u parent=%u "
+                    "rect=(%.4f,%.4f %.4fx%.4f) checked=%.0f "
+                    "normal=%u path=\"%s\" loaded=%p checkedArt=%u path=\"%s\" loaded=%p "
+                    "hover=%u path=\"%s\" loaded=%p\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    r->x, r->y, r->w, r->h, frame->value,
+                    (unsigned)cb->normal.Background, CL_WindowImageName(cb->normal.Background),
+                    cb->normal.Background < MAX_IMAGES ? (void *)cl.pics[cb->normal.Background] : NULL,
+                    (unsigned)cb->checked.alphaFile, CL_WindowImageName(cb->checked.alphaFile),
+                    cb->checked.alphaFile < MAX_IMAGES ? (void *)cl.pics[cb->checked.alphaFile] : NULL,
+                    (unsigned)cb->mouseOver.alphaFile, CL_WindowImageName(cb->mouseOver.alphaFile),
+                    cb->mouseOver.alphaFile < MAX_IMAGES ? (void *)cl.pics[cb->mouseOver.alphaFile] : NULL);
+        } else if ((frame->flags.type == FT_BUTTON || frame->flags.type == FT_TEXTBUTTON ||
+                    frame->flags.type == FT_POPUPMENU || frame->flags.type == FT_GLUEPOPUPMENU ||
+                    frame->flags.type == FT_GLUETEXTBUTTON || frame->flags.type == FT_GLUEBUTTON) &&
+                   frame->buffer.data && frame->buffer.size >= sizeof(uiGlueTextButton_t)) {
+            uiGlueTextButton_t const *button = frame->buffer.data;
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG window=%08x control=button frame=%u parent=%u "
+                    "rect=(%.4f,%.4f %.4fx%.4f) disabled=%u flags=0x%08x onclick=\"%s\" "
+                    "normal=%u path=\"%s\" loaded=%p pushed=%u path=\"%s\" loaded=%p "
+                    "disabledBg=%u path=\"%s\" loaded=%p highlight=%u path=\"%s\" loaded=%p\n",
+                    (unsigned)window->id, (unsigned)frame->number, (unsigned)frame->parent,
+                    r->x, r->y, r->w, r->h,
+                    !!(frame->flagsvalue & UIFRAME_DISABLED), (unsigned)frame->flagsvalue,
+                    frame->onclick ? frame->onclick : "",
+                    (unsigned)button->normal.Background, CL_WindowImageName(button->normal.Background),
+                    button->normal.Background < MAX_IMAGES ? (void *)cl.pics[button->normal.Background] : NULL,
+                    (unsigned)button->pushed.Background, CL_WindowImageName(button->pushed.Background),
+                    button->pushed.Background < MAX_IMAGES ? (void *)cl.pics[button->pushed.Background] : NULL,
+                    (unsigned)button->disabled.Background, CL_WindowImageName(button->disabled.Background),
+                    button->disabled.Background < MAX_IMAGES ? (void *)cl.pics[button->disabled.Background] : NULL,
+                    (unsigned)button->highlight.alphaFile, CL_WindowImageName(button->highlight.alphaFile),
+                    button->highlight.alphaFile < MAX_IMAGES ? (void *)cl.pics[button->highlight.alphaFile] : NULL);
+        }
+    }
+}
+
+static void CL_WindowUnlink(clientWindow_t *window) {
+    if (window->prev) window->prev->next = window->next;
+    else cl_windows.first = window->next;
+    if (window->next) window->next->prev = window->prev;
+    else cl_windows.last = window->prev;
+    window->prev = window->next = NULL;
+}
+
+/* The tail is frontmost; moving focus there makes draw and input order agree. */
+static void CL_WindowFocus(clientWindow_t *window) {
+    if (!window) { cl_windows.focus = NULL; return; }
+    if (window != cl_windows.last) {
+        CL_WindowUnlink(window);
+        window->prev = cl_windows.last;
+        if (cl_windows.last) cl_windows.last->next = window;
+        else cl_windows.first = window;
+        cl_windows.last = window;
+    }
+    cl_windows.focus = window;
+}
+
+static clientWindow_t *CL_WindowById(uint32_t id) {
+    FOR_EACH_LIST(clientWindow_t, window, cl_windows.first)
+        if (window->id == id) return window;
+    return NULL;
+}
+
+static clientWindow_t *CL_WindowByClass(uint32_t class_id) {
+    FOR_EACH_LIST(clientWindow_t, window, cl_windows.first)
+        if (window->class_id == class_id) return window;
+    return NULL;
+}
+
+static clientWindow_t *CL_WindowModal(void) {
+    for (clientWindow_t *window = cl_windows.last; window; window = window->prev)
+        if (window->flags & UI_WINDOW_MODAL) return window;
+    return NULL;
+}
+
+static bool CL_WindowPauseOwnerPresent(void) {
+    for (clientWindow_t *window = cl_windows.last; window; window = window->prev) {
+        if ((window->flags & UI_WINDOW_MODAL) && !(window->flags & UI_WINDOW_NO_PAUSE)) return true;
+    }
+    return false;
+}
+
+/* Quake II's menu stack owns the single-player pause cvar. Keep the server
+ * request synchronized with pause-owning modal-list presence so a modal such
+ * as WC3's Allies dialog can capture gameplay input without freezing time. */
+static void CL_WindowSyncPause(void) {
+    bool paused = CL_WindowPauseOwnerPresent();
+    char command[16];
+    if (paused == cl_windows.modal_paused) return;
+    cl_windows.modal_paused = paused;
+    snprintf(command, sizeof(command), "pause %u", (unsigned)paused);
+    Cmd_ForwardToServer(command);
+}
+
+static rect_t CL_WindowRoot(clientWindow_t const *window) {
+    rect_t root = SCR_LayoutSceneRect();
+    root.x += window->offset.x;
+    root.y += window->offset.y;
+    return root;
+}
+
+static void CL_WindowRememberScroll(clientWindow_t *window, uint32_t frame_number, float value) {
+    if (!window || !frame_number) return;
+    value = MIN(1.0f, MAX(0.0f, value));
+    FOR_LOOP(i, window->num_scroll_values) {
+        if (window->scroll_values[i].frame == frame_number) {
+            window->scroll_values[i].value = value;
+            return;
+        }
+    }
+    if (window->num_scroll_values >= MAX_WINDOW_SCROLL_VALUES) return;
+    window->scroll_values[window->num_scroll_values++] = (clientWindowValue_t){
+        .frame = frame_number, .value = value,
+    };
+}
+
+static bool CL_WindowIsEditBox(uiFrame_t const *frame) {
+    return frame && (frame->flags.type == FT_EDITBOX ||
+                     frame->flags.type == FT_GLUEEDITBOX ||
+                     frame->flags.type == FT_SLASHCHATBOX);
+}
+
+static uiFrame_t *CL_WindowEditTextFrame(uiFrame_t const *edit) {
+    if (!edit) return NULL;
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t *child = SCR_Frame(i);
+        if (child && child->parent == edit->number &&
+            (child->flags.type == FT_TEXT || child->flags.type == FT_STRING))
+            return child;
+    }
+    return NULL;
+}
+
+static clientWindowEdit_t *CL_WindowEditValue(clientWindow_t *window, uiFrame_t const *edit, bool create) {
+    uiFrame_t *text_frame;
+    uiEditBox_t const *wire;
+    clientWindowEdit_t *value;
+
+    if (!window || !CL_WindowIsEditBox(edit)) return NULL;
+    FOR_LOOP(i, window->num_edit_values)
+        if (window->edit_values[i].frame == edit->number) return &window->edit_values[i];
+    if (!create || window->num_edit_values >= MAX_WINDOW_EDIT_VALUES) return NULL;
+    text_frame = CL_WindowEditTextFrame(edit);
+    if (!text_frame) return NULL;
+    value = &window->edit_values[window->num_edit_values++];
+    memset(value, 0, sizeof(*value));
+    value->frame = edit->number;
+    value->text_frame = text_frame->number;
+    wire = edit->buffer.data && edit->buffer.size >= sizeof(uiEditBox_t)
+        ? (uiEditBox_t const *)edit->buffer.data : NULL;
+    value->max_chars = wire && wire->maxChars ? wire->maxChars : sizeof(value->text) - 1;
+    value->max_chars = MIN(value->max_chars, sizeof(value->text) - 1);
+    snprintf(value->text, sizeof(value->text), "%.*s",
+             (int)value->max_chars, text_frame->text ? text_frame->text : "");
+    value->cursor = (uint32_t)strlen(value->text);
+    value->anchor = value->cursor;
+    return value;
+}
+
+static clientWindowList_t *CL_WindowListValue(clientWindow_t *window, uiFrame_t const *frame, bool create) {
+    uiListBox_t const *wire;
+    clientWindowList_t *value;
+
+    if (!window || !frame || frame->flags.type != FT_LISTBOX) return NULL;
+    FOR_LOOP(i, window->num_list_values)
+        if (window->list_values[i].frame == frame->number) return &window->list_values[i];
+    if (!create || window->num_list_values >= MAX_WINDOW_LIST_VALUES) return NULL;
+    wire = frame->buffer.data && frame->buffer.size >= sizeof(uiListBox_t)
+        ? (uiListBox_t const *)frame->buffer.data : NULL;
+    value = &window->list_values[window->num_list_values++];
+    value->frame = frame->number;
+    value->selected = wire ? wire->selectedIndex : -1;
+    return value;
+}
+
+static void CL_WindowBlurEdit(void) {
+    cl_windows.edit_window = NULL;
+    cl_windows.edit_frame = 0;
+    CL_SetTransientTextInput(false);
+}
+
+static void CL_WindowFocusEdit(clientWindow_t *window, uiFrame_t const *edit) {
+    clientWindowEdit_t *value = CL_WindowEditValue(window, edit, true);
+    if (!value) return;
+    cl_windows.edit_window = window;
+    cl_windows.edit_frame = edit->number;
+    CL_SetTransientTextInput(true);
+}
+
+static cstring_t CL_WindowListSelectedText(uiFrame_t const *frame, int16_t selected, windowTextOut_t *out) {
+    char items[2048];
+    char *save = NULL, *line;
+    int index = 0;
+
+    if (!out || !out->data || out->size == 0) return "";
+    out->data[0] = '\0';
+    if (!frame || !frame->text || selected < 0) return out->data;
+    snprintf(items, sizeof(items), "%s", frame->text);
+    for (line = strtok_r(items, "\n", &save); line; line = strtok_r(NULL, "\n", &save), index++) {
+        char *hidden;
+        if (index != selected) continue;
+        hidden = strchr(line, '\t');
+        snprintf(out->data, out->size, "%s", hidden && hidden[1] ? hidden + 1 : line);
+        return out->data;
+    }
+    return out->data;
+}
+
+/* A chooser may bind its selected hidden value to an edit control so an existing name can be amended or overwritten. */
+static void CL_WindowListApplyEdit(clientWindow_t *window, uiFrame_t const *frame, int16_t selected) {
+    uiListBox_t const *wire;
+    char selected_text[CMDARG_LEN];
+
+    if (!window || !frame || !frame->buffer.data || frame->buffer.size < sizeof(uiListBox_t)) return;
+    wire = frame->buffer.data;
+    if (!wire->editTarget || !CL_WindowListSelectedText(frame, selected, &MAKE(windowTextOut_t, .data = selected_text, .size = sizeof(selected_text)))) return;
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t *edit = SCR_Frame(i);
+        clientWindowEdit_t *value;
+        if (!CL_WindowIsEditBox(edit) || !edit->buffer.data || edit->buffer.size < sizeof(uiEditBox_t)) continue;
+        if (edit->number != wire->editTarget) continue;
+        value = CL_WindowEditValue(window, edit, true);
+        if (!value) return;
+        snprintf(value->text, sizeof(value->text), "%.*s", (int)value->max_chars, selected_text);
+        value->cursor = value->anchor = (uint32_t)strlen(value->text);
+        return;
+    }
+    fprintf(stderr, "CL_WindowListApplyEdit: unresolved edit frame %u\n", (unsigned)wire->editTarget);
+}
+
+static bool CL_WindowControlValue(clientWindow_t *window, cstring_t id, windowTextOut_t *out) {
+    if (!window || !id || !*id || !out || !out->data || out->size == 0) return false;
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t const *frame = SCR_Frame(i);
+        if (!frame || !frame->buffer.data) continue;
+        if (CL_WindowIsEditBox(frame) && frame->buffer.size >= sizeof(uiEditBox_t)) {
+            uiEditBox_t const *edit = frame->buffer.data;
+            clientWindowEdit_t *value;
+            if (strcmp(edit->id, id)) continue;
+            value = CL_WindowEditValue(window, frame, true);
+            if (!value) return false;
+            snprintf(out->data, out->size, "%s", value->text);
+            return true;
+        }
+        if (frame->flags.type == FT_LISTBOX && frame->buffer.size >= sizeof(uiListBox_t)) {
+            uiListBox_t const *list = frame->buffer.data;
+            clientWindowList_t *value;
+            if (strcmp(list->id, id)) continue;
+            value = CL_WindowListValue(window, frame, true);
+            if (!value) return false;
+            CL_WindowListSelectedText(frame, value->selected, out);
+            return out->data[0] != '\0';
+        }
+    }
+    return false;
+}
+
+static bool CL_WindowFormatCommand(clientWindow_t *window, cstring_t src, windowTextOut_t *dst) {
+    uint32_t out = 0;
+
+    if (!dst || !dst->data || dst->size == 0) return false;
+    dst->data[0] = '\0';
+    if (!src) return false;
+    for (uint32_t i = 0; src[i] && out + 1 < dst->size; i++) {
+        if (src[i] == '{') {
+            char id[80], value[256];
+            uint32_t n = 0, j = i + 1;
+            while (src[j] && src[j] != '}' && n + 1 < sizeof(id)) id[n++] = src[j++];
+            if (src[j] == '}') {
+                id[n] = '\0';
+                /* An unresolved control means the authored command is invalid; the old "0" substitution could target the wrong save. */
+                if (!CL_WindowControlValue(window, id, &MAKE(windowTextOut_t, .data = value, .size = sizeof(value)))) {
+                    fprintf(stderr, "CL_WindowFormatCommand: unresolved control {%s}\n", id);
+                    dst->data[0] = '\0';
+                    return false;
+                }
+                for (uint32_t k = 0; value[k] && out + 1 < dst->size; k++) {
+                    if ((value[k] == '"' || value[k] == '\\') && out + 2 < dst->size)
+                        dst->data[out++] = '\\';
+                    dst->data[out++] = value[k];
+                }
+                i = j;
+                continue;
+            }
+        }
+        dst->data[out++] = src[i];
+    }
+    dst->data[out] = '\0';
+    return true;
+}
+
+typedef enum {
+    CVAR_TRANSACTION_NONE,
+    CVAR_TRANSACTION_BEGIN,
+    CVAR_TRANSACTION_ACCEPT,
+    CVAR_TRANSACTION_CANCEL,
+} cvarTransactionAction_t;
+
+/* Decode transaction prefixes while keeping their server-command suffix opaque to local preference logic. */
+static cvarTransactionAction_t CL_WindowCvarTransactionAction(cstring_t action,
+                                                                           cstring_t *command) {
+    if (!action || !command) return CVAR_TRANSACTION_NONE;
+    if (!strncmp(action, UI_WINDOW_CVAR_TX_BEGIN_COMMAND_PREFIX,
+                 sizeof(UI_WINDOW_CVAR_TX_BEGIN_COMMAND_PREFIX) - 1)) {
+        *command = action + sizeof(UI_WINDOW_CVAR_TX_BEGIN_COMMAND_PREFIX) - 1;
+        return CVAR_TRANSACTION_BEGIN;
+    }
+    if (!strncmp(action, UI_WINDOW_CVAR_TX_ACCEPT_COMMAND_PREFIX,
+                 sizeof(UI_WINDOW_CVAR_TX_ACCEPT_COMMAND_PREFIX) - 1)) {
+        *command = action + sizeof(UI_WINDOW_CVAR_TX_ACCEPT_COMMAND_PREFIX) - 1;
+        return CVAR_TRANSACTION_ACCEPT;
+    }
+    if (!strncmp(action, UI_WINDOW_CVAR_TX_CANCEL_COMMAND_PREFIX,
+                 sizeof(UI_WINDOW_CVAR_TX_CANCEL_COMMAND_PREFIX) - 1)) {
+        *command = action + sizeof(UI_WINDOW_CVAR_TX_CANCEL_COMMAND_PREFIX) - 1;
+        return CVAR_TRANSACTION_CANCEL;
+    }
+    return CVAR_TRANSACTION_NONE;
+}
+
+/* Begin an empty edit log; cvars are captured as the page first touches them. A Begin inside an unfinished
+ * transaction keeps its log, so Cancel still restores the values from before the first Begin. */
+static void CL_WindowBeginCvarTransaction(void) {
+    if (cl_cvar_transaction.active) return;
+    cl_cvar_transaction.count = 0;
+    cl_cvar_transaction.active = true;
+}
+
+/* Accept keeps the live values; Cancel restores every cvar edited since Begin. */
+static void CL_WindowFinishCvarTransaction(bool cancel) {
+    if (!cl_cvar_transaction.active) return;
+    if (cancel)
+        FOR_LOOP(i, cl_cvar_transaction.count)
+            Cvar_Set(cl_cvar_transaction.saved[i].name, cl_cvar_transaction.saved[i].value);
+    cl_cvar_transaction.active = false;
+    cl_cvar_transaction.count = 0;
+}
+
+/* Apply the local transaction action, then forward only its authored server-command suffix. */
+static bool CL_WindowRunCvarTransactionCommand(clientWindow_t *window, cstring_t action) {
+    cstring_t source = NULL;
+    cvarTransactionAction_t transaction = CL_WindowCvarTransactionAction(action, &source);
+    char command[CMDARG_LEN * 4];
+
+    if (transaction == CVAR_TRANSACTION_NONE) return false;
+    if (!CL_WindowFormatCommand(window, source, &MAKE(windowTextOut_t, .data = command, .size = sizeof(command))))
+        return true;
+    if (transaction == CVAR_TRANSACTION_BEGIN) CL_WindowBeginCvarTransaction();
+    else CL_WindowFinishCvarTransaction(transaction == CVAR_TRANSACTION_CANCEL);
+    Cmd_ForwardToServer(command);
+    return true;
+}
+
+static void CL_WindowPrepareState(clientWindow_t *window, rect_t const *root) {
+    if (!window) return;
+    SCR_WindowPrepare(window->layout, root);
+    SCR_WindowSetCameraNamespace(window->camera_namespace);
+    FOR_LOOP(i, window->num_scroll_values) {
+        uiFrame_t *frame = SCR_Frame(window->scroll_values[i].frame);
+        if (frame) frame->value = window->scroll_values[i].value;
+    }
+    FOR_LOOP(i, window->num_edit_values) {
+        clientWindowEdit_t *value = &window->edit_values[i];
+        uiFrame_t *text = SCR_Frame(value->text_frame);
+        if (text) {
+            text->text = value->text;
+            text->textLength = (uint32_t)strlen(value->text);
+        }
+    }
+    FOR_LOOP(i, window->num_list_values) {
+        clientWindowList_t *value = &window->list_values[i];
+        uiFrame_t *frame = SCR_Frame(value->frame);
+        if (frame && frame->buffer.data && frame->buffer.size >= sizeof(uiListBox_t))
+            ((uiListBox_t *)frame->buffer.data)->selectedIndex = value->selected;
+    }
+    CL_WindowApplyCvarBindings();
+}
+
+/* A window takes part in the open transaction when it carries bound controls or a transaction step. */
+static bool CL_WindowOwnsCvarTransaction(clientWindow_t *window) {
+    rect_t root;
+
+    if (!window || !cl_cvar_transaction.active) return false;
+    root = CL_WindowRoot(window);
+    CL_WindowPrepareState(window, &root);
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t const *frame = SCR_Frame(i);
+        if (frame && CL_WindowIsCvarAction(frame->onclick)) return true;
+    }
+    return false;
+}
+
+static uiFrame_t *CL_WindowScrollOwner(uiFrame_t *frame) {
+    uiFrame_t *parent;
+    if (!frame) return NULL;
+    if (frame->flags.type == FT_TEXTAREA || frame->flags.type == FT_LISTBOX) return frame;
+    if (frame->flags.type != FT_SCROLLBAR || frame->parent >= SCR_NumFrames()) return NULL;
+    parent = SCR_Frame(frame->parent);
+    return parent && (parent->flags.type == FT_TEXTAREA || parent->flags.type == FT_LISTBOX)
+        ? parent : frame;
+}
+
+static int CL_WindowListMaxScroll(uiFrame_t const *frame) {
+    uiListBox_t const *lb;
+    rect_t view;
+    float item_height;
+    int count = 0, visible;
+
+    if (!frame || frame->flags.type != FT_LISTBOX || !frame->buffer.data ||
+        frame->buffer.size < sizeof(uiListBox_t)) return 0;
+    lb = frame->buffer.data;
+    /* Share the renderer's inset math so list hit-testing uses the exact same viewport. */
+    view = Rect_inset(SCR_LayoutRect(frame), lb->border);
+    item_height = lb->itemHeight > 0.0f ? lb->itemHeight : 0.018f;
+    if (!strcmp(lb->fetchCommand, "FRAME_ROWS")) {
+        FOR_LOOP(i, SCR_NumFrames()) {
+            uiFrame_t const *child = SCR_Frame(i);
+            if (child && child->parent == frame->number && child->flags.type != FT_SCROLLBAR) count++;
+        }
+    } else if (frame->text && *frame->text) {
+        count = 1;
+        for (cstring_t p = frame->text; *p; p++) if (*p == '\n') count++;
+    }
+    visible = MAX((int)floorf(view.h / item_height), 1);
+    return MAX(count - visible, 0);
+}
+
+static float CL_WindowScrollStep(uiFrame_t const *owner) {
+    if (owner && owner->flags.type == FT_LISTBOX) {
+        int max_scroll = CL_WindowListMaxScroll(owner);
+        return max_scroll > 0 ? 1.0f / max_scroll : 0.0f;
+    }
+    return 0.1f;
+}
+
+static bool CL_WindowSetScroll(clientWindow_t *window, uiFrame_t *owner, float value) {
+    if (!window || !owner) return false;
+    if ((owner->flags.type == FT_TEXTAREA && SCR_LayoutTextAreaMaxScroll(owner) <= 0.0f) ||
+        (owner->flags.type == FT_LISTBOX && CL_WindowListMaxScroll(owner) <= 0)) {
+        value = 0.0f;
+    }
+    value = MIN(1.0f, MAX(0.0f, value));
+    if (owner->flags.type == FT_LISTBOX && owner->buffer.data &&
+        owner->buffer.size >= sizeof(uiListBox_t) &&
+        !strcmp(((uiListBox_t const *)owner->buffer.data)->fetchCommand, "FRAME_ROWS")) {
+        int max_scroll = CL_WindowListMaxScroll(owner);
+        if (max_scroll > 0) value = (float)lroundf(value * max_scroll) / max_scroll;
+    }
+    if (fabsf(owner->value - value) < 0.00001f) return true;
+    owner->value = value;
+    CL_WindowRememberScroll(window, owner->number, value);
+    /* A standalone server-authored scrollbar may own a paged table instead
+     * of a client TEXTAREA/LISTBOX. Send its new normalized position only in
+     * response to user input, never when restoring a saved scroll position. */
+    if (owner->flags.type == FT_SCROLLBAR && owner->onclick[0]) {
+        char command[CMDARG_LEN * 4], source[CMDARG_LEN * 2];
+        snprintf(source, sizeof(source), "%s %.6f", owner->onclick, value);
+        if (CL_WindowFormatCommand(window, source,
+                &MAKE(windowTextOut_t, .data = command, .size = sizeof(command))))
+            Cmd_ForwardToServer(command);
+    }
+    /* TextArea scrollbars mirror their parent's local viewport state. */
+    FOR_LOOP(i, SCR_NumFrames()) {
+        uiFrame_t *child = SCR_Frame(i);
+        if (child && child->parent == owner->number && child->flags.type == FT_SCROLLBAR)
+            child->value = value;
+    }
+    return true;
+}
+
+static uiFrame_t *CL_WindowFrameAtType(vec2_t const *point, FRAMETYPE type) {
+    for (uint32_t i = SCR_NumFrames(); i > 0; i--) {
+        uiFrame_t *frame = SCR_Frame(i - 1);
+        if (frame && frame->flags.type == type && Rect_contains(SCR_LayoutRect(frame), point))
+            return frame;
+    }
+    return NULL;
+}
+
+static bool CL_WindowScrollWheel(clientWindow_t *window, vec2_t const *point, int wheel_y) {
+    uiFrame_t *hit, *owner;
+    if (!window || !point || !wheel_y) return false;
+    hit = CL_WindowFrameAtType(point, FT_SCROLLBAR);
+    if (!hit) hit = CL_WindowFrameAtType(point, FT_TEXTAREA);
+    if (!hit) hit = CL_WindowFrameAtType(point, FT_LISTBOX);
+    owner = CL_WindowScrollOwner(hit);
+    if (!owner) return false;
+    if ((owner->flags.type == FT_TEXTAREA && SCR_LayoutTextAreaMaxScroll(owner) <= 0.0f) ||
+        (owner->flags.type == FT_LISTBOX && CL_WindowListMaxScroll(owner) <= 0))
+        return true;
+    return CL_WindowSetScroll(window, owner,
+                              owner->value - wheel_y * CL_WindowScrollStep(owner));
+}
+
+static bool CL_WindowScrollBarSetFromPoint(clientWindow_t *window, uiFrame_t *scrollbar,
+                                           vec2_t const *point, bool drag_track) {
+    uiFrame_t *owner = CL_WindowScrollOwner(scrollbar);
+    rect_t const *screen;
+    rect_t track;
+    float bh, th, value;
+
+    if (!window || !scrollbar || !owner || !point) return false;
+    if ((owner->flags.type == FT_TEXTAREA && SCR_LayoutTextAreaMaxScroll(owner) <= 0.0f) ||
+        (owner->flags.type == FT_LISTBOX && CL_WindowListMaxScroll(owner) <= 0))
+        return true;
+    screen = SCR_LayoutRect(scrollbar);
+    if (!screen || screen->w <= 0.0f || screen->h <= 0.0f) return true;
+    bh = MIN(screen->w * UI_PIXEL_ASPECT, screen->h * 0.5f);
+    track = MAKE(rect_t, screen->x, screen->y + bh, screen->w, screen->h - bh * 2.0f);
+    value = owner->value;
+
+    if (!drag_track && point->y < track.y) {
+        value -= CL_WindowScrollStep(owner);
+    } else if (!drag_track && point->y >= track.y + track.h) {
+        value += CL_WindowScrollStep(owner);
+    } else if (track.h > 0.0f) {
+        bool compact = scrollbar->buffer.size == sizeof(uiScrollBarImage_t);
+        th = MIN(compact ? bh : MIN(bh, 0.010f), track.h);
+        value = track.h > th
+            ? (point->y - track.y - th * 0.5f) / (track.h - th)
+            : 0.0f;
+    }
+    return CL_WindowSetScroll(window, owner, value);
+}
+
+static bool CL_WindowContains(clientWindow_t *window, vec2_t const *point) {
+    rect_t root = CL_WindowRoot(window);
+    CL_WindowPrepareState(window, &root);
+    uiFrame_t const *frame = SCR_Frame(1);
+    return frame && Rect_contains(SCR_LayoutRect(frame), point);
+}
+
+bool CL_WindowMouseOver(int x, int y) {
+    vec2_t point = SCR_ScreenToUI(x, y);
+    clientWindow_t *modal = CL_WindowModal();
+    if (modal && modal->blackout) return true;
+    for (clientWindow_t *window = cl_windows.last; window; window = window->prev) {
+        if (modal && window != modal) continue;
+        if (CL_WindowContains(window, &point)) return true;
+    }
+    return modal != NULL;
+}
+
+static uiFrame_t const *CL_WindowClickableAt(clientWindow_t *window, vec2_t const *point) {
+    rect_t root = CL_WindowRoot(window);
+    CL_WindowPrepareState(window, &root);
+    for (uint32_t i = SCR_NumFrames(); i > 0; i--) {
+        uiFrame_t const *frame = SCR_Frame(i - 1);
+        if (SCR_LayoutFrameHasClickCommand(frame) && Rect_contains(SCR_LayoutRect(frame), point)) return frame;
+    }
+    return NULL;
+}
+
+/* Consume client-owned button actions locally; ordinary layout actions remain server commands. */
+static void CL_WindowActivateFrame(clientWindow_t *window, uiFrame_t const *frame) {
+    size_t const close_command_len = sizeof(UI_WINDOW_CLOSE_COMMAND_PREFIX) - 1;
+    size_t const blackout_command_len = sizeof(UI_WINDOW_BLACKOUT_COMMAND_PREFIX) - 1;
+    windowCvar_t binding;
+    if (!window || !frame || window->blackout) return;
+    if (CL_WindowRunCvarTransactionCommand(window, frame->onclick)) return;
+    if (CL_WindowCvarBinding(frame, &binding)) {
+        CL_WindowSetCvar(&binding, binding.slider ? frame->value : (frame->value < 0.5f ? 1.0f : 0.0f));
+        return;
+    }
+    if (CL_WindowIsCvarAction(frame->onclick)) {
+        /* A rejected binding is dropped: forwarding it would hand the server an action it never authored as a command. */
+        fprintf(stderr, "CL_WindowActivateFrame: \"%s\" names a cvar without CVAR_UI\n", frame->onclick);
+        return;
+    }
+    if (!strcmp(frame->onclick, UI_WINDOW_CLOSE_ACTION) ||
+        !strcmp(frame->onclick, UI_WINDOW_CLOSE_NOTIFY_ACTION)) {
+        CL_WindowClose(window->id);
+    } else if (!strncmp(frame->onclick, UI_WINDOW_CLOSE_COMMAND_PREFIX, close_command_len)) {
+        cstring_t source = frame->onclick + close_command_len;
+        char command[CMDARG_LEN * 4];
+        if (CL_WindowFormatCommand(window, source, &MAKE(windowTextOut_t, .data = command, .size = sizeof(command))))
+            Cmd_ForwardToServer(command);
+        CL_WindowClose(window->id);
+    } else if (!strncmp(frame->onclick, UI_WINDOW_BLACKOUT_COMMAND_PREFIX, blackout_command_len)) {
+        /* Server-authored, generic post-presentation action. Blank *locally*
+         * before the deferred destination runs; keep the presentation window
+         * installed so SCR_DrawScreenField continues clearing to black, never
+         * exposing the outgoing world. Only presentation windows may do this. */
+        char command[CMDARG_LEN * 4];
+        cstring_t source = frame->onclick + blackout_command_len;
+        if ((window->flags & (UI_WINDOW_PRESENTATION | UI_WINDOW_MODAL)) !=
+            (UI_WINDOW_PRESENTATION | UI_WINDOW_MODAL) || !*source) return;
+        if (!CL_WindowFormatCommand(window, source,
+                &MAKE(windowTextOut_t, .data = command, .size = sizeof(command)))) return;
+        window->blackout = true;
+        window->blackout_start_ms = SDL_GetTicks();
+        window->blackout_command_sent = false;
+        strlcpy(window->blackout_command, command, sizeof(window->blackout_command));
+    } else if (!strcmp(frame->onclick, UI_WINDOW_DISCONNECT_ACTION)) {
+        /* A gameplay leave is a full world-to-front-end boundary.  Defer it
+         * until input dispatch returns so the client can disconnect, stop the
+         * local server/game module, clear map-scoped renderer state, and then
+         * rebuild the menu/FDF state in that order. */
+        MenuAction("menu", "menu_main");
+    } else if (!strcmp(frame->onclick, UI_WINDOW_QUIT_ACTION)) {
+        /* Defer normal application shutdown until input dispatch returns. */
+        Cbuf_AddText("quit\n");
+    } else {
+        char command[CMDARG_LEN * 4];
+        if (CL_WindowFormatCommand(window, frame->onclick, &MAKE(windowTextOut_t, .data = command, .size = sizeof(command))))
+            Cmd_ForwardToServer(command);
+    }
+}
+
+static void CL_WindowEndSliderDrag(void) {
+    clientWindow_t *window = cl_windows.slider_drag;
+
+    if (window && window->layout) SCR_LayoutSetPointer(window->layout, 0, false);
+    cl_windows.slider_drag = NULL;
+    cl_windows.slider_drag_frame = 0;
+}
+
+/* Duplicate score-window refreshes may already be in flight at Continue.
+ * Preserve the blackout for the same presentation ID, never an unrelated
+ * window reusing the unique class or a normal gameplay popup. */
+static bool CL_WindowRetainsBlackout(clientWindow_t const *window, uiWindowDef_t const *def) {
+    return window && def && window->blackout && window->id == def->id &&
+           (def->flags & UI_WINDOW_PRESENTATION) && (def->flags & UI_WINDOW_MODAL);
+}
+
+void CL_WindowOpen(uiWindowDef_t const *def, handle_t layout) {
+    clientWindow_t *window = CL_WindowById(def->id);
+    bool retain_blackout;
+    uint32_t old_blackout_start_ms = 0;
+    bool old_blackout_command_sent = false;
+    char old_blackout_command[CMDARG_LEN * 4] = { 0 };
+    if (!window && (def->flags & UI_WINDOW_UNIQUE)) window = CL_WindowByClass(def->class_id);
+    retain_blackout = CL_WindowRetainsBlackout(window, def);
+    if (retain_blackout) {
+        old_blackout_start_ms = window->blackout_start_ms;
+        old_blackout_command_sent = window->blackout_command_sent;
+        strlcpy(old_blackout_command, window->blackout_command, sizeof(old_blackout_command));
+    }
+    if (!window) {
+        window = MemAlloc(sizeof(*window));
+        memset(window, 0, sizeof(*window));
+        window->prev = cl_windows.last;
+        if (cl_windows.last) cl_windows.last->next = window;
+        else cl_windows.first = window;
+        cl_windows.last = window;
+    } else {
+        SCR_ReleaseWindowCameraEvents(window->camera_namespace);
+        window->camera_namespace = 0;
+        if (cl_windows.pressed_window == window) {
+            cl_windows.pressed_window = NULL;
+            cl_windows.pressed_frame = 0;
+        }
+        if (cl_windows.edit_drag_window == window) {
+            cl_windows.edit_drag_window = NULL;
+            cl_windows.edit_drag_frame = 0;
+        }
+        if (cl_windows.edit_window == window) CL_WindowBlurEdit();
+        if (cl_windows.slider_drag == window) CL_WindowEndSliderDrag();
+        SAFE_DELETE(window->layout, MemFree);
+    }
+    window->camera_namespace = CL_WindowNewCameraNamespace();
+    window->id = def->id; window->class_id = def->class_id; window->flags = def->flags; window->layout = layout;
+    window->debug_draw_logged = false;
+    window->blackout = retain_blackout;
+    window->blackout_start_ms = old_blackout_start_ms;
+    window->blackout_command_sent = old_blackout_command_sent;
+    strlcpy(window->blackout_command, old_blackout_command, sizeof(window->blackout_command));
+    window->num_edit_values = 0;
+    window->num_list_values = 0;
+    CL_WindowFocus(window);
+    CL_WindowDebugLayout(window);
+    {
+        rect_t root = CL_WindowRoot(window);
+        CL_WindowPrepareState(window, &root);
+        FOR_LOOP(i, SCR_NumFrames()) {
+            uiFrame_t const *frame = SCR_Frame(i);
+            if (CL_WindowIsEditBox(frame)) {
+                CL_WindowFocusEdit(window, frame);
+                /* Default filename/text is selected only on a new window open;
+                 * ordinary click focus retains the pointer-selected caret. */
+                clientWindowEdit_t *value = CL_WindowEditValue(window, frame, false);
+                if (value) value->anchor = 0;
+                break;
+            }
+        }
+    }
+    CL_WindowSyncPause();
+}
+
+void CL_WindowClose(uint32_t id) {
+    clientWindow_t *window = CL_WindowById(id);
+    if (!window) return;
+    if (cl_windows.pressed_window == window) {
+        cl_windows.pressed_window = NULL;
+        cl_windows.pressed_frame = 0;
+    }
+    if (cl_windows.edit_drag_window == window) {
+        cl_windows.edit_drag_window = NULL;
+        cl_windows.edit_drag_frame = 0;
+    }
+    if (cl_windows.edit_window == window) CL_WindowBlurEdit();
+    if (cl_windows.focus == window) cl_windows.focus = NULL;
+    if (cl_windows.drag == window) cl_windows.drag = NULL;
+    if (cl_windows.scroll_drag == window) {
+        cl_windows.scroll_drag = NULL;
+        cl_windows.scroll_drag_frame = 0;
+    }
+    if (cl_windows.slider_drag == window) CL_WindowEndSliderDrag();
+    SCR_ReleaseWindowCameraEvents(window->camera_namespace);
+    CL_WindowUnlink(window);
+    SAFE_DELETE(window->layout, MemFree);
+    MemFree(window);
+    if (!cl_windows.focus) cl_windows.focus = cl_windows.last;
+    CL_WindowSyncPause();
+}
+
+void CL_WindowClear(void) {
+    while (cl_windows.first) CL_WindowClose(cl_windows.first->id);
+    memset(&cl_windows, 0, sizeof(cl_windows));
+    /* A full client-state clear ends this edit session without restoring stale preferences. */
+    cl_cvar_transaction.active = false;
+}
+
+bool CL_WindowModalActive(void) { return CL_WindowModal() != NULL; }
+
+/* A presentation window owns the entire gameplay surface until it is closed.
+ * No WC3-specific window IDs or rendering policy belong in the generic client. */
+bool CL_WindowPresentationActive(void) {
+    for (clientWindow_t const *window = cl_windows.last; window; window = window->prev)
+        if (window->flags & UI_WINDOW_PRESENTATION) return true;
+    return false;
+}
+
+/* SDL text input is owned by a focused transient edit box while gameplay
+ * remains key_game. Player snapshots repeatedly reaffirm gameplay input, so
+ * expose that ownership rather than letting CL_SetGameplayInput disable text
+ * delivery underneath the still-focused edit control. */
+bool CL_WindowTextInputActive(void) {
+    return cl_windows.edit_window != NULL && cl_windows.edit_frame != 0;
+}
+
+/* Fade is driven by client presentation time, not the paused game clock. */
+#define PRESENTATION_BLACKOUT_FADE_MS 400u
+
+static uint8_t CL_WindowBlackoutAlpha(uint32_t elapsed_ms) {
+    if (elapsed_ms >= PRESENTATION_BLACKOUT_FADE_MS) return 255;
+    return (uint8_t)((elapsed_ms * 255u) / PRESENTATION_BLACKOUT_FADE_MS);
+}
+
+static bool CL_WindowShouldDraw(clientWindow_t const *window, bool exclusive) {
+    return window &&
+           (!exclusive || (window->flags & UI_WINDOW_PRESENTATION));
+}
+
+void CL_WindowDraw(void) {
+    /* A presentation can coexist with an old result dialog still in the
+     * window stack; paint only the presentation, never the stale dialog. */
+    bool const exclusive = CL_WindowPresentationActive();
+    FOR_EACH_LIST(clientWindow_t, window, cl_windows.first) {
+        if (!CL_WindowShouldDraw(window, exclusive)) continue;
+        rect_t root = CL_WindowRoot(window);
+        CL_WindowPrepareState(window, &root);
+        if (!window->debug_draw_logged && CL_WindowDebugEnabled()) {
+            fprintf(stderr,
+                    "UI_WINDOW_DEBUG draw window=%08x frames=%u root=(%.4f,%.4f %.4fx%.4f)\n",
+                    (unsigned)window->id, (unsigned)SCR_NumFrames(),
+                    root.x, root.y, root.w, root.h);
+            window->debug_draw_logged = true;
+        }
+        if (!window->blackout || !window->blackout_command_sent)
+            SCR_LayoutDrawOverlay(window->layout);
+        if (window->blackout) {
+            uint8_t const alpha = CL_WindowBlackoutAlpha(SDL_GetTicks() - window->blackout_start_ms);
+            size2_t const size = re.GetWindowSize();
+            rect_t const screen = { 0, 0, size.width, size.height };
+            re.DrawFill(&screen, MAKE(color32_t, 0, 0, 0, alpha));
+            if (alpha == 255 && !window->blackout_command_sent) {
+                window->blackout_command_sent = true;
+                Cmd_ForwardToServer(window->blackout_command);
+            }
+        }
+    }
+}
+
+static void CL_WindowSliderSetFromPoint(clientWindow_t *window, uiFrame_t *slider, vec2_t const *point) {
+    rect_t const *rect;
+    windowCvar_t binding;
+    float value;
+
+    if (!window || !slider || !point || slider->flags.type != FT_SLIDER) return;
+    if (!CL_WindowCvarBinding(slider, &binding) || !binding.slider) return;
+    rect = SCR_LayoutRect(slider);
+    if (!rect || rect->w <= 0.0f || rect->h <= 0.0f) return;
+    value = (point->x - rect->x) / rect->w;
+    value = MIN(1.0f, MAX(0.0f, value));
+    slider->value = value;
+    CL_WindowSetCvar(&binding, value);
+}
+
+static void CL_WindowEditPointer(clientWindow_t *window, uint32_t frame_number,
+                                 float x, bool extend) {
+    uiFrame_t const *frame;
+    clientWindowEdit_t *value;
+    uint32_t cursor;
+    if (!window || !frame_number) return;
+    rect_t root = CL_WindowRoot(window);
+    CL_WindowPrepareState(window, &root);
+    frame = SCR_Frame(frame_number);
+    value = CL_WindowEditValue(window, frame, false);
+    if (!value) return;
+    cursor = SCR_LayoutEditCaretAt(frame, value->text, x);
+    value->cursor = cursor;
+    if (!extend) value->anchor = cursor;
+}
+
+bool CL_WindowMouseEventWithMods(menuMouseEvent_t event, int x, int y, int32_t param, uint32_t mods) {
+    vec2_t point = SCR_ScreenToUI(x, y);
+    clientWindow_t *modal = CL_WindowModal(), *window;
+    uiFrame_t const *frame;
+
+    /* The presentation is blank but still modal: no invisible UI controls or
+     * repeated Continue actions may be activated while navigation is pending. */
+    if (modal && modal->blackout) return true;
+    if (event == MENU_MOUSE_DOWN && param == 1) {
+        cl_windows.pressed_window = NULL;
+        cl_windows.pressed_frame = 0;
+        cl_windows.edit_drag_window = NULL;
+        cl_windows.edit_drag_frame = 0;
+    }
+    if (cl_windows.edit_drag_window &&
+        (event == MENU_MOUSE_MOVE || (event == MENU_MOUSE_UP && param == 1))) {
+        CL_WindowEditPointer(cl_windows.edit_drag_window, cl_windows.edit_drag_frame,
+                             point.x, true);
+        if (event == MENU_MOUSE_UP) {
+            cl_windows.edit_drag_window = NULL;
+            cl_windows.edit_drag_frame = 0;
+        }
+        return true;
+    }
+
+    if (cl_windows.slider_drag) {
+        rect_t root = CL_WindowRoot(cl_windows.slider_drag);
+        CL_WindowPrepareState(cl_windows.slider_drag, &root);
+        uiFrame_t *slider = SCR_Frame(cl_windows.slider_drag_frame);
+        if (event == MENU_MOUSE_MOVE && slider && slider->flags.type == FT_SLIDER)
+            CL_WindowSliderSetFromPoint(cl_windows.slider_drag, slider, &point);
+        else if (event == MENU_MOUSE_UP && param == 1) {
+            if (slider && slider->flags.type == FT_SLIDER)
+                CL_WindowSliderSetFromPoint(cl_windows.slider_drag, slider, &point);
+            CL_WindowEndSliderDrag();
+        }
+        return true;
+    }
+
+    if (cl_windows.scroll_drag) {
+        rect_t root = CL_WindowRoot(cl_windows.scroll_drag);
+        CL_WindowPrepareState(cl_windows.scroll_drag, &root);
+        frame = SCR_Frame(cl_windows.scroll_drag_frame);
+        if (event == MENU_MOUSE_MOVE && frame && frame->flags.type == FT_SCROLLBAR) {
+            CL_WindowScrollBarSetFromPoint(cl_windows.scroll_drag, (uiFrame_t *)frame, &point, true);
+        } else if (event == MENU_MOUSE_UP && param == 1) {
+            cl_windows.scroll_drag = NULL;
+            cl_windows.scroll_drag_frame = 0;
+        }
+        return true;
+    }
+    if (cl_windows.drag) {
+        if (event == MENU_MOUSE_MOVE) {
+            cl_windows.drag->offset.x = cl_windows.drag_offset.x + point.x - cl_windows.drag_point.x;
+            cl_windows.drag->offset.y = cl_windows.drag_offset.y + point.y - cl_windows.drag_point.y;
+        } else if (event == MENU_MOUSE_UP && param == 1) cl_windows.drag = NULL;
+        return true;
+    }
+    for (window = cl_windows.last; window; window = window->prev) {
+        rect_t root;
+        uiFrame_t *scrollbar;
+        if (modal && window != modal) continue;
+        if (!CL_WindowContains(window, &point)) continue;
+        if (event == MENU_MOUSE_DOWN && param == 1) CL_WindowFocus(window);
+
+        root = CL_WindowRoot(window);
+        CL_WindowPrepareState(window, &root);
+        if (event == MENU_MOUSE_SCROLL && CL_WindowScrollWheel(window, &point, MENU_MOUSE_PARAM_Y(param)))
+            return true;
+
+        if (event == MENU_MOUSE_DOWN && param == 1) {
+            uiFrame_t *slider = CL_WindowFrameAtType(&point, FT_SLIDER);
+            uiFrame_t *edit = CL_WindowFrameAtType(&point, FT_EDITBOX);
+            if (slider && CL_WindowCvarIsSlider(slider)) {
+                CL_WindowSliderSetFromPoint(window, slider, &point);
+                cl_windows.slider_drag = window;
+                cl_windows.slider_drag_frame = slider->number;
+                SCR_LayoutSetPointer(window->layout, slider->number, true);
+                return true;
+            }
+            uiFrame_t *list = CL_WindowFrameAtType(&point, FT_LISTBOX);
+            uiFrame_t *list_scrollbar = CL_WindowFrameAtType(&point, FT_SCROLLBAR);
+            if (!edit) edit = CL_WindowFrameAtType(&point, FT_GLUEEDITBOX);
+            if (!edit) edit = CL_WindowFrameAtType(&point, FT_SLASHCHATBOX);
+            if (edit) {
+                bool extend = (mods & KEY_MOD_SHIFT) != 0;
+                CL_WindowFocusEdit(window, edit);
+                CL_WindowEditPointer(window, edit->number, point.x, extend);
+                cl_windows.edit_drag_window = window;
+                cl_windows.edit_drag_frame = edit->number;
+                SCR_LayoutSetPointer(window->layout, 0, true);
+                return true;
+            }
+            uiListBox_t const *list_wire = list && list->buffer.data &&
+                list->buffer.size >= sizeof(uiListBox_t) ? list->buffer.data : NULL;
+            if (list && !list_scrollbar &&
+                (!list_wire || strcmp(list_wire->fetchCommand, "FRAME_ROWS")) &&
+                list->buffer.data && list->buffer.size >= sizeof(uiListBox_t)) {
+                uiListBox_t const *lb = list->buffer.data;
+                rect_t list_rect = *SCR_LayoutRect(list);
+                float item_height = lb->itemHeight > 0.0f ? lb->itemHeight : 0.018f;
+                clientWindowList_t *value = CL_WindowListValue(window, list, true);
+                list_rect.x += lb->border; list_rect.y += lb->border;
+                list_rect.w = MAX(0.0f, list_rect.w - lb->border * 2.0f);
+                list_rect.h = MAX(0.0f, list_rect.h - lb->border * 2.0f);
+                if (value && item_height > 0.0f && Rect_contains(&list_rect, &point)) {
+                    /* Match the front-end cinematic/mission MapListBox: rows
+                     * run top-to-bottom inside one clipped content rectangle.
+                     * Drawing and hit-testing must use the same origin or a
+                     * visible row can select a different save. */
+                    int row = (int)floorf((point.y - list_rect.y) / item_height);
+                    int count = 0;
+                    int visible = MAX((int)floorf(list_rect.h / item_height), 1);
+                    int max_scroll, scroll_offset;
+                    if (list->text) for (cstring_t p = list->text; *p; p++) if (*p == '\n') count++;
+                    if (list->text && *list->text) count++;
+                    max_scroll = MAX(count - visible, 0);
+                    scroll_offset = max_scroll
+                        ? (int)lroundf(MIN(MAX(list->value, 0.0f), 1.0f) * max_scroll)
+                        : 0;
+                    row += scroll_offset;
+                    if (row >= 0 && row < count) {
+                        value->selected = (int16_t)row;
+                        CL_WindowListApplyEdit(window, list, value->selected);
+                    }
+                }
+                SCR_LayoutSetPointer(window->layout, 0, true);
+                return true;
+            }
+            if (cl_windows.edit_window == window) CL_WindowBlurEdit();
+        }
+
+        scrollbar = CL_WindowFrameAtType(&point, FT_SCROLLBAR);
+        if (scrollbar && event == MENU_MOUSE_DOWN && param == 1) {
+            rect_t const *sr = SCR_LayoutRect(scrollbar);
+            float bh = MIN(sr->w * UI_PIXEL_ASPECT, sr->h * 0.5f);
+            bool track = point.y >= sr->y + bh && point.y < sr->y + sr->h - bh;
+            CL_WindowScrollBarSetFromPoint(window, scrollbar, &point, track);
+            if (track) {
+                cl_windows.scroll_drag = window;
+                cl_windows.scroll_drag_frame = scrollbar->number;
+            }
+            SCR_LayoutSetPointer(window->layout, 0, true);
+            return true;
+        }
+
+        frame = CL_WindowClickableAt(window, &point);
+        if (event == MENU_MOUSE_DOWN && param == 1) {
+            cl_windows.pressed_window = frame ? window : NULL;
+            cl_windows.pressed_frame = frame ? frame->number : 0;
+        }
+        SCR_LayoutSetPointer(window->layout, frame ? frame->number : 0, event == MENU_MOUSE_DOWN && param == 1);
+        if (event == MENU_MOUSE_UP && param == 1) {
+            if (frame && cl_windows.pressed_window == window &&
+                cl_windows.pressed_frame == frame->number)
+                CL_WindowActivateFrame(window, frame);
+            cl_windows.pressed_window = NULL;
+            cl_windows.pressed_frame = 0;
+        }
+        else if (event == MENU_MOUSE_DOWN && param == 1 && !frame && (window->flags & UI_WINDOW_MOVABLE) &&
+                 point.y <= window->offset.y + 24.0f) {
+            cl_windows.drag = window;
+            cl_windows.drag_point = point;
+            cl_windows.drag_offset = window->offset;
+        }
+        return true;
+    }
+    if (event == MENU_MOUSE_UP && param == 1) {
+        bool consumed = cl_windows.pressed_window != NULL;
+        cl_windows.pressed_window = NULL;
+        cl_windows.pressed_frame = 0;
+        if (consumed) return true;
+    }
+    if (event == MENU_MOUSE_DOWN && param == 1 && !modal) cl_windows.focus = NULL;
+    return modal != NULL;
+}
+
+bool CL_WindowMouseEvent(menuMouseEvent_t event, int x, int y, int32_t param) {
+    return CL_WindowMouseEventWithMods(event, x, y, param, 0);
+}
+
+bool CL_WindowKeyEvent(int key, uint32_t mods) {
+    clientWindow_t *window = CL_WindowModal();
+    int upper = toupper(key);
+    rect_t root;
+    bool modal;
+
+    if (!window) window = cl_windows.focus;
+    if (!window) return false;
+    if (window->blackout) return true;
+    modal = window->flags & UI_WINDOW_MODAL;
+    if (cl_windows.edit_window == window && cl_windows.edit_frame) {
+        clientWindowEdit_t *value = NULL;
+        FOR_LOOP(i, window->num_edit_values)
+            if (window->edit_values[i].frame == cl_windows.edit_frame) { value = &window->edit_values[i]; break; }
+        if (value) {
+            menuTextInput_t ti = {
+                .text = value->text, .size = sizeof(value->text),
+                .max_chars = value->max_chars, .cursor = value->cursor, .anchor = value->anchor,
+            };
+            /* Preserve ordinary horizontal camera keys for non-modal windows. */
+            if (!modal && (key == K_LEFTARROW || key == K_RIGHTARROW ||
+                           key == K_HOME || key == K_END)) return false;
+            if (key == 8 || key == 127 || key == K_LEFTARROW || key == K_RIGHTARROW ||
+                key == K_HOME || key == K_END || ((mods & KEY_MOD_CTRL) && (key == 'a' || key == 'A'))) {
+                M_TextInput_KeyModified(&ti, key, (mods & KEY_MOD_SHIFT) != 0,
+                                        (mods & KEY_MOD_CTRL) != 0);
+                value->cursor = ti.cursor;
+                value->anchor = ti.anchor;
+                return true;
+            }
+            if (key == K_ENTER || key == K_TAB) { CL_WindowBlurEdit(); return true; }
+            if (key == K_ESCAPE) { CL_WindowBlurEdit(); return true; }
+            /* Printable keys belong to the focused edit control, not to
+             * button hotkeys (for example Save/Load's A, S and D). SDL's
+             * subsequent TEXTINPUT event inserts the actual character. */
+            if (key >= 32 && key <= 126) return true;
+        }
+    }
+    /* Quake II pops the active menu on Escape. Dismiss locally first, then
+     * release only the server-side pause owner associated with this window. */
+    if (key == K_ESCAPE) {
+        if (window->flags & UI_WINDOW_NO_ESCAPE)
+            return (window->flags & UI_WINDOW_MODAL) != 0;
+        /* Dismissing an options page is a Cancel: live edits must not survive as a silent Accept. */
+        if (CL_WindowOwnsCvarTransaction(window)) CL_WindowFinishCvarTransaction(true);
+        CL_WindowClose(window->id);
+        return true;
+    }
+    root = CL_WindowRoot(window);
+    CL_WindowPrepareState(window, &root);
+    for (uint32_t i = SCR_NumFrames(); i > 0; i--) {
+        uiFrame_t const *frame = SCR_Frame(i - 1);
+        bool cancel;
+        if (!SCR_LayoutFrameHasClickCommand(frame)) continue;
+        cancel = key == K_ESCAPE && !strcmp(frame->onclick, "button CmdCancel");
+        if (cancel || (frame->hotkey && toupper(frame->hotkey) == upper)) {
+            CL_WindowActivateFrame(window, frame);
+            return true;
+        }
+    }
+    return modal;
+}
+
+
+bool CL_WindowEditRepeat(int key, uint32_t mods) {
+    if (!CL_WindowTextInputActive()) return false;
+    /* Key repeats must never reach game binds or command-button hotkeys. */
+    if (key != 8 && key != 127 && key != K_LEFTARROW && key != K_RIGHTARROW &&
+        key != K_HOME && key != K_END) return false;
+    return CL_WindowKeyEvent(key, mods);
+}
+
+bool CL_WindowTextInput(cstring_t text) {
+    clientWindow_t *window = cl_windows.edit_window;
+    clientWindowEdit_t *value = NULL;
+    char filtered[256];
+    menuTextInput_t ti;
+
+    if (!window || !text || !*text) return false;
+    if (window->blackout) return true;
+    FOR_LOOP(i, window->num_edit_values)
+        if (window->edit_values[i].frame == cl_windows.edit_frame) { value = &window->edit_values[i]; break; }
+    if (!value) return false;
+    M_TextInput_Filter(text, filtered, sizeof(filtered));
+    if (!filtered[0]) return true;
+    ti = (menuTextInput_t){
+        .text = value->text, .size = sizeof(value->text),
+        .max_chars = value->max_chars, .cursor = value->cursor, .anchor = value->anchor,
+    };
+    M_TextInput_Insert(&ti, filtered);
+    value->cursor = ti.cursor;
+    value->anchor = ti.anchor;
+    if (Cvar_Integer("ui_window_debug", 0) >= 2)
+        fprintf(stderr,
+                "UI_WINDOW_DEBUG text-input window=%08x editFrame=%u input=\"%s\" "
+                "value=\"%s\" cursor=%u maxChars=%u\n",
+                (unsigned)window->id, (unsigned)value->frame, filtered, value->text,
+                (unsigned)value->cursor, (unsigned)value->max_chars);
+    return true;
+}
+
+static clientWindow_t *CL_WindowPrepared(void) {
+    FOR_EACH_LIST(clientWindow_t, window, cl_windows.first)
+        if (SCR_WindowLayoutIsCurrent(window->layout)) return window;
+    return NULL;
+}
+
+cstring_t CL_WindowEditTextValue(uint32_t text_frame) {
+    clientWindow_t *window = CL_WindowPrepared();
+
+    if (!window || !text_frame) return NULL;
+
+    /* Frame numbers are local to each serialized layout. A gameplay HUD frame
+     * can therefore have the same number as a transient edit-box text child.
+     * Only consult retained edit state for the window whose layout is currently
+     * prepared; otherwise the edit value can leak into an unrelated HUD label. */
+    FOR_LOOP(i, window->num_edit_values) {
+        clientWindowEdit_t const *value = &window->edit_values[i];
+        if (value->text_frame == text_frame) return value->text;
+    }
+    return NULL;
+}
+
+bool CL_WindowEditCursor(uint32_t text_frame, uint32_t *cursor) {
+    clientWindow_t *window = CL_WindowPrepared();
+    if (!window || window != cl_windows.edit_window || !text_frame) return false;
+    FOR_LOOP(i, window->num_edit_values) {
+        clientWindowEdit_t const *value = &window->edit_values[i];
+        if (value->frame == cl_windows.edit_frame && value->text_frame == text_frame) {
+            if (cursor) *cursor = value->cursor;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Selection endpoints for the focused transient edit box. */
+bool CL_WindowEditSelection(uint32_t text_frame, uint32_t *start, uint32_t *selection_end) {
+    clientWindow_t *window = CL_WindowPrepared();
+    if (!window || window != cl_windows.edit_window || !text_frame) return false;
+    FOR_LOOP(i, window->num_edit_values) {
+        clientWindowEdit_t const *value = &window->edit_values[i];
+        if (value->frame == cl_windows.edit_frame && value->text_frame == text_frame) {
+            if (start) *start = MIN(value->cursor, value->anchor);
+            if (selection_end) *selection_end = MAX(value->cursor, value->anchor);
+            return value->cursor != value->anchor;
+        }
+    }
+    return false;
+}
+#ifdef BZ_TESTS
+#include "shared/test.h"
+
+TEST(client_windows, presentation_flag_hides_gameplay_only_while_window_exists) {
+    clientWindow_t *old_first = cl_windows.first, *old_last = cl_windows.last;
+    clientWindow_t dialog = { .flags = UI_WINDOW_MODAL };
+    clientWindow_t scores = { .flags = UI_WINDOW_MODAL | UI_WINDOW_PRESENTATION,
+                              .prev = &dialog };
+    dialog.next = &scores;
+    cl_windows.first = &dialog;
+    cl_windows.last = &dialog;
+    T_ASSERT(!CL_WindowPresentationActive());
+    cl_windows.last = &scores;
+    T_ASSERT(CL_WindowPresentationActive());
+    cl_windows.last = &dialog;
+    T_ASSERT(!CL_WindowPresentationActive());
+    cl_windows.first = old_first;
+    cl_windows.last = old_last;
+}
+
+TEST(client_windows, blackout_keeps_presentation_cover_but_does_not_draw_old_layout) {
+    clientWindow_t *old_first = cl_windows.first, *old_last = cl_windows.last;
+    clientWindow_t scores = { .id = 10u, .flags = UI_WINDOW_MODAL | UI_WINDOW_PRESENTATION };
+    clientWindow_t normal = { .id = 11u, .flags = UI_WINDOW_MODAL };
+    cl_windows.first = cl_windows.last = &scores;
+    T_ASSERT(CL_WindowPresentationActive());
+    T_ASSERT(CL_WindowShouldDraw(&scores, true));
+    scores.blackout = true;
+    T_ASSERT(CL_WindowPresentationActive()); /* SCR clears the display to black. */
+    T_ASSERT(CL_WindowShouldDraw(&scores, true)); /* draw fade/black instead of old world */
+    T_ASSERT(!CL_WindowShouldDraw(&normal, true));
+    T_ASSERT(CL_WindowShouldDraw(&normal, false)); /* unrelated windows unchanged */
+    cl_windows.first = old_first;
+    cl_windows.last = old_last;
+}
+
+TEST(client_windows, blackout_fade_uses_wall_time_and_reaches_full_black) {
+    T_EQ(CL_WindowBlackoutAlpha(0), 0);
+    T_EQ(CL_WindowBlackoutAlpha(100), 63);
+    T_EQ(CL_WindowBlackoutAlpha(200), 127);
+    T_EQ(CL_WindowBlackoutAlpha(399), 254);
+    T_EQ(CL_WindowBlackoutAlpha(400), 255);
+    T_EQ(CL_WindowBlackoutAlpha(800), 255);
+}
+
+TEST(client_windows, blackout_survives_late_refresh_but_not_new_window) {
+    clientWindow_t old = { .id = 2, .flags = UI_WINDOW_MODAL | UI_WINDOW_PRESENTATION,
+                           .blackout = true };
+    uiWindowDef_t same_id = { .id = 2, .flags = UI_WINDOW_MODAL | UI_WINDOW_PRESENTATION };
+    uiWindowDef_t new_id = { .id = 3, .flags = UI_WINDOW_MODAL | UI_WINDOW_PRESENTATION };
+    uiWindowDef_t ordinary = { .id = 2, .flags = UI_WINDOW_MODAL };
+    uiWindowDef_t nonmodal = { .id = 2, .flags = UI_WINDOW_PRESENTATION };
+    T_ASSERT(CL_WindowRetainsBlackout(&old, &same_id));
+    T_ASSERT(!CL_WindowRetainsBlackout(&old, &new_id));
+    T_ASSERT(!CL_WindowRetainsBlackout(&old, &ordinary));
+    T_ASSERT(!CL_WindowRetainsBlackout(&old, &nonmodal));
+    T_ASSERT(!CL_WindowRetainsBlackout(NULL, &same_id));
+    old.blackout = false;
+    T_ASSERT(!CL_WindowRetainsBlackout(&old, &same_id));
+}
+#endif

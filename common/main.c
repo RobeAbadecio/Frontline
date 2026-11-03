@@ -1,0 +1,704 @@
+#include "common/common.h"
+#include "common/online.h"
+#include "../client/client.h"
+#include "server_api.h"
+
+#include <SDL2/SDL.h>
+#ifdef __ANDROID__
+#include <SDL2/SDL_system.h>
+#endif
+#include <stdlib.h>
+#include <stdio.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#include "../port/web/src/web_opfs.h"
+#endif
+#ifdef _WIN32
+#include <conio.h>
+#include <direct.h>
+#else
+#include <sys/select.h>
+#include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+#define BZ_PLATFORM "Darwin"
+#elif defined(_WIN32)
+#define BZ_PLATFORM "Windows"
+#elif defined(__EMSCRIPTEN__)
+#define BZ_PLATFORM "Emscripten"
+#elif defined(__ANDROID__)
+#define BZ_PLATFORM "Android"
+#elif defined(__linux__)
+#define BZ_PLATFORM "Linux"
+#elif defined(__OpenBSD__)
+#define BZ_PLATFORM "OpenBSD"
+#else
+#define BZ_PLATFORM "Unknown"
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define BZ_ARCH "arm64"
+#elif defined(__x86_64__) || defined(_M_X64)
+#define BZ_ARCH "x86_64"
+#elif defined(__i386__) || defined(_M_IX86)
+#define BZ_ARCH "x86"
+#else
+#define BZ_ARCH "unknown"
+#endif
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BZ_BYTE_ORDER "big endian"
+#else
+#define BZ_BYTE_ORDER "little endian"
+#endif
+
+#define USAGE \
+"Usage:\n" \
+"  openwarcraft3 -data <folder> +map <map>       (listen server + local client)\n" \
+"  openwarcraft3 -data <folder> +dedicated 1 +map <map>  (dedicated server, no client)\n" \
+"  openwarcraft3 -data <folder>                 (client menu)\n" \
+"  openwarcraft3 -data <folder> -connect <host>  (remote client, default port " \
+                                                    PORT_SERVER_STRING ")\n" \
+"  openwarcraft3 -data <folder> -connect <host:port>\n" \
+"  openwarcraft3 -data <folder> -tft             (select TFT / expose expansion MPQs)\n" \
+"  openwarcraft3 -data <folder> +tft             (compatibility form; same startup selection)\n" \
+"\n" \
+"Examples:\n" \
+"  openwarcraft3 -data /home/user/Warcraft3 +map Maps\\\\Campaign\\\\Human02.w3m\n" \
+"  openwarcraft3 -data /home/user/Warcraft3 +dedicated 1 +map Maps\\\\Campaign\\\\Human02.w3m\n" \
+"  openwarcraft3 -data /home/user/Warcraft3 -tft +menu_single_player_campaign\n" \
+"  openwarcraft3 -data /home/user/Warcraft3 -connect 192.168.1.10\n" \
+"\n" \
+"Notes:\n" \
+"  - The data folder should contain Warcraft III MPQs and optionally Maps/.\n" \
+"  - Expansion MPQs stay hidden in RoC mode; use -tft, +tft, or +fs_expansion 1 to expose them.\n" \
+"  - The data folder may also be saved as data in the generated per-build config.\n" \
+"  - The map path uses the internal MPQ path format; use +map to launch one.\n" \
+"  - Remote clients still need the game data for asset loading.\n" \
+"  - Dedicated mode runs the server headless without renderer, sound, or UI.\n"
+
+extern texture_t *Texture;
+
+#ifndef __EMSCRIPTEN__
+static void Com_LimitFrameRate(Uint64 frame_start, Uint64 frequency, bool dedicated) {
+    int maxfps;
+    Uint64 target_ticks;
+
+    if (dedicated || !frequency) return;
+
+    maxfps = Cvar_Integer("com_maxfps", 0);
+    if (maxfps <= 0) return;
+
+    target_ticks = frequency / (Uint64)maxfps;
+    if (!target_ticks) return;
+
+    for (;;) {
+        Uint64 now = SDL_GetPerformanceCounter();
+        Uint64 elapsed = now - frame_start;
+        Uint64 remaining;
+        Uint32 delay_ms;
+
+        if (elapsed >= target_ticks) return;
+
+        remaining = target_ticks - elapsed;
+        delay_ms = (Uint32)((remaining * 1000ULL) / frequency);
+
+        /* Leave the final millisecond to scheduler yields so coarse sleeps do
+         * not systematically push every frame far beyond the requested cap. */
+        if (delay_ms > 1)
+            SDL_Delay(delay_ms - 1);
+        else
+            SDL_Delay(0);
+    }
+}
+#endif /* !__EMSCRIPTEN__ */
+
+#ifdef _WIN32
+static bool Sys_FileExists(cstring_t filename) {
+    FILE *file = fopen(filename, "rb");
+
+    if (!file) {
+        return false;
+    }
+    fclose(file);
+    return true;
+}
+
+static bool Sys_IsWarcraftDataDirectory(cstring_t dirname) {
+    PATHSTR archive;
+
+    if (!dirname || !*dirname) {
+        return false;
+    }
+    snprintf(archive, sizeof(archive), "%s/war3.mpq", dirname);
+    return Sys_FileExists(archive);
+}
+
+static bool Sys_TryWarcraftDataDirectory(cstring_t dirname,
+                                         string_t result,
+                                         size_t result_size) {
+    if (!Sys_IsWarcraftDataDirectory(dirname)) {
+        return false;
+    }
+    strlcpy(result, dirname, result_size);
+    return true;
+}
+
+static bool Sys_DiscoverWarcraftDataDirectory(string_t result, size_t result_size) {
+    static cstring_t relative_candidates[] = {
+        ".",
+        "data",
+        "Warcraft III",
+        NULL
+    };
+    static cstring_t drive_candidates[] = {
+        "%c:/Warcraft III",
+        "%c:/Games/Warcraft III",
+        "%c:/Program Files/Warcraft III",
+        "%c:/Program Files (x86)/Warcraft III",
+        NULL
+    };
+    cstring_t environment_path = getenv("WARCRAFT_III_PATH");
+    string_t executable_path = SDL_GetBasePath();
+    unsigned long drives = _getdrives();
+    PATHSTR candidate;
+
+    if (Sys_TryWarcraftDataDirectory(environment_path, result, result_size)) {
+        SDL_free(executable_path);
+        return true;
+    }
+    if (executable_path) {
+        if (Sys_TryWarcraftDataDirectory(executable_path, result, result_size)) {
+            SDL_free(executable_path);
+            return true;
+        }
+        snprintf(candidate, sizeof(candidate), "%sdata", executable_path);
+        if (Sys_TryWarcraftDataDirectory(candidate, result, result_size)) {
+            SDL_free(executable_path);
+            return true;
+        }
+        SDL_free(executable_path);
+    }
+    for (cstring_t *path = relative_candidates; *path; path++) {
+        if (Sys_TryWarcraftDataDirectory(*path, result, result_size)) {
+            return true;
+        }
+    }
+    for (int drive = 0; drive < 26; drive++) {
+        if (!(drives & (1UL << drive))) {
+            continue;
+        }
+        for (cstring_t *format = drive_candidates; *format; format++) {
+            snprintf(candidate, sizeof(candidate), *format, 'A' + drive);
+            if (Sys_TryWarcraftDataDirectory(candidate, result, result_size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void Sys_ShowStartupError(cstring_t message) {
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                             "OpenWarcraft3 could not start",
+                             message,
+                             NULL);
+}
+#endif
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR
+#include <dirent.h>
+#include <strings.h>
+#endif
+#endif
+
+/* iPad sandbox: the Files-visible Documents directory is both the data import
+ * drop point (copy War3.mpq et al via Files/AirDrop) and, lacking XDG, the
+ * writable home. $HOME is the sandbox root, so Documents is $HOME/Documents. */
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR)
+static bool Sys_iOSDocumentsDir(string_t out, size_t out_size) {
+    cstring_t home = getenv("HOME");
+    if (!home || !*home) return false;
+    snprintf(out, out_size, "%s/Documents", home);
+    return true;
+}
+
+/* The Documents folder always exists, so FS_AddDataDirectory succeeds even
+ * before the user has copied any data in; check for war3.mpq explicitly
+ * (any case: the iOS filesystem is case-sensitive). */
+static bool Sys_iOSHasWarcraftArchive(cstring_t dirname) {
+    DIR *dir = opendir(dirname);
+    struct dirent *entry;
+    bool found = false;
+
+    if (!dir) return false;
+    while (!found && (entry = readdir(dir)) != NULL) {
+        found = !strcasecmp(entry->d_name, "war3.mpq");
+    }
+    closedir(dir);
+    return found;
+}
+#endif
+
+/* Anchor the read-only share/ tree at the executable's location so the binary
+ * finds its configs regardless of the working directory. Probes three layouts:
+ * flat portable (share/ beside the exe), the FHS build tree (share/ beside
+ * bin/), and the in-tree CWD fallback. */
+static void Sys_ResolveShareDirectory(void) {
+#ifdef __ANDROID__
+    /* APK assets are installed into this app-owned tree before SDL starts the engine. */
+    PATHSTR android_share;
+    snprintf(android_share, sizeof(android_share), "%s/share", SDL_AndroidGetInternalStoragePath());
+    FS_SetShareDirectory(android_share);
+    return;
+#endif
+#ifdef __EMSCRIPTEN__
+    FS_SetShareDirectory("/share");
+    return;
+#endif
+    string_t base = SDL_GetBasePath();
+
+    if (base) {
+        PATHSTR share;
+        snprintf(share, sizeof(share), "%sshare", base);
+        FS_SetShareDirectory(share);
+        snprintf(share, sizeof(share), "%s../share", base);
+        FS_SetShareDirectory(share);
+        SDL_free(base);
+    }
+    FS_SetShareDirectory("share");
+}
+
+/* Resolve writable per-user game data: XDG_DATA_HOME (or ~/.local/share)
+ * on Unix, APPDATA on Windows. Only adopted if creatable and writable. */
+static void Sys_ResolveHomeDirectory(void) {
+#ifdef __ANDROID__
+    PATHSTR android_home;
+    snprintf(android_home, sizeof(android_home), "%s/user", SDL_AndroidGetInternalStoragePath());
+    FS_SetHomeDirectory(android_home);
+    return;
+#endif
+#ifdef __EMSCRIPTEN__
+    FS_SetHomeDirectory("/openrealm/user");
+    return;
+#endif
+    PATHSTR dir;
+
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR)
+    if (Sys_iOSDocumentsDir(dir, sizeof(dir))) {
+        FS_SetHomeDirectory(dir);
+        return;
+    }
+#endif
+#ifdef _WIN32
+    cstring_t home = getenv("APPDATA");
+    if (!home || !*home) {
+        return;
+    }
+    snprintf(dir, sizeof(dir), "%s/%s", home, BZ_GAME);
+#else
+    cstring_t data_home = getenv("XDG_DATA_HOME");
+    if (data_home && data_home[0] == '/') {
+        snprintf(dir, sizeof(dir), "%s/%s", data_home, BZ_GAME);
+    } else {
+        cstring_t home = getenv("HOME");
+        if (!home || !*home) return;
+        snprintf(dir, sizeof(dir), "%s/.local/share/%s", home, BZ_GAME);
+    }
+#endif
+    FS_SetHomeDirectory(dir);
+}
+
+static unsigned short Sys_GamePort(void) {
+    int port = Cvar_Integer("game_port", PORT_SERVER);
+
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr,
+                "Invalid game_port %d, using default %u\n",
+                port,
+                (unsigned)PORT_SERVER);
+        Cvar_Set("game_port", PORT_SERVER_STRING);
+        port = PORT_SERVER;
+    }
+    return (unsigned short)port;
+}
+
+void Sys_Quit(void) {
+    Sys_Exit(0);
+}
+
+/* Read a line from stdin for dedicated server console input.
+ * Returns NULL if no input is available (non-blocking check). */
+#ifndef __EMSCRIPTEN__
+static string_t Sys_ConsoleInput(void) {
+    static char line[256];
+    static char *pos = line;
+    int ch;
+
+    if (!Cvar_Integer("dedicated", 0)) {
+        return NULL;
+    }
+    /* Non-blocking check: is there data on stdin? */
+#ifdef _WIN32
+    if (!_kbhit()) {
+        return NULL;
+    }
+#else
+    fd_set fds;
+    struct timeval tv;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) {
+        return NULL;
+    }
+#endif
+    while (1) {
+        ch = fgetc(stdin);
+        if (ch == EOF) {
+            pos = line;
+            return NULL;
+        }
+        if (ch == '\n') {
+            *pos = '\0';
+            pos = line;
+            return line;
+        }
+        if (pos < line + sizeof(line) - 1) {
+            *pos++ = (char)ch;
+        }
+    }
+}
+#endif /* !__EMSCRIPTEN__ */
+
+/* The browser supplies frame scheduling; never busy-wait on its event thread.
+ * Keep the real client/server frame order identical to the native loop. */
+typedef struct {
+    uint32_t previous_time;
+    uint32_t frame_count;
+    bool dedicated;
+} openrealm_frame_state_t;
+
+static openrealm_frame_state_t frame_state;
+
+/* Stage wall time includes driver waits; loop calls are not necessarily rendered frames. */
+static void Com_ProfileFrame(bool enabled, Uint64 start, Uint64 online_end, Uint64 server_end, Uint64 client_end) {
+    static struct {
+        bool active;
+        Uint64 start, frequency, online, server, client, server_max;
+        uint32_t loops;
+    } sample;
+    if (!enabled) {
+        if (sample.active) memset(&sample, 0, sizeof(sample));
+        return;
+    }
+    if (!sample.active) {
+        sample.active = true; sample.start = start; sample.frequency = SDL_GetPerformanceFrequency();
+    }
+    if (!sample.frequency) return;
+    sample.loops++;
+    sample.online += online_end - start;
+    sample.server += server_end - online_end;
+    sample.client += client_end - server_end;
+    sample.server_max = MAX(sample.server_max, server_end - online_end);
+    Uint64 elapsed = client_end - sample.start;
+    if (elapsed < sample.frequency) return;
+    double ms = 1000.0 / sample.frequency;
+    fprintf(stderr, "[COM_FRAME] loops=%u elapsed_ms=%.3f online_ms=%.3f server_ms=%.3f server_max_ms=%.3f client_ms=%.3f\n",
+        sample.loops, elapsed * ms, sample.online * ms, sample.server * ms, sample.server_max * ms, sample.client * ms);
+    sample.start = client_end; sample.loops = 0;
+    sample.online = sample.server = sample.client = sample.server_max = 0;
+}
+
+static void OpenRealm_Frame(void *argument) {
+    openrealm_frame_state_t *state = (openrealm_frame_state_t *)argument;
+    uint32_t current_time = SDL_GetTicks();
+    uint32_t elapsed = current_time - state->previous_time;
+    bool profile = Cvar_Integer("com_profile", 0) != 0;
+    Uint64 start = profile ? SDL_GetPerformanceCounter() : 0;
+    Online_Frame(elapsed);
+    Uint64 online_end = profile ? SDL_GetPerformanceCounter() : 0;
+    if (SV_NeedsFrame())
+        SV_Frame(Cvar_Integer("com_fast_forward", 0) ? FRAMETIME : elapsed);
+    Uint64 server_end = profile ? SDL_GetPerformanceCounter() : 0;
+    if (!state->dedicated) {
+        CL_Frame(elapsed);
+    } else {
+#ifndef __EMSCRIPTEN__
+        string_t cmd = Sys_ConsoleInput();
+        if (cmd && *cmd) {
+            Cbuf_AddText(cmd);
+            Cbuf_AddText("\n");
+            Cbuf_Execute();
+        }
+#endif
+    }
+    Com_ProfileFrame(profile, start, online_end, server_end, profile ? SDL_GetPerformanceCounter() : 0);
+    state->previous_time = current_time;
+    state->frame_count++;
+    if (Cvar_Integer("com_frame_limit", 0) > 0 &&
+        state->frame_count >= (uint32_t)Cvar_Integer("com_frame_limit", 0))
+        Com_Quit();
+}
+
+int main(int argc, string_t argv[]) {
+    bool data = 0;
+#ifdef __ANDROID__
+    /* Native stdio is otherwise invisible after SDLActivity starts its thread; retain startup failures in app storage. */
+    PATHSTR android_log;
+    snprintf(android_log, sizeof(android_log), "%s/engine.log", SDL_AndroidGetInternalStoragePath());
+    if (!freopen(android_log, "w", stderr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Cannot open engine log: %s", android_log);
+        return 1;
+    }
+    dup2(fileno(stderr), STDOUT_FILENO);
+    setvbuf(stderr, NULL, _IONBF, 0);
+#endif
+#ifdef _WIN32
+    PATHSTR discovered_data_dir = { 0 };
+#endif
+
+    fprintf(stderr,
+            "\nOpenWarcraft3\n"
+            "Platform: %s\n"
+            "Architecture: %s\n"
+            "Byte ordering: %s\n\n",
+            BZ_PLATFORM,
+            BZ_ARCH,
+            BZ_BYTE_ORDER);
+
+#ifdef __EMSCRIPTEN__
+    if (!WebOPFS_Mount()) return 1;
+#endif
+    Sys_ResolveShareDirectory();
+    Sys_ResolveHomeDirectory();
+    Com_Init(argc, (cstring_t *)argv);
+
+#ifdef __EMSCRIPTEN__
+    /* The browser launcher passes its validated OPFS generation as argv
+     * because PROXY_TO_PTHREAD runs main in a worker. */
+    const char *web_data_dir = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "+openrealm-data=", 16)) {
+            web_data_dir = argv[i] + 16;
+            break;
+        }
+    }
+    if (!web_data_dir || !*web_data_dir) {
+        fprintf(stderr, "OpenRealm: no validated browser installation\n");
+        return 1;
+    }
+    Cvar_Set("data", web_data_dir);
+#endif
+    cstring_t data_dir = Cvar_String("data", "");
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR)
+    /* iOS has no command line: default to the Files-visible Documents folder
+     * so a user-supplied War3.mpq Tree (Files/AirDrop/USB) just works. The
+     * archived `data` cvar is an absolute container path, and iOS moves the
+     * container on reinstall, so a saved path without war3.mpq is stale. */
+    PATHSTR ios_data_dir = { 0 };
+    if ((!data_dir || !*data_dir || !Sys_iOSHasWarcraftArchive(data_dir)) &&
+        Sys_iOSDocumentsDir(ios_data_dir, sizeof(ios_data_dir))) {
+        Cvar_Set("data", ios_data_dir);
+        data_dir = Cvar_String("data", "");
+        fprintf(stderr, "iOS data directory: %s\n", data_dir);
+    }
+    if (data_dir && *data_dir && !Sys_iOSHasWarcraftArchive(data_dir)) {
+        fprintf(stderr, "No war3.mpq in %s\n", data_dir);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                                 "Warcraft III data not found",
+                                 "Copy War3.mpq and War3Local.mpq (plus War3x.mpq and "
+                                 "War3xLocal.mpq for The Frozen Throne) into "
+                                 "On My iPad > OpenWarcraft3 using the Files app or "
+                                 "Finder, then relaunch OpenWarcraft3.",
+                                 NULL);
+        return 1;
+    }
+#endif
+#ifdef _WIN32
+    if ((!data_dir || !*data_dir) &&
+        Sys_DiscoverWarcraftDataDirectory(discovered_data_dir,
+                                          sizeof(discovered_data_dir))) {
+        Cvar_Set("data", discovered_data_dir);
+        /* The desktop entry point presents the Frozen Throne glue UI.  A
+         * first-run double-click therefore needs the expansion archives too;
+         * command-line launches retain their explicit -tft/-roc choice. */
+        Cvar_Set("fs_expansion", "1");
+        data_dir = Cvar_String("data", "");
+        fprintf(stderr, "Discovered Warcraft III data: %s\n", data_dir);
+    }
+#endif
+    if (data_dir && *data_dir) {
+        if (!FS_AddDataDirectory(data_dir)) {
+            fprintf(stderr, "Failed to add data directory: %s\n", data_dir);
+#ifdef _WIN32
+            Sys_ShowStartupError(
+                "The configured Warcraft III folder is unavailable.\n\n"
+                "Start OpenWarcraft3 with:\n"
+                "  openwarcraft3.exe -data \"C:\\path\\to\\Warcraft III\"\n\n"
+                "The folder must contain war3.mpq.");
+#endif
+            return 1;
+        }
+        data = 1;
+    }
+
+    cstring_t extra_data_dir = Cvar_String("extra_data", "");
+    if (extra_data_dir && *extra_data_dir) {
+        FS_AddDataDirectory(extra_data_dir);
+    }
+
+    if (!data) {
+        printf(USAGE);
+#ifdef _WIN32
+        Sys_ShowStartupError(
+            "A compatible Warcraft III installation was not found.\n\n"
+            "Install Warcraft III Classic, put openwarcraft3.exe in its folder, "
+            "or start it with:\n"
+            "  openwarcraft3.exe -data \"C:\\path\\to\\Warcraft III\"\n\n"
+            "You can also set the WARCRAFT_III_PATH environment variable.");
+#endif
+        return 1;
+    }
+
+    Game_StartupDiagnostics();
+
+    PATHSTR resolved_map;
+    PATHSTR load_map;
+    cstring_t map = Cvar_String("map", "");
+    cstring_t connect_addr = Cvar_String("connect", "");
+    bool has_map = map && *map;
+    bool has_connect_addr = connect_addr && *connect_addr;
+    bool menu_mode = !has_map && !has_connect_addr;
+    bool listen_server_mode = has_map && !has_connect_addr;
+    bool load_map_from_save = false;
+    unsigned short game_port = Sys_GamePort();
+
+    if (has_map) {
+        if (!Com_ResolveMapArgument(map, resolved_map, sizeof(resolved_map))) {
+            return 1;
+        }
+        map = resolved_map;
+    }
+    if (!has_map) {
+        for (int i = 1; i + 1 < COM_Argc(); i++) {
+            if (strcmp(COM_Argv(i), "+load")) continue;
+            if (SV_GetSaveMap(COM_Argv(i + 1), load_map, sizeof(load_map))) {
+                map = load_map; has_map = true; listen_server_mode = !has_connect_addr; load_map_from_save = true;
+            }
+            break;
+        }
+    }
+    bool dedicated = Cvar_Integer("dedicated", 0) != 0;
+
+    /* Dedicated server mode: follow the Quake 2 convention of running the
+     * server without the client stack.  Unlike Quake 2 which uses a
+     * compile-time cl_null.c stub, we use runtime checks here because the
+     * codebase is not yet structured for a separate dedicated target and
+     * runtime branching keeps a single binary for both modes. */
+    cls.key_dest = dedicated ? key_game : (menu_mode ? key_menu : key_game);
+    cls.state = ca_disconnected;
+
+    NET_Init();
+
+    /* Headless test mode: `+test <pattern>` runs the in-engine test registry
+     * without a map.  The game module is a link dependency, so its TEST()
+     * constructors have already registered by the time we get here. */
+    bool run_tests = false;
+    bool run_online_check = false;
+    bool has_load = false;
+    for (int i = 1; i < COM_Argc(); i++) {
+#if defined(BZ_EOS) && defined(BZ_TESTS)
+        if (!strcmp(COM_Argv(i), "+online_acceptance")) run_online_check = true;
+#endif
+        if (!strcmp(COM_Argv(i), "+test")) { run_tests = true; break; }
+        if (!strcmp(COM_Argv(i), "+load")) has_load = true;
+    }
+
+    if (dedicated) {
+        // Dedicated server mode: no client stack, no SDL window.
+        SV_Init();
+        if (!has_map && !run_tests && !run_online_check && !has_load) {
+            SV_InitGameProgs();
+            if (!SV_HasExternalControl()) {
+                fprintf(stderr, "Dedicated server requires +map <map> unless an external controller is active\n");
+                return 1;
+            }
+        }
+        if (has_map) {
+            fprintf(stderr, "Dedicated server starting on map: %s\n", map);
+            /* Call SV_Map directly instead of routing through the 'map' command,
+             * because Com_Map_f -> MenuAction -> CL_BeginLoadingMap requires the
+             * client stack which is not initialized in dedicated mode. */
+            SV_Map(map);
+        }
+        if (run_tests) {
+            /* Bring up the real game module (gi + globals via GetGameAPI, then
+             * ge->Init) so in-engine tests exercise the actual server import
+             * table and can spawn entities / register models from the mounted
+             * archives.  When a map was loaded, SV_Map already did this. */
+            if (!has_map) {
+                SV_InitGameProgs();
+            }
+            /* Fire the queued `test` command; Com_Test_f exits with the
+             * failure count once the registry has run. */
+            Cbuf_AddLateCommands();
+            Cbuf_Execute();
+        } else {
+            Cbuf_AddLateCommands();
+            Cbuf_Execute();
+        }
+    } else {
+        SV_Init();
+        CL_Init();
+        if (load_map_from_save) {
+            CL_BeginLoadingMap(map);
+            SV_Map(map);
+            if (SV_IsActive()) CL_SetLoadingProgress(0.05f);
+        }
+        Cbuf_AddLateCommands();
+
+        if (has_connect_addr) {
+            // Remote-client mode: skip the local server, connect over UDP.
+            CL_Connect(connect_addr, game_port);
+        } else if (listen_server_mode) {
+            // Listen-server mode: show the client loading screen before the
+            // synchronous server map load, mirroring Quake's loading plaque flow.
+            /* Save-only startup has already prepared its map above; the late load command restores it. */
+            if (!SV_IsActive()) {
+                SV_Init();
+                CL_BeginLoadingMap(map);
+                SCR_UpdateScreen(0);
+                SV_Map(map);
+                if (SV_IsActive()) CL_SetLoadingProgress(0.05f);
+            }
+        }
+        /* Startup map selectors are early CVars. Load first so the whole late command tail is deferred. */
+        Cbuf_Execute();
+        // Menu mode: UI runs client-side, no server connection needed (Quake 3 pattern)
+    }
+
+    fprintf(stderr, "OpenWarcraft3 initialized.\n\n");
+
+    frame_state.previous_time = SDL_GetTicks();
+    frame_state.frame_count = 0;
+    frame_state.dedicated = dedicated;
+#ifdef __EMSCRIPTEN__
+    /* The launcher and storage mount must be ready before main() executes.
+     * Browser scheduling yields to input, rendering and other page tasks. */
+    emscripten_set_main_loop_arg(OpenRealm_Frame, &frame_state, 0, 1);
+#else
+    Uint64 performanceFrequency = SDL_GetPerformanceFrequency();
+    while (true) {
+        Uint64 frame_start = SDL_GetPerformanceCounter();
+        OpenRealm_Frame(&frame_state);
+        Com_LimitFrameRate(frame_start, performanceFrequency, dedicated);
+    }
+#endif
+
+    return 0;
+}

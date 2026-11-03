@@ -1,0 +1,605 @@
+#include "common.h"
+#include "common/ui_constants.h"
+#ifdef WOW
+#include "common/wow_ui_shared.h"
+#endif
+
+#include <ctype.h>
+#include <stdlib.h>
+
+extern void Key_WriteBindings(FILE *file);
+
+#define CVAR_COMPLETE_CHARS 1024
+
+typedef struct cvaralias_s {
+    struct cvaralias_s *next;
+    string_t name;
+    cvar_t *target;
+} cvarAlias_t;
+
+
+
+static cvar_t *cvar_vars;
+static cvarAlias_t *aliases;
+static bool aliases_open;
+
+static bool Cvar_NameMatches(cstring_t name, cstring_t partial) {
+    size_t len;
+
+    if (!name || !partial) {
+        return false;
+    }
+    len = strlen(partial);
+    return !strncasecmp(name, partial, len);
+}
+
+static void Cvar_CommonPrefix(string_t out, uint32_t out_size, cstring_t name) {
+    uint32_t i;
+
+    if (!out || out_size == 0 || !name) {
+        return;
+    }
+    if (!out[0]) {
+        snprintf(out, out_size, "%s", name);
+        return;
+    }
+    for (i = 0; out[i] && name[i] && i + 1 < out_size; i++) {
+        if (tolower((unsigned char)out[i]) != tolower((unsigned char)name[i])) {
+            break;
+        }
+    }
+    out[i] = '\0';
+}
+
+static string_t Cvar_CopyString(cstring_t in) {
+    size_t len = in ? strlen(in) : 0;
+    string_t out = MemAlloc((long)len + 1);
+
+    if (len) {
+        memcpy(out, in, len);
+    }
+    return out;
+}
+
+static bool Cvar_NameIsValid(cstring_t name) {
+    if (!name || !*name) {
+        return false;
+    }
+    for (cstring_t p = name; *p; p++) {
+        if (isspace((unsigned char)*p) || *p == '"' || *p == ';') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void Cvar_UpdateValue(cvar_t *var) {
+    if (!var || !var->string) {
+        return;
+    }
+    var->value = strtof(var->string, NULL);
+    var->integer = (int)var->value;
+}
+
+static cvar_t *Cvar_FindVar(cstring_t name) {
+    if (!name) {
+        return NULL;
+    }
+    FOR_EACH_LIST(cvarAlias_t, alias, aliases)
+        if (!strcmp(alias->name, name)) return alias->target;
+    FOR_EACH_LIST(cvar_t, var, cvar_vars) {
+        if (!strcmp(var->name, name)) {
+            return var;
+        }
+    }
+    return NULL;
+}
+
+/* Removed cvars from old configs must not be recreated by seta. */
+static bool Cvar_IsObsolete(cstring_t name) {
+    return name && !strcmp(name, "r_module");
+}
+
+cvar_t *Cvar_Get(cstring_t name, cstring_t value, uint32_t flags) {
+    cvar_t *var;
+
+    if (Cvar_IsObsolete(name))
+        return NULL;
+    if (!Cvar_NameIsValid(name)) {
+        fprintf(stderr, "Cvar_Get: invalid cvar name \"%s\"\n", name ? name : "");
+        return NULL;
+    }
+    var = Cvar_FindVar(name);
+    if (var) {
+        var->flags |= flags;
+        return var;
+    }
+    var = MemAlloc(sizeof(*var));
+    var->name = Cvar_CopyString(name);
+    var->string = Cvar_CopyString(value ? value : "");
+    var->flags = flags;
+    var->modified = true;
+    Cvar_UpdateValue(var);
+    ADD_TO_LIST(var, cvar_vars);
+    return var;
+}
+
+cvar_t *Cvar_Set(cstring_t name, cstring_t value) {
+    cvar_t *var = Cvar_Get(name, value ? value : "", 0);
+
+    if (!var) {
+        return NULL;
+    }
+    value = value ? value : "";
+    if (!strcmp(var->string, value)) {
+        return var;
+    }
+    MemFree(var->string);
+    var->string = Cvar_CopyString(value);
+    var->modified = true;
+    Cvar_UpdateValue(var);
+    return var;
+}
+
+cvar_t *Cvar_SetValue(cstring_t name, float value) {
+    char text[64];
+
+    snprintf(text, sizeof(text), "%g", value);
+    return Cvar_Set(name, text);
+}
+
+cstring_t Cvar_String(cstring_t name, cstring_t fallback) {
+    cvar_t *var = Cvar_FindVar(name);
+
+    return var ? var->string : fallback;
+}
+
+int Cvar_Integer(cstring_t name, int fallback) {
+    cvar_t *var = Cvar_FindVar(name);
+
+    return var ? var->integer : fallback;
+}
+
+float Cvar_Value(cstring_t name, float fallback) {
+    cvar_t *var = Cvar_FindVar(name);
+
+    return var ? var->value : fallback;
+}
+
+/* Flags of a registered cvar; 0 when the name is unknown, so callers can gate on a flag without creating it. */
+uint32_t Cvar_Flags(cstring_t name) {
+    cvar_t *var = Cvar_FindVar(name);
+    return var ? var->flags : 0;
+}
+
+void Cvar_Describe(cstring_t name, cstring_t description) {
+    cvar_t *var = Cvar_FindVar(name);
+    if (var) var->description = description;
+}
+
+cvar_t *Cvar_GetD(cstring_t name, cstring_t value, uint32_t flags, cstring_t description) {
+    cvar_t *var = Cvar_Get(name, value, flags);
+    if (var) var->description = description;
+    return var;
+}
+
+void Cvar_ForEachVariable(cmdListFunc_t func, void *userData) {
+    if (!func) {
+        return;
+    }
+    FOR_EACH_LIST(cvar_t, var, cvar_vars) {
+        func(var->name, userData);
+    }
+}
+
+int Cvar_CompleteVariable(cstring_t partial, string_t out, uint32_t out_size, bool print) {
+    int matches = 0;
+    char common[CVAR_COMPLETE_CHARS];
+
+    if (out && out_size > 0) {
+        out[0] = '\0';
+    }
+    common[0] = '\0';
+    partial = partial ? partial : "";
+    FOR_EACH_LIST(cvar_t, var, cvar_vars) {
+        if (!Cvar_NameMatches(var->name, partial)) {
+            continue;
+        }
+        if (print) {
+            if (var->description)
+                fprintf(stderr, "  %-28s — %s\n", var->name, var->description);
+            else
+                fprintf(stderr, "  %s\n", var->name);
+        }
+        Cvar_CommonPrefix(common, sizeof(common), var->name);
+        matches++;
+    }
+    if (out && out_size > 0 && matches > 0) {
+        snprintf(out, out_size, "%s", common);
+    }
+    return matches;
+}
+
+static void Cvar_Set_f(void) {
+    int argc = Cmd_Argc();
+    cstring_t name = Cmd_Argv(1);
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: set <name> <value>\n");
+        return;
+    }
+    if (argc == 2) {
+        cvar_t *var = Cvar_FindVar(name);
+        if (var) {
+            fprintf(stderr, "\"%s\" is \"%s\"\n", var->name, var->string);
+        } else {
+            fprintf(stderr, "\"%s\" is undefined\n", name);
+        }
+        return;
+    }
+    Cvar_Set(name, Cmd_ArgsFrom(2));
+}
+
+static void Cvar_SetA_f(void) {
+    cvar_t *var;
+    int argc = Cmd_Argc();
+    cstring_t name = Cmd_Argv(1);
+
+    if (argc < 3) {
+        Cvar_Set_f();
+        return;
+    }
+    var = Cvar_Set(name, Cmd_ArgsFrom(2));
+    if (var) {
+        var->flags |= CVAR_ARCHIVE;
+    }
+}
+
+static void Cvar_List_f(void) {
+    uint32_t count = 0;
+
+    FOR_EACH_LIST(cvar_t, var, cvar_vars) {
+        if (var->description)
+            fprintf(stderr, "%c %-28s \"%s\"  — %s\n",
+                    (var->flags & CVAR_ARCHIVE) ? '*' : ' ',
+                    var->name, var->string, var->description);
+        else
+            fprintf(stderr, "%c %s \"%s\"\n",
+                    (var->flags & CVAR_ARCHIVE) ? '*' : ' ',
+                    var->name, var->string);
+        count++;
+    }
+    fprintf(stderr, "%u cvars\n", count);
+}
+
+bool Cvar_Command(void) {
+    cvar_t *var = Cvar_FindVar(Cmd_Argv(0));
+
+    if (!var) {
+        return false;
+    }
+    if (Cmd_Argc() == 1) {
+        if (var->description)
+            fprintf(stderr, "\"%s\" is \"%s\"  — %s\n", var->name, var->string, var->description);
+        else
+            fprintf(stderr, "\"%s\" is \"%s\"\n", var->name, var->string);
+    } else {
+        Cvar_Set(var->name, Cmd_ArgsFrom(1));
+    }
+    return true;
+}
+
+static string_t Cvar_ReadLocalConfig(cstring_t filename) {
+    FILE *file;
+    long fileSize;
+    string_t buffer;
+
+    file = fopen(filename, "rb");
+    if (!file) {
+        return NULL;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    fileSize = ftell(file);
+    if (fileSize < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    buffer = MemAlloc(fileSize + 1);
+    if (fileSize > 0 && fread(buffer, 1, fileSize, file) != (size_t)fileSize) {
+        MemFree(buffer);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    buffer[fileSize] = '\0';
+    return buffer;
+}
+
+bool Cvar_LoadConfig(cstring_t filename) {
+    string_t text;
+
+    if (!filename || !*filename) {
+        return false;
+    }
+    text = FS_ReadFileIntoString(filename);
+    if (!text) {
+        text = Cvar_ReadLocalConfig(filename);
+    }
+    if (!text) {
+        return false;
+    }
+    fprintf(stderr, "Executing %s\n", filename);
+    Cbuf_AddText(text);
+    Cbuf_AddText("\n");
+    FS_FreeFileString(text);
+    return true;
+}
+
+static void Cvar_WriteEscaped(FILE *file, cstring_t text) {
+    for (cstring_t p = text ? text : ""; *p; p++) {
+        if (*p == '"') {
+            fputc('\\', file);
+        }
+        fputc(*p, file);
+    }
+}
+
+static bool Cvar_IsSessionOnly(cstring_t name) {
+    return name && (!strcmp(name, "map") || !strcmp(name, "connect"));
+}
+
+void Cvar_WriteConfig(cstring_t filename) {
+    FILE *file;
+    uint32_t count = 0;
+
+    if (!filename || !*filename) {
+        filename = Cvar_String("config", "");
+    }
+    file = fopen(filename, "wb");
+    if (!file) {
+        fprintf(stderr, "Couldn't write %s\n", filename);
+        return;
+    }
+    fprintf(file, "// generated by %s, do not modify\n", BZ_GAME);
+    fprintf(file, "// Loaded after the shipped game defaults and before autoexec.cfg.\n\n");
+    Key_WriteBindings(file);
+    fprintf(file, "\n");
+    FOR_EACH_LIST(cvar_t, var, cvar_vars) {
+        if (!(var->flags & CVAR_ARCHIVE) || Cvar_IsSessionOnly(var->name) || Cvar_IsObsolete(var->name)) {
+            continue;
+        }
+        fprintf(file, "seta %s \"", var->name);
+        Cvar_WriteEscaped(file, var->string);
+        fprintf(file, "\"\n");
+        count++;
+    }
+    fclose(file);
+    fprintf(stderr, "Wrote %u archived cvars to %s\n", count, filename);
+}
+
+static void Cvar_WriteConfig_f(void) {
+    Cvar_WriteConfig(Cmd_Argc() > 1 ? Cmd_Argv(1) : Cvar_String("config", ""));
+}
+
+static void Cvar_Exec_f(void) {
+    if (Cmd_Argc() != 2) {
+        fprintf(stderr, "usage: exec <filename>\n");
+        return;
+    }
+    Cvar_LoadConfig(Cmd_Argv(1));
+}
+
+static bool Cvar_ApplyDashArg(int argc, cstring_t *argv, int *index, cstring_t name) {
+    cstring_t arg = argv[*index];
+    size_t len = strlen(name);
+
+    if (arg[0] != '-' || strncmp(arg + 1, name, len)) {
+        return false;
+    }
+    if (arg[len + 1] == '\0' && *index + 1 < argc) {
+        Cvar_Set(name, argv[++(*index)]);
+        return true;
+    }
+    return false;
+}
+
+bool Cvar_ApplyBooleanCommandLineFlag(cstring_t name) {
+    if (!name || !*name) {
+        return false;
+    }
+    if (!strcmp(name, "vid_modes")) {
+        Cvar_Set("vid_modes", "1");
+        return true;
+    }
+    if (!strcmp(name, "com_fast_forward")) {
+        Cvar_Set("com_fast_forward", "1");
+        return true;
+    }
+    if (!strcmp(name, "tft")) {
+        Cvar_Set("fs_expansion", "1");
+        return true;
+    }
+    if (!strcmp(name, "roc")) {
+        Cvar_Set("fs_expansion", "0");
+        return true;
+    }
+    return false;
+}
+
+void Cvar_ApplyConfigCommandLine(int argc, cstring_t *argv) {
+    for (int i = 1; i < argc; i++) {
+        cstring_t arg = argv[i];
+
+        if (!arg || !*arg) {
+            continue;
+        }
+        if (Cvar_ApplyDashArg(argc, argv, &i, "config")) {
+            continue;
+        }
+    }
+}
+
+void Cvar_ApplyCommandLine(int argc, cstring_t *argv) {
+    for (int i = 1; i < argc; i++) {
+        cstring_t arg = argv[i];
+
+        if (!arg || !*arg) {
+            continue;
+        }
+        if (Cvar_ApplyDashArg(argc, argv, &i, "connect")) {
+            continue;
+        }
+        if (Cvar_ApplyDashArg(argc, argv, &i, "data")) {
+            continue;
+        }
+        if (arg[0] == '-' && Cvar_ApplyBooleanCommandLineFlag(arg + 1)) {
+            continue;
+        }
+    }
+}
+
+/* Config-owned compatibility names share one cvar, including flags and archived output. */
+static void Cvar_Alias_f(void) {
+    cstring_t name = Cmd_Argv(1), dest = Cmd_Argv(2);
+    cvar_t *target, *old;
+    if (Cmd_Argc() != 3 || !Cvar_NameIsValid(name) || !Cvar_NameIsValid(dest) || !strcmp(name, dest)) {
+        fprintf(stderr, "usage: cvar_alias <old-name> <canonical-name>\n");
+        return;
+    }
+    target = Cvar_FindVar(dest);
+    if (!target) {
+        fprintf(stderr, "cvar_alias: define canonical cvar %s first\n", dest);
+        return;
+    }
+    FOR_EACH_LIST(cvarAlias_t, alias, aliases) {
+        if (strcmp(alias->name, name)) continue;
+        if (alias->target != target) fprintf(stderr, "cvar_alias: %s already names %s\n", name, alias->target->name);
+        return;
+    }
+    if (!aliases_open) {
+        fprintf(stderr, "cvar_alias: declare %s in startup config before modules cache cvars\n", name);
+        return;
+    }
+    old = Cvar_FindVar(name);
+    if (old == target) {
+        fprintf(stderr, "cvar_alias: %s would replace its own canonical name\n", name);
+        return;
+    }
+    if (old) {
+        /* Early command-line settings can precede the shipped alias declaration. Keep their value and flags. */
+        Cvar_Set(target->name, old->string);
+        target->flags |= old->flags;
+        FOR_EACH_LIST(cvarAlias_t, alias, aliases)
+            if (alias->target == old) alias->target = target;
+        for (cvar_t **link = &cvar_vars; *link; link = &(*link)->next) {
+            if (*link != old) continue;
+            *link = old->next;
+            MemFree((void *)old->name); MemFree(old->string); MemFree(old);
+            break;
+        }
+    }
+    cvarAlias_t *alias = MemAlloc(sizeof(*alias));
+    *alias = (cvarAlias_t){ .next = aliases, .name = Cvar_CopyString(name), .target = target };
+    aliases = alias;
+}
+
+/* Alias migration may retire old cvars only before modules retain cvar pointers. */
+void Cvar_EndConfig(void) { aliases_open = false; }
+
+void Cvar_Init(void) {
+    aliases_open = true;
+    Cmd_AddCommand("cvar_alias", Cvar_Alias_f);
+    Cmd_AddCommand("set", Cvar_Set_f);
+    Cmd_AddCommand("seta", Cvar_SetA_f);
+    Cmd_AddCommand("cvarlist", Cvar_List_f);
+    Cmd_AddCommand("exec", Cvar_Exec_f);
+    Cmd_AddCommand("writeconfig", Cvar_WriteConfig_f);
+
+    {
+        static PATHSTR config_path;
+
+        FS_ConfigPath("config.cfg", config_path, sizeof(config_path));
+        Cvar_GetD("config", config_path, 0, "writable config file; loaded/saved on startup");
+    }
+    /* Resolved filesystem roots, exposed as cvars so UI/game modules (shared
+     * libs that can't reach common.c statics) can locate their own user files. */
+    Cvar_GetD("fs_basepath", FS_BasePath(), 0, "read-only engine/share data directory");
+    Cvar_GetD("fs_homepath", FS_HomePath(), 0, "writable per-user directory (empty if unavailable)");
+    Cvar_GetD("data",             "",                  CVAR_ARCHIVE, "override game data directory path");
+    Cvar_GetD("fs_expansion",     "0",                 0,            "0=RoC data/skin, 1=TFT data/skin (expose expansion archives)");
+    Cvar_GetD("fs_expansion_archive_prefix", "",             0,            "optional archive basename prefix hidden while fs_expansion is 0");
+#ifdef SC2_DEFAULT_MAP
+    Cvar_GetD("map",              SC2_DEFAULT_MAP,     0,            "map file to load at startup");
+#else
+    Cvar_GetD("map",              "",                  0,            "map file to load at startup (e.g. Maps/HumanCampaign1.w3m)");
+#endif
+    Cvar_GetD("connect",          "",                  0,            "server address to connect to at startup");
+    Cvar_GetD("online_force_relay", "0",               0,            "force EOS relay transport; set before entering Internet games for the first time");
+    Cvar_GetD("cl_debug_entities","0",                 0,            "log client-side entity sync events");
+    Cvar_GetD("sv_debug_entities","0",                 0,            "log server-side entity sync events");
+    Cvar_GetD("r_debug_entities", "0",                 0,            "log renderer entity lifecycle events");
+    Cvar_GetD("menu_module",        "menu",                CVAR_ARCHIVE, "UI shared library name");
+    Cvar_GetD("g_module",         "game",              CVAR_ARCHIVE, "game logic shared library name");
+    Cvar_GetD("ui_game_setup_map","",                  0,            "map pre-selected in game setup UI");
+#ifdef WC3
+    Cvar_GetD("wc3_load_units_from_map_data", "0", 0,
+              "load preplaced units/items from war3mapUnits.doo instead of generated map-script creation");
+    Cvar_GetD("wc3_cheat_starting_resources", "0", 0,
+              "cheat: add 5000 gold and 5000 lumber to each human player's map-authored starting resources");
+#endif
+    Cvar_GetD("camera_trace", "0", 0,
+              "emit opt-in camera trace samples for game camera setup applications");
+    Cvar_GetD("game_port",        PORT_SERVER_STRING,  CVAR_ARCHIVE, "UDP port the game server listens on");
+    Cvar_GetD("name",             "Player",            CVAR_ARCHIVE, "player display name shown in lobbies");
+    Cvar_GetD("sv_hostname",      "OpenWarcraft3",     CVAR_ARCHIVE, "server name shown in lobby browser");
+    Cvar_GetD("sv_cheats",        "0",                 0,            "enable cheat commands on this server");
+    Cvar_GetD("sv_rate",          "0",                 0,            "UDP client link in bytes/second; snapshots due while it drains are skipped; 0=unlimited");
+    Cvar_GetD("dedicated",        "0",                 0,            "dedicated server mode (no client)");
+    Cvar_GetD("com_frame_limit",  "0",                 0,            "exit after N main-loop iterations; 0=disabled");
+#ifdef WC3
+    Cvar_GetD("com_maxfps",       "64",                CVAR_ARCHIVE, "maximum client frame rate; 0=unlimited");
+#else
+    Cvar_GetD("com_maxfps",       "0",                 CVAR_ARCHIVE, "maximum client frame rate; 0=unlimited");
+#endif
+    Cvar_GetD("com_fast_forward", "0",                 0,            "run one fixed server tick per main-loop frame");
+    Cvar_GetD("scr_showfps",      "1",                 CVAR_ARCHIVE, "show FPS counter on screen");
+    Cvar_GetD("skip_cutscene",    "0",                 0,            "skip intro cutscene on startup");
+    Cvar_GetD("vid_mode",         "0",                 CVAR_ARCHIVE, "resolution index: 0=640x480, 1=800x600, 2=1024x768, ...");
+    Cvar_GetD("vid_native",       "0",                 CVAR_ARCHIVE, "use the current desktop resolution instead of vid_mode");
+    Cvar_GetD("vid_fullscreen",   "0",                 CVAR_ARCHIVE, "window mode: 0=windowed, 1=fullscreen");
+    Cvar_GetD("vid_modes",        "0",                 0,            "log SDL display modes during video initialization");
+    Cvar_GetD("r_model_detail",   "2",                 CVAR_ARCHIVE, "model LOD quality: 0=low, 1=medium, 2=high");
+    Cvar_GetD("r_anim_quality",   "2",                 CVAR_ARCHIVE, "animation interpolation quality: 0=off, 2=full");
+    Cvar_GetD("r_texture_quality","2",                 CVAR_ARCHIVE, "texture mip level: 0=low, 1=medium, 2=full");
+    Cvar_GetD("r_particles",      "2",                 CVAR_ARCHIVE, "particle effect density: 0=off, 1=reduced, 2=full");
+    Cvar_GetD("r_lights",         "2",                 CVAR_ARCHIVE, "dynamic light count: 0=off, 1=minimal, 2=max");
+    Cvar_GetD("r_unit_shadows",   "1",                 CVAR_ARCHIVE, "render blob shadows under units");
+    Cvar_GetD("r_occlusion",      "1",                 CVAR_ARCHIVE, "frustum-cull off-screen entities");
+    Cvar_GetD("r_vsync",          "0",                 CVAR_ARCHIVE, "vertical sync: 0=off (use for perf testing), 1=on");
+    Cvar_GetD("r_cursor",         "0",                 CVAR_ARCHIVE, "cursor: 0=native SDL, 1=game-authored");
+    Cvar_GetD("r_stats",          "0",                 0,            "print per-frame draw/world stats to console each second");
+    Cvar_GetD("r_profile",        "0",                 0,            "frame timings: 0=off, 1=CPU/particles, 2=CPU and async GPU queries");
+    Cvar_GetD("r_program_cache",  "1",                 0,            "skip unchanged GL program bindings; 0 enables uncached profiling");
+    Cvar_GetD("r_norefresh",      "0",                 0,            "skip all screen rendering while client/server processing continues");
+    Cvar_GetD("r_entities",       "1",                 0,            "render game entities (units, buildings, etc.)");
+    Cvar_GetD("r_fogofwar",       "1",                 0,            "render fog-of-war overlay");
+#ifdef WOW
+    /* Bare Quake-style console assignment only works for cvars registered before command dispatch. */
+    Cvar_GetD("r_fog",            "1",                 CVAR_ARCHIVE, "render world distance fog");
+    Cvar_GetD("r_fog_start",      WOW_WORLD_FOG_START_STRING, CVAR_ARCHIVE, "fog start distance in WoW yards");
+    Cvar_GetD("r_fog_end",        WOW_WORLD_FOG_END_STRING,   CVAR_ARCHIVE, "fog cutoff distance in WoW yards");
+    Cvar_GetD("r_grass",          "1",                 0,            "render ground-cover grass (14 M2 instanced draw calls when on)");
+    Cvar_GetD("r_doodads",        "1",                 0,            "render terrain and WMO doodad props");
+    Cvar_GetD("r_wmos",           "1",                 0,            "render WMO buildings and structures");
+    Cvar_GetD("r_terrain",        "1",                 0,            "render ADT terrain chunks");
+    Cvar_GetD("r_minimap",        "1",                 0,            "render minimap overlay in corner");
+    Cvar_GetD(BZ_WOW_CVAR_SHOW_TIPS,"1",                CVAR_ARCHIVE, "show WoW tutorial tip windows and alerts");
+#endif
+    Cvar_GetD("ui_chat_support",  "0",                 CVAR_ARCHIVE, "enable in-game chat UI panel");
+    Cvar_GetD("s_sound",          "1",                 CVAR_ARCHIVE | CVAR_UI, "enable game sound effects");
+    Cvar_GetD("s_volume",         "1",                 CVAR_ARCHIVE | CVAR_UI, "game sound effects volume: 0.0..1.0");
+    Cvar_GetD("s_provider",       "1",                 CVAR_ARCHIVE, "sound backend: 0=none, 1=OpenAL");
+}

@@ -1,0 +1,275 @@
+--- a/src/video/uikit/SDL_uikitappdelegate.h
++++ b/src/video/uikit/SDL_uikitappdelegate.h
+@@ -20,6 +20,9 @@
+ */
+ 
+ #import <UIKit/UIKit.h>
++
++/* OpenRealm adaptation: one scene shared by SDL windows and startup alerts. */
++UIWindowScene *UIKit_GetWindowScene(void);
+ 
+ @interface SDLLaunchScreenController : UIViewController
+ 
+--- a/src/video/uikit/SDL_uikitappdelegate.m
++++ b/src/video/uikit/SDL_uikitappdelegate.m
+@@ -349,6 +349,49 @@
+ 
+ @end
+ 
++/* OpenRealm adaptation: preserve SDL2's event pump inside a single UIKit scene. */
++static UIWindowScene *UIKit_window_scene;
++static BOOL UIKit_main_started;
++
++UIWindowScene *UIKit_GetWindowScene(void)
++{
++    return UIKit_window_scene;
++}
++
++@interface SDLUIKitSceneDelegate : NSObject <UIWindowSceneDelegate>
++@end
++
++@implementation SDLUIKitSceneDelegate
++- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options
++{
++    UIKit_window_scene = (UIWindowScene *)scene;
++}
++
++- (void)sceneDidBecomeActive:(UIScene *)scene
++{
++    if (!UIKit_main_started) {
++        UIKit_main_started = YES;
++        [[SDLUIKitDelegate sharedAppDelegate] performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
++    }
++}
++
++- (void)windowScene:(UIWindowScene *)scene didUpdateCoordinateSpace:(id<UICoordinateSpace>)previousCoordinateSpace interfaceOrientation:(UIInterfaceOrientation)previousInterfaceOrientation traitCollection:(UITraitCollection *)previousTraitCollection
++{
++    SDL_OnApplicationDidChangeStatusBarOrientation();
++    for (UIWindow *window in scene.windows) {
++        window.frame = scene.coordinateSpace.bounds;
++        window.rootViewController.view.frame = window.bounds;
++        [window.rootViewController.view setNeedsLayout];
++        [window.rootViewController.view layoutIfNeeded];
++    }
++}
++
++- (void)sceneDidDisconnect:(UIScene *)scene
++{
++    if (UIKit_window_scene == scene) UIKit_window_scene = nil;
++}
++@end
++
+ @implementation SDLUIKitDelegate {
+     UIWindow *launchWindow;
+ }
+@@ -414,54 +457,6 @@
+ {
+     NSBundle *bundle = [NSBundle mainBundle];
+ 
+-#ifdef SDL_IPHONE_LAUNCHSCREEN
+-    /* The normal launch screen is displayed until didFinishLaunching returns,
+-     * but SDL_main is called after that happens and there may be a noticeable
+-     * delay between the start of SDL_main and when the first real frame is
+-     * displayed (e.g. if resources are loaded before SDL_GL_SwapWindow is
+-     * called), so we show the launch screen programmatically until the first
+-     * time events are pumped. */
+-    UIViewController *vc = nil;
+-    NSString *screenname = nil;
+-
+-    /* tvOS only uses a plain launch image. */
+-#if !TARGET_OS_TV
+-    screenname = [bundle objectForInfoDictionaryKey:@"UILaunchStoryboardName"];
+-
+-    if (screenname) {
+-        @try {
+-            /* The launch storyboard is actually a nib in some older versions of
+-             * Xcode. We'll try to load it as a storyboard first, as it's more
+-             * modern. */
+-            UIStoryboard *storyboard = [UIStoryboard storyboardWithName:screenname bundle:bundle];
+-            __auto_type storyboardVc = [storyboard instantiateInitialViewController];
+-            vc = [[SDLLaunchStoryboardViewController alloc] initWithStoryboardViewController:storyboardVc];
+-        }
+-        @catch (NSException *exception) {
+-            /* Do nothing (there's more code to execute below). */
+-        }
+-    }
+-#endif
+-
+-    if (vc == nil) {
+-        vc = [[SDLLaunchScreenController alloc] initWithNibName:screenname bundle:bundle];
+-    }
+-
+-    if (vc.view) {
+-        launchWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+-
+-        /* We don't want the launch window immediately hidden when a real SDL
+-         * window is shown - we fade it out ourselves when we're ready. */
+-        launchWindow.windowLevel = UIWindowLevelNormal + 1.0;
+-
+-        /* Show the window but don't make it key. Events should always go to
+-         * other windows when possible. */
+-        launchWindow.hidden = NO;
+-
+-        launchWindow.rootViewController = vc;
+-    }
+-#endif
+-
+     /* Set working directory to resource path */
+     [[NSFileManager defaultManager] changeCurrentDirectoryPath:[bundle resourcePath]];
+ 
+@@ -470,7 +465,7 @@
+                         SDL_IdleTimerDisabledChanged, NULL);
+ 
+     SDL_SetMainReady();
+-    [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
++    /* The scene starts SDL_main after it becomes active. */
+ 
+     return YES;
+ }
+--- a/src/video/uikit/SDL_uikitwindow.m
++++ b/src/video/uikit/SDL_uikitwindow.m
+@@ -207,7 +207,8 @@
+ 
+         /* ignore the size user requested, and make a fullscreen window */
+         /* !!! FIXME: can we have a smaller view? */
+-        uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
++        /* OpenRealm adaptation: UIKit requires windows to belong to the active scene. */
++        uiwindow = [[SDL_uikitwindow alloc] initWithWindowScene:UIKit_GetWindowScene()];
+ 
+         /* put the window on an external display if appropriate. */
+         if (data.uiscreen != [UIScreen mainScreen]) {
+--- a/src/video/uikit/SDL_uikitmessagebox.m
++++ b/src/video/uikit/SDL_uikitmessagebox.m
+@@ -25,6 +25,7 @@
+ #include "SDL.h"
+ #include "SDL_uikitvideo.h"
+ #include "SDL_uikitwindow.h"
++#import "SDL_uikitappdelegate.h"
+ 
+ /* Display a UIKit message box */
+ 
+@@ -99,7 +100,8 @@
+     }
+ 
+     if (window == nil || window.rootViewController == nil) {
+-        alertwindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
++        /* OpenRealm adaptation: startup alerts also need the active scene. */
++        alertwindow = [[UIWindow alloc] initWithWindowScene:UIKit_GetWindowScene()];
+         alertwindow.rootViewController = [UIViewController new];
+         alertwindow.windowLevel = UIWindowLevelAlert;
+ 
+--- a/src/video/uikit/SDL_uikitevents.m
++++ b/src/video/uikit/SDL_uikitevents.m
+@@ -53,10 +53,11 @@
+     NSNotificationCenter *notificationCenter = NSNotificationCenter.defaultCenter;
+     if (UIKit_EventPumpEnabled && !self.isObservingNotifications) {
+         self.isObservingNotifications = YES;
+-        [notificationCenter addObserver:self selector:@selector(applicationDidBecomeActive) name:UIApplicationDidBecomeActiveNotification object:nil];
+-        [notificationCenter addObserver:self selector:@selector(applicationWillResignActive) name:UIApplicationWillResignActiveNotification object:nil];
+-        [notificationCenter addObserver:self selector:@selector(applicationDidEnterBackground) name:UIApplicationDidEnterBackgroundNotification object:nil];
+-        [notificationCenter addObserver:self selector:@selector(applicationWillEnterForeground) name:UIApplicationWillEnterForegroundNotification object:nil];
++        /* OpenRealm adaptation: scene notifications own activation/background state. */
++        [notificationCenter addObserver:self selector:@selector(applicationDidBecomeActive) name:UISceneDidActivateNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationWillResignActive) name:UISceneWillDeactivateNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationDidEnterBackground) name:UISceneDidEnterBackgroundNotification object:nil];
++        [notificationCenter addObserver:self selector:@selector(applicationWillEnterForeground) name:UISceneWillEnterForegroundNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationWillTerminate) name:UIApplicationWillTerminateNotification object:nil];
+         [notificationCenter addObserver:self selector:@selector(applicationDidReceiveMemoryWarning) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
+ #if !TARGET_OS_TV
+--- a/src/video/uikit/SDL_uikitvideo.m
++++ b/src/video/uikit/SDL_uikitvideo.m
+@@ -32,6 +32,7 @@
+ #include "../../events/SDL_events_c.h"
+ 
+ #include "SDL_uikitvideo.h"
++#import "SDL_uikitappdelegate.h"
+ #include "SDL_uikitevents.h"
+ #include "SDL_uikitmodes.h"
+ #include "SDL_uikitwindow.h"
+@@ -196,45 +197,10 @@
+ 
+ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
+ {
+-    SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
+-    CGRect frame = screen.bounds;
+-#if !TARGET_OS_TV
+-    UIInterfaceOrientation orient;
+-    BOOL landscape;
+-    BOOL fullscreen;
+-#endif
+-
+-    /* Use the UIWindow bounds instead of the UIScreen bounds, when possible.
+-     * The uiwindow bounds may be smaller than the screen bounds when Split View
+-     * is used on an iPad. */
+-    if (data != nil && data.uiwindow != nil) {
+-        frame = data.uiwindow.bounds;
+-    }
+-
+-#if !TARGET_OS_TV
+-    /* iOS 10 seems to have a bug where, in certain conditions, putting the
+-     * device to sleep with the a landscape-only app open, re-orienting the
+-     * device to portrait, and turning it back on will result in the screen
+-     * bounds returning portrait orientation despite the app being in landscape.
+-     * This is a workaround until a better solution can be found.
+-     * https://bugzilla.libsdl.org/show_bug.cgi?id=3505
+-     * https://bugzilla.libsdl.org/show_bug.cgi?id=3465
+-     * https://forums.developer.apple.com/thread/65337 */
+-    orient = [UIApplication sharedApplication].statusBarOrientation;
+-    landscape = UIInterfaceOrientationIsLandscape(orient) ||
+-                    !(UIKit_GetSupportedOrientations(window) & (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown));
+-    fullscreen = CGRectEqualToRect(screen.bounds, frame);
+-
+-    /* The orientation flip doesn't make sense when the window is smaller
+-     * than the screen (iPad Split View, for example). */
+-    if (fullscreen && (landscape != (frame.size.width > frame.size.height))) {
+-        float height = frame.size.width;
+-        frame.size.width = frame.size.height;
+-        frame.size.height = height;
+-    }
+-#endif
+-
+-    return frame;
++    /* Scene coordinates already include rotation and the current window size. */
++    (void)window;
++    UIWindowScene *scene = UIKit_GetWindowScene();
++    return scene ? scene.coordinateSpace.bounds : screen.bounds;
+ }
+ 
+ void UIKit_ForceUpdateHomeIndicator(void)
+--- a/src/video/uikit/SDL_uikitmodes.m
++++ b/src/video/uikit/SDL_uikitmodes.m
+@@ -24,6 +24,7 @@
+ 
+ #include "SDL_system.h"
+ #include "SDL_uikitmodes.h"
++#import "SDL_uikitappdelegate.h"
+ 
+ #include "../../events/SDL_events_c.h"
+ 
+@@ -355,7 +356,7 @@
+ {
+ #if !TARGET_OS_TV
+     if (uiscreen == [UIScreen mainScreen]) {
+-        return UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
++        return UIInterfaceOrientationIsLandscape(UIKit_GetWindowScene().interfaceOrientation);
+     } else
+ #endif /* !TARGET_OS_TV */
+     {
+@@ -525,7 +526,7 @@
+ #if !TARGET_OS_TV
+ void SDL_OnApplicationDidChangeStatusBarOrientation(void)
+ {
+-    BOOL isLandscape = UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
++    BOOL isLandscape = UIInterfaceOrientationIsLandscape(UIKit_GetWindowScene().interfaceOrientation);
+     SDL_VideoDisplay *display = SDL_GetDisplay(0);
+ 
+     if (display) {
+@@ -550,7 +551,7 @@
+             currentmode->h = height;
+         }
+ 
+-        switch ([UIApplication sharedApplication].statusBarOrientation) {
++        switch (UIKit_GetWindowScene().interfaceOrientation) {
+         case UIInterfaceOrientationPortrait:
+             orientation = SDL_ORIENTATION_PORTRAIT;
+             break;

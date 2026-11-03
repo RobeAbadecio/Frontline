@@ -1,0 +1,43 @@
+#include "g_sc2_local.h"
+
+/* SC2 edicts have no dynamic walkable surfaces; the shared router must not inspect WC3-only fields. */
+static bool entity_is_live_walkable_surface(edict_t const *ent) { (void)ent; return false; }
+static uint8_t entity_dynamic_pathing_flags(edict_t const *ent, uint8_t mover_flags) { (void)ent; (void)mover_flags; return CM_PATHING_UNWALKABLE; }
+static bool entity_is_pathing_ignored(edict_t const *ent) { (void)ent; return false; }
+/* SC2 has no bridges; identity transform. */
+static void entity_pathtex_transform(pathTexTransformParams_t const *params, pathTexTransform_t *transform) {
+    if (params && params->pathtex && transform) *transform = MAKE(pathTexTransform_t,
+        .width = params->pathtex->width, .height = params->pathtex->height, .turn = 0);
+}
+
+static inline handle_t G_WorldReadFile(cstring_t filename, uint32_t * size) { return gi.ReadFile(filename, size); }
+static inline handle_t G_WorldMemAlloc(long size) { return gi.MemAlloc(size); }
+static inline void G_WorldMemFree(handle_t mem) { gi.MemFree(mem); }
+static inline BOMStatus G_WorldTextRemoveBom(string_t buffer) {
+	size_t len;
+	if (!buffer) return INVALID_BOM;
+	len = strlen(buffer);
+	if (len >= 3 && !memcmp(buffer, "\xEF\xBB\xBF", 3)) { memmove(buffer, buffer + 3, len - 2); return UTF8_BOM_FOUND; }
+	if (len >= 2 && !memcmp(buffer, "\xFF\xFE", 2)) { memmove(buffer, buffer + 2, len - 1); return UTF16LE_BOM_FOUND; }
+	if (len >= 2 && !memcmp(buffer, "\xFE\xFF", 2)) { memmove(buffer, buffer + 2, len - 1); return UTF16BE_BOM_FOUND; }
+	return NO_BOM;
+}
+#define FS_ReadFile G_WorldReadFile
+#define FS_FreeFile G_WorldMemFree
+#define MemAlloc G_WorldMemAlloc
+#define MemFree G_WorldMemFree
+#define PF_TextRemoveBom G_WorldTextRemoveBom
+#define Com_Error(code, ...) gi.error(__VA_ARGS__)
+#include "common/world.c"
+/* This shared routing unit owns CM_GetPathingFlagsAt, including the empty-pathmap result used by SC2. */
+#include "server/sv_routing.c"
+#include "games/starcraft-2/common/sc2_map.c"
+#include "games/starcraft-2/common/world_sc2.c"
+
+#undef FS_ReadFile
+#undef FS_FreeFile
+#undef MemAlloc
+#undef MemFree
+#undef PF_TextRemoveBom
+#undef Com_Error
+#undef ge

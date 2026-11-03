@@ -1,0 +1,132 @@
+#ifndef war3map_h
+#define war3map_h
+
+#include "common.h"
+
+/* cmodel.h is included by common.h before common.h reaches its own edict
+ * forward declaration, so declare the tag here before using it in prototypes. */
+struct edict_s;
+
+typedef void (*cmLoadYield_t)(void);
+
+/* Generic byte-mask pathing channels used by the shared router. Existing
+ * walkability APIs keep their historical UNWALKABLE behavior; games select
+ * the channels and match policy required by their movement rules. */
+#define CM_PATHING_UNWALKABLE   0x02
+#define CM_PATHING_UNFLYABLE    0x04
+#define CM_PATHING_UNSWIMMABLE  0x40
+/* Generic query modifier: require every selected static blocker bit instead of
+ * the default any-selected-bit match. This is a routing policy bit, not WPM data. */
+#define CM_PATHING_REQUIRE_ALL  0x80
+
+typedef struct {
+    vec2_t const *from, *target;
+    float radius;
+    uint8_t blocked_flags; /* channels + query modifiers; 0 preserves legacy UNWALKABLE */
+} pathAccelParams_t;
+
+struct War3MapVertex {
+    uint16_t accurate_height;
+    uint16_t waterlevel;
+    uint8_t mapedge;
+    uint8_t ground;
+    uint8_t ramp;
+    uint8_t blight;
+    uint8_t water;
+    uint8_t boundary;
+    uint8_t groundVariation;
+    uint8_t cliffVariation; // used also to mark mid-ramp
+    uint8_t level;
+    uint8_t cliff;
+};
+
+struct war3map {
+    uint32_t header;
+    uint32_t version;
+    uint8_t tileset;
+    uint32_t custom;
+    uint32_t *grounds;
+    uint32_t *cliffs;
+    vec2_t center;
+    uint32_t width;
+    uint32_t height;
+    handle_t vertices;
+    uint32_t num_grounds;
+    uint32_t num_cliffs;
+};
+
+/* Synchronous format parsers cooperatively yield through the caller-owned callback. */
+bool CM_LoadMap(cstring_t mapFilename, cmLoadYield_t yield);
+uint32_t CM_GetMapChecksum(void);
+bool CM_IsMapLoaded(cstring_t mapFilename);
+float CM_GetHeightAtPoint(float sx, float sy);
+float CM_GetWaterHeightAtPoint(float sx, float sy);
+doodad_t *CM_GetDoodads(void);
+//mapPlayer_t const *CM_GetPlayer(uint32_t index);
+uint32_t CM_GetLocalPlayerNumber(void);
+mapInfo_t const *CM_GetMapInfo(void);
+bool CM_ReadMapInfo(cstring_t filename, mapInfo_t *info);
+void CM_FreeMapInfo(mapInfo_t *info);
+void CM_ReadAbilities(handle_t archive);
+void CM_ReadDestructables(handle_t archive);
+void CM_ReadDoodadOverrides(handle_t archive);
+vec2_t CM_GetNormalizedMapPosition(float x, float y);
+vec2_t CM_GetDenormalizedMapPosition(float x, float y);
+bool CM_ClosestPathablePoint(vec2_t const *location, vec2_t *out);
+bool CM_ClosestPathablePointForRadius(vec2_t const *location, float radius, vec2_t *out);
+bool CM_ClosestPathablePointWithin(vec2_t const *location, float radius, uint8_t blocked_flags, float max_distance,
+                                   vec2_t *out);
+bool CM_ClosestPathablePointForRadiusFlags(vec2_t const *location, float radius, uint8_t blocked_flags,
+                                           vec2_t *out);
+bool CM_ClosestReachablePointForRadius(vec2_t const *from, vec2_t const *target, float radius, vec2_t *out);
+bool CM_ClosestReachablePointForRadiusFlags(vec2_t const *from, vec2_t const *target, float radius,
+                                            uint8_t blocked_flags, vec2_t *out);
+bool CM_PointIsPathableForRadius(vec2_t const *location, float radius);
+bool CM_PointIsPathableForRadiusFlags(vec2_t const *location, float radius, uint8_t blocked_flags);
+bool CM_LineIsWalkable(vec2_t const *a, vec2_t const *b);
+/* Optional byte-mask pathing sample used by generic local presentation.
+ * Backends without a compatible cell mask return false and clear flags. */
+bool CM_GetPathingFlagsAt(vec2_t const *location, uint8_t *flags);
+bool CM_TerrainPointIsWalkable(vec2_t const *location);
+bool CM_TerrainPointIsSwimmable(vec2_t const *location);
+bool CM_LineIsWalkableForRadius(vec2_t const *a, vec2_t const *b, float radius);
+bool CM_LineIsPathableForRadiusFlags(vec2_t const *a, vec2_t const *b, float radius, uint8_t blocked_flags);
+bool CM_FindPathWaypoint(pathAccelParams_t const *params, vec2_t *out);
+bool CM_GetTerrainPathingFlagsAt(vec2_t const *location, uint8_t *flags);
+float CM_PathDistanceForRadiusFlags(vec2_t const *from, vec2_t const *target, float radius, uint8_t blocked_flags);
+bool CM_FindDirectApproachPointForRadius(vec2_t const *from, vec2_t const *target, float range, float radius, vec2_t *out);
+float CM_PathCellWorldSize(void);
+uint32_t CM_RequestHeatmapForRadius(struct edict_s *goalentity, float radius);
+uint32_t CM_RequestHeatmapForRadiusFlags(struct edict_s *goalentity, float radius, uint8_t blocked_flags);
+bool CM_ActivateCachedFlowForFlags(uint32_t generation, uint8_t blocked_flags);
+void CM_ProcessPathJobs(uint32_t work_budget);
+bool CM_FindApproachPointToFootprintForRadius(struct edict_s const *target, vec2_t const *from, float range, float radius, vec2_t *out);
+bool CM_FindInnerApproachPointToFootprintForRadius(struct edict_s const *target, vec2_t const *from, float range, float radius, vec2_t *out);
+/* Distance from a world point to the target entity's authored no-walk
+ * pathing footprint. Returns FLT_MAX when the target has no usable footprint. */
+float CM_DistanceToPathingFootprint(struct edict_s const *target, vec2_t const *point);
+float CM_DistanceToPathingFootprintFlags(struct edict_s const *target, vec2_t const *point,
+                                         uint8_t blocked_flags);
+box2_t CM_GetWorldBounds(void);
+
+/* WoW-only: all WorldSafeLocs entries for the current map.  Populated during
+ * CM_LoadMap; null until a WoW map is loaded.  Callers must not free. */
+#ifdef WOW
+uint32_t CM_WowGetMapId(void);
+uint32_t CM_WowGetAllSpawnCount(void);
+vec3_t const *CM_WowGetSpawnPos(uint32_t index);
+cstring_t CM_WowGetSpawnName(uint32_t index);
+cstring_t CM_WowAdtPath(int tile_x, int tile_y, string_t out, uint32_t out_size);
+float CM_WowFloorHeight(float x, float y, float ref_z, float step_up);
+bool CM_WowMoveBlocked(vec3_t const *from, vec3_t const *to);
+bool CM_WowRayTriangle(vec3_t const *start, vec3_t const *end, vec3_t const *a, vec3_t const *b, vec3_t const *c, float *fraction);
+#ifdef BZ_TESTS
+bool CM_WowTestBspRay(vec3_t const *start, vec3_t const *end, float *fraction);
+bool CM_WowTestWallRay(bool wall);
+#endif
+#endif
+void CM_BakeStaticObstacles(void);
+void CM_InvalidatePathCache(void);
+void CM_SetupPathMap(uint32_t width, uint32_t height, uint8_t const *cells);
+
+#endif

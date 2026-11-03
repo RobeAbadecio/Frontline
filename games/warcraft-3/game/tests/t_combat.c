@@ -1,0 +1,4241 @@
+#ifdef BZ_TESTS
+#include <stddef.h>
+/* Forward declarations — defined in t_slk.c, compiled together in unity build. */
+slkTestData_t *parse_slk_string(char const *slk_text);
+void free_slk_rows(slkTestData_t *rows);
+/*
+ * test_combat.c — Tests for combat, animation, ability lookup, resources,
+ *                 build queue, and quest system.
+ *
+ * Covered:
+ *   T_Damage             — health reduction, lethal hit (calls die),
+ *                          counter-attack trigger, attacker stand after kill
+ *   M_MoveFrame          — normal advance, wrap at interval end (endfunc call,
+ *                          frame reset), AI_HOLD_FRAME inhibits advance,
+ *                          no animation → no-op
+ *   G_RunEntity          — stat fields compressed after run,
+ *                          ability index updated from currentmove (non-zero)
+ *   G_AttackDamage       — representative attack×defense table cells (pierce/
+ *                          small=2.0, normal/medium=1.5, siege/fort=1.5,
+ *                          magic/large=2.0, chaos passthrough, hero/fort=0.5),
+ *                          data-driven armor/type constants, Divine reduction,
+ *                          exponential negative armor, minimum-1 clamp
+ *   Ability lookup       — FindAbilityByClassname hit/miss,
+ *                          command-name/rawcode resolution, GetAbilityByIndex,
+ *                          GetAbilityIndex
+ *   player_pay           — deducts gold on success,
+ *                          refuses when gold insufficient,
+ *                          refuses when lumber insufficient,
+ *                          NULL player guard
+ *   unit_add_build_queue — single item, chained items
+ *   Quest system         — G_MakeQuest fields, set/query, G_RemoveQuest
+ *   G_PublishEvent       — queue write/read using ring-buffer semantics
+ */
+
+#include "test.h"
+#include "../g_local.h"
+#include "../hud/hud_local.h"
+
+/* Helpers defined in t_utils.c */
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void reset_entities(void);
+void setup_test_world(void);
+void G_RunEntities(void);
+void ui_selectskill(gameClient_t *client);
+
+
+#include "../game/skills/s_skills.h"
+
+/* Forward declarations for internal functions not in any public header. */
+bool  player_pay(player_t *ps, uint32_t project);
+void  T_Damage(edict_t *target, edict_t *attacker, int damage);
+int   G_AttackDamage(edict_t *attacker, edict_t *target, int base);
+void  attack_melee(edict_t *self);
+void  attack_melee_cooldown(edict_t *self);
+void  attack_ranged(edict_t *self);
+void  attack_ranged_cooldown(edict_t *self);
+bool  attack_menu_selecttarget(edict_t *ent, edict_t *target);
+void  M_MoveFrame(edict_t *self);
+void  G_RunEntity(edict_t *ent);
+void  unit_add_build_queue(edict_t *self, edict_t *item);
+void  order_move(edict_t *self, edict_t *target);
+
+static animation_t _replacement_anim = {
+    .name = "stand alternate",
+    .interval = { 1000, 1300 }
+};
+static umove_t _replacement_move = { "stand alternate", NULL, NULL, NULL };
+
+/* ==========================================================================
+ * Shared helpers
+ * ========================================================================== */
+
+/* Minimal die() stub that records calls without touching the move state. */
+static int _die_call_count = 0;
+static edict_t *_die_last_attacker = NULL;
+static PATHSTR _fire_model;
+static char _hero_menu_clicks[8][64];
+static uint32_t _hero_menu_click_count;
+static uint32_t _hero_menu_command_button_count;
+
+static void hero_menu_capture_write(pfWriteType_t type, void const *value) {
+    uiFrame_t const *frame;
+
+    if (type != PF_UIFRAME || !value || _hero_menu_click_count >= sizeof(_hero_menu_clicks) / sizeof(_hero_menu_clicks[0])) return;
+    frame = value;
+    if (frame->flags.type != FT_COMMANDBUTTON) return;
+    _hero_menu_command_button_count++;
+    if (!frame->onclick) return;
+    strlcpy(_hero_menu_clicks[_hero_menu_click_count++], frame->onclick,
+            sizeof(_hero_menu_clicks[0]));
+}
+
+static int hero_menu_test_image_index(cstring_t path) {
+    (void)path;
+    return 1;
+}
+
+static void stub_die(edict_t *self, edict_t *attacker) {
+    (void)self;
+    _die_call_count++;
+    _die_last_attacker = attacker;
+}
+
+static int capture_fire_model(cstring_t model) {
+    strlcpy(_fire_model, model, sizeof(_fire_model));
+    return 77;
+}
+
+static edict_t *make_combat_unit(uint32_t class_id, float hp, float x, float y) {
+    static UnitWeapons_t const test_weapons = { .attacksEnabled = 3 };
+    edict_t *ent       = alloc_test_unit(class_id, x, y);
+    ent->health.value     = hp;
+    ent->health.max_value = hp;
+    ent->stand            = unit_stand;
+    ent->die              = stub_die;
+    ent->svflags         |= SVF_MONSTER;
+    ent->data.UnitWeapons = &test_weapons;
+    unit_stand(ent);
+    return ent;
+}
+
+static animation_t _stub_anim = {
+    .name       = "stand",
+    .interval   = { 0, 300 }   /* 300 ms long animation */
+};
+
+/* Wire a real animation into an entity so M_MoveFrame has something to work with. */
+static void attach_stub_anim(edict_t *ent) {
+    ent->animation = &_stub_anim;
+}
+
+/* ==========================================================================
+ * Ability presentation effects
+ * ========================================================================== */
+
+TEST(wc3_combat, projectile_presentation_selects_stand_sequence) {
+    edict_t *missile;
+
+    setup_test_world();
+    reset_entities();
+    missile = G_Spawn();
+    missile->s.model = G_RegisterModel("TestUI\\Models\\anim_pulse.mdx");
+
+    G_StartProjectilePresentation(missile);
+
+    T_NOT_NULL(missile->animation);
+    T_STREQ(missile->animation->name, "Stand");
+    T_EQ(missile->s.frame, missile->animation->interval[0]);
+    T_ASSERT(missile->s.flags & EF_NOT_SELECTABLE);
+    T_ASSERT(missile->s.renderfx & RF_NO_SHADOW);
+}
+
+TEST(wc3_combat, flymissile_advances_animation_and_tracks_homing_yaw) {
+    animation_t stand = { .name = "Stand", .interval = { 1000, 1300 } };
+    edict_t *missile;
+    edict_t *target;
+
+    setup_test_world();
+    reset_entities();
+    missile = G_Spawn();
+    target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 100.0f, 100.0f);
+    target->s.origin.z = 200.0f;
+    missile->s.origin = (vec3_t){ 0.0f, 0.0f, 0.0f };
+    missile->goalentity = target;
+    missile->movetype = MOVETYPE_FLYMISSILE;
+    missile->velocity = 0.1f;
+    missile->animation = &stand;
+    missile->s.frame = 1250;
+
+    G_RunEntity(missile);
+
+    T_FEQ(missile->s.angle, (float)(M_PI / 4.0), 0.001f);
+    T_ASSERT(missile->s.frame >= stand.interval[0]);
+    T_ASSERT(missile->s.frame < stand.interval[1]);
+    T_NE(missile->s.frame, 1250);
+}
+
+TEST(wc3_effects, ability_effect_art_selects_requested_entry_and_last_fallback) {
+    uint32_t const holy_light = MAKEFOURCC('A','H','h','b');
+
+    setup_test_world();
+    T_STREQ(G_AbilityEffectArt(holy_light, WC3_EFFECT_TARGET, 0),
+            "TestUI\\Models\\anim_pulse.mdx");
+    T_STREQ(G_AbilityEffectArt(holy_light, WC3_EFFECT_TARGET, 1),
+            "TestUI\\Models\\quad_sprite.mdx");
+    T_STREQ(G_AbilityEffectArt(holy_light, WC3_EFFECT_TARGET, 99),
+            "TestUI\\Models\\quad_sprite.mdx");
+    T_STREQ(G_AbilityEffectArt(holy_light, WC3_EFFECT_SPECIAL, 0),
+            "TestUI\\Models\\panel_sprite.mdx");
+    T_STREQ(G_AbilityEffectArt(holy_light, WC3_EFFECT_AREA_EFFECT, 0),
+            "TestUI\\Models\\ui_panel.mdx");
+    T_NULL(G_AbilityEffectArt(holy_light, WC3_EFFECT_LIGHTNING, 0));
+
+    T_STREQ(G_AbilityEffectArt(MAKEFOURCC('B','i','m','l'), WC3_EFFECT_TARGET, 0),
+            "TestUI\\Models\\anim_pulse.mdx");
+    T_STREQ(G_AbilityEffectArt(MAKEFOURCC('B','i','m','l'), WC3_EFFECT_SPECIAL, 0),
+            "TestUI\\Models\\panel_sprite.mdx");
+    T_STREQ(G_AbilityEffectArt(MAKEFOURCC('B','i','m','l'), WC3_EFFECT_EFFECT, 0),
+            "TestUI\\Models\\quad_sprite.mdx");
+    T_STREQ(G_AbilityEffectArt(MAKEFOURCC('A','C','s','p'), WC3_EFFECT_TARGET, 0),
+            "TestUI\\Models\\anim_pulse.mdx");
+}
+
+TEST(wc3_effects, owned_target_ability_effect_records_owner_and_target_generation) {
+    uint32_t const holy_light = MAKEFOURCC('A','H','h','b');
+    edict_t *owner;
+    edict_t *target;
+    edict_t *effect;
+
+    setup_test_world();
+    reset_entities();
+    owner = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64.0f, 0.0f);
+
+    effect = G_SpawnOwnedAbilityEffectTarget(owner, holy_light, WC3_EFFECT_TARGET, 0, target, NULL);
+
+    T_NOT_NULL(effect);
+    T_ASSERT(effect->owner == owner);
+    T_ASSERT(effect->goalentity == target);
+    T_EQ(effect->damage, target->spawn_time);
+    T_EQ(effect->movetype, MOVETYPE_LINK);
+    T_ASSERT(effect->s.flags & EF_NOT_SELECTABLE);
+}
+
+/* ==========================================================================
+ * T_Damage
+ * ========================================================================== */
+
+TEST(wc3_combat, tdamage_reduces_health) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    _die_call_count  = 0;
+
+    T_Damage(target, attacker, 100);
+
+    T_FEQ(target->health.value, 320.0f, 0.01f);
+    T_EQ(_die_call_count, 0);
+}
+
+TEST(wc3_combat, tdamage_does_not_repeat_death_for_already_dead_unit) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    _die_call_count  = 0;
+
+    T_Damage(target, attacker, 100);
+    T_Damage(target, attacker, 100);
+
+    T_FEQ(target->health.value, 0.0f, 0.01f);
+    T_EQ(_die_call_count, 1);
+}
+
+TEST(wc3_combat, tdamage_refreshes_owned_hero_shortcut_alert) {
+    gameClient_t *client;
+    edict_t *target;
+    edict_t *attacker;
+
+    reset_entities();
+    setup_test_world();
+    client = &game.clients[0];
+    client->ps.number = 0;
+    client->shortcuts.dirty = false;
+    target = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 50.0f, 0.0f);
+    target->s.player = 0;
+    attacker->s.player = 1;
+    level.time = 7000;
+
+    T_Damage(target, attacker, 25);
+
+    T_ASSERT(target->unit_state->shortcut_alert_until > level.time);
+    T_ASSERT(client->shortcuts.dirty);
+}
+
+TEST(wc3_combat, tdamage_updates_building_fire_model_and_slot_mask) {
+    edict_t *building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1000.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 50.0f, 0.0f);
+    int (*old_model_index)(cstring_t) = gi.ModelIndex;
+
+    building->s.flags |= EF_BUILDING;
+    gi.ModelIndex = capture_fire_model;
+    T_Damage(building, attacker, 300);
+    T_STREQ(_fire_model, "Environment\\SmallBuildingFire\\SmallBuildingFire2.mdx");
+    T_EQ(building->s.effect, 77);
+    T_EQ(building->s.effect_flags, EFX_MODEL | EFX_ATTACH_SLOTS | EFX_SLOT_FIRST | EFX_SLOT_SECOND);
+    T_Damage(building, attacker, 250);
+    T_STREQ(_fire_model, "Environment\\LargeBuildingFire\\LargeBuildingFire2.mdx");
+    T_EQ(building->s.effect_flags, EFX_MODEL | EFX_ATTACH_SLOTS | EFX_SLOT_FIRST | EFX_SLOT_SECOND |
+                                       EFX_SLOT_FOURTH | EFX_SLOT_FIFTH);
+    T_Damage(building, attacker, 250);
+    T_STREQ(_fire_model, "Environment\\LargeBuildingFire\\LargeBuildingFire1.mdx");
+    T_EQ(building->s.effect_flags, EFX_MODEL | EFX_ATTACH_SLOTS | EFX_SLOT_FIRST | EFX_SLOT_SECOND |
+                                       EFX_SLOT_THIRD | EFX_SLOT_FOURTH | EFX_SLOT_FIFTH);
+    G_AddHealth(building, 800.0f);
+    T_EQ(building->s.effect, 0);
+    T_EQ(building->s.effect_flags, 0);
+    gi.ModelIndex = old_model_index;
+}
+
+/* Find the persistent ACsp presentation edict owned by a sleeping unit. */
+static edict_t *find_creep_sleep_overlay(edict_t const *target) {
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *effect = g_edicts + i;
+        if (effect->inuse && effect->owner == target && effect->goalentity == target)
+            return effect;
+    }
+    return NULL;
+}
+
+TEST(wc3_effects, natural_creep_sleep_uses_persistent_acsp_overhead_target_art) {
+    edict_t *target;
+    edict_t *overlay;
+
+    setup_test_world();
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    target->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    if (!target->sleep) target->sleep = G_AllocSleep();
+    assert(target->sleep);
+    target->sleep->can_sleep = true;
+    target->s.radius = 32.0f;
+    game.clients[PLAYER_NEUTRAL_AGGRESSIVE].ps.stats[WC3_PLAYERSTATE_NO_CREEP_SLEEP] = 0;
+
+    G_SetTimeOfDay(game.constants.duskTimeGameHours);
+    G_UpdateTimeOfDay();
+    ai_stand(target);
+    T_ASSERT(G_UnitIsSleeping(target));
+    overlay = find_creep_sleep_overlay(target);
+    T_NOT_NULL(overlay);
+    T_ASSERT(overlay->s.model != 0);
+    T_ASSERT(overlay->s.flags & EF_NOT_SELECTABLE);
+    T_EQ(overlay->movetype, MOVETYPE_LINK);
+    T_ASSERT(overlay->owner == target);
+    T_FEQ(overlay->wait, 80.0f, 0.01f);
+
+    G_UnitWakeUp(target);
+    T_ASSERT(!G_UnitIsSleeping(target));
+    T_NULL(find_creep_sleep_overlay(target));
+
+    /* Replacing the Sleep move directly must use the same overlay cleanup,
+     * not merely clear the logical sleeping flag. */
+    ai_stand(target);
+    T_ASSERT(G_UnitIsSleeping(target));
+    T_NOT_NULL(find_creep_sleep_overlay(target));
+    unit_stand(target);
+    T_ASSERT(!G_UnitIsSleeping(target));
+    T_NULL(find_creep_sleep_overlay(target));
+
+    /* RemoveUnit must clean the overlay before this edict slot can be reused. */
+    ai_stand(target);
+    T_ASSERT(G_UnitIsSleeping(target));
+    overlay = find_creep_sleep_overlay(target);
+    T_NOT_NULL(overlay);
+    G_FreeEdict(target);
+    T_ASSERT(overlay && !overlay->inuse);
+
+    G_SetTimeOfDay(12.0f);
+    G_UpdateTimeOfDay();
+}
+
+TEST(wc3_combat, positive_damage_wakes_natural_creep_sleep) {
+    edict_t *target;
+    edict_t *attacker;
+
+    setup_test_world();
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    target->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    if (!target->sleep) target->sleep = G_AllocSleep();
+    assert(target->sleep);
+    target->sleep->can_sleep = true;
+    attacker->s.player = 0;
+    game.clients[PLAYER_NEUTRAL_AGGRESSIVE].ps.stats[WC3_PLAYERSTATE_NO_CREEP_SLEEP] = 0;
+
+    G_SetTimeOfDay(game.constants.duskTimeGameHours);
+    G_UpdateTimeOfDay();
+    ai_stand(target);
+    T_ASSERT(G_UnitIsSleeping(target));
+
+    gi.LinkEntity(target); gi.LinkEntity(attacker);
+    T_NULL(G_FindNearestEnemy(attacker, 128.0f));
+    T_Damage(target, attacker, 0);
+    T_ASSERT(G_UnitIsSleeping(target));
+
+    T_Damage(target, attacker, 1);
+
+    T_ASSERT(!G_UnitIsSleeping(target));
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == target);
+    G_SetTimeOfDay(12.0f);
+    G_UpdateTimeOfDay();
+}
+
+TEST(wc3_combat, automatic_acquisition_ignores_invulnerable_units) {
+    edict_t *target, *attacker;
+
+    setup_test_world();
+    target = make_combat_unit(MAKEFOURCC('u','a','c','o'), 420.0f, 0.0f, 0.0f);
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 250.0f, 50.0f, 0.0f);
+    target->s.player = 6; attacker->s.player = 1;
+    G_SetUnitFlag(target, UNIT_FLAG_INVULNERABLE, true);
+    gi.LinkEntity(target); gi.LinkEntity(attacker);
+
+    T_NULL(G_FindNearestEnemy(attacker, 128.0f));
+    G_SetUnitFlag(target, UNIT_FLAG_INVULNERABLE, false);
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == target);
+}
+
+TEST(wc3_combat, hidden_owner_transferred_unit_cannot_be_acquired_or_attacked) {
+    edict_t *cairne, *tauren;
+    mapInfo_t *mapinfo;
+
+    setup_test_world(); reset_entities();
+    mapinfo = (mapInfo_t *)level.mapinfo;
+    mapinfo->players[0].playerType = kPlayerTypeHuman;
+    mapinfo->players[4].playerType = kPlayerTypeComputer;
+    mapinfo->players[5].playerType = kPlayerTypeComputer;
+    cairne = make_combat_unit(MAKEFOURCC('O','c','b','h'), 1200.0f, 0.0f, 0.0f);
+    tauren = make_combat_unit(MAKEFOURCC('o','t','a','u'), 700.0f, 48.0f, 0.0f);
+    cairne->s.player = 4; tauren->s.player = 0;
+    cairne->targtype = tauren->targtype = TARG_GROUND;
+    tauren->unit_state->attack1.type = ATK_NORMAL;
+    tauren->unit_state->attack1.cooldown = 1.5f;
+    tauren->unit_state->attack1.damageBase = 25;
+    tauren->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    gi.LinkEntity(cairne); gi.LinkEntity(tauren);
+
+    T_ASSERT(G_FindNearestEnemy(tauren, 128.0f) == cairne);
+    T_ASSERT(S_OrderAttack(tauren, cairne));
+    attack_melee(tauren);
+    tauren->wait = 0.0f;
+    cairne->s.renderfx |= RF_HIDDEN;
+    cairne->s.player = 5;
+    tauren->currentmove->think(tauren);
+
+    T_FEQ(cairne->health.value, 1200.0f, 0.01f);
+    T_NULL(tauren->goalentity);
+    T_NULL(G_FindNearestEnemy(tauren, 128.0f));
+    T_ASSERT(!S_AttackCanTarget(tauren, cairne));
+    T_ASSERT(!S_OrderAttack(tauren, cairne));
+    T_NULL(tauren->goalentity);
+
+    cairne->s.renderfx &= ~RF_HIDDEN;
+    T_ASSERT(G_FindNearestEnemy(tauren, 128.0f) == cairne);
+    T_ASSERT(S_OrderAttack(tauren, cairne));
+    T_ASSERT(tauren->goalentity == cairne);
+}
+
+TEST(wc3_combat, attack_target_mask_rejects_air_until_air_is_allowed) {
+    edict_t *attacker, *target;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 400.0f, 64.0f, 0.0f);
+    attacker->s.player = 0; target->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_PIERCE;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_AIR;
+
+    T_ASSERT(!S_OrderAttack(attacker, target));
+    T_NULL(attacker->goalentity);
+
+    attacker->unit_state->attack1.targetsAllowed |= WC3_TARGET_FLAG_AIR;
+    T_ASSERT(S_OrderAttack(attacker, target));
+    T_ASSERT(attacker->goalentity == target);
+}
+
+TEST(wc3_combat, automatic_acquisition_skips_disallowed_nearer_target) {
+    edict_t *attacker, *air, *ground;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','r','i','f'), 535.0f, 0.0f, 0.0f);
+    air = make_combat_unit(MAKEFOURCC('h','f','o','o'), 400.0f, 40.0f, 0.0f);
+    ground = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    attacker->s.player = 0; air->s.player = ground->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_PIERCE;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damageBase = 10;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    air->targtype = TARG_AIR;
+    ground->targtype = TARG_GROUND;
+    gi.LinkEntity(attacker); gi.LinkEntity(air); gi.LinkEntity(ground);
+
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == ground);
+}
+
+TEST(wc3_combat, automatic_acquisition_includes_attackable_structures) {
+    edict_t *tower, *building;
+
+    setup_test_world();
+    tower = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1500.0f, 80.0f, 0.0f);
+    tower->s.player = 0; building->s.player = 1;
+    tower->unit_state->attack1.type = ATK_PIERCE;
+    tower->unit_state->attack1.cooldown = 1.0f;
+    tower->unit_state->attack1.damageBase = 10;
+    tower->unit_state->attack1.range = 700.0f;
+    tower->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_STRUCTURE;
+    tower->aiflags |= AI_IMMOBILE;
+    building->targtype = TARG_STRUCTURE;
+    building->runtime.flags |= UNIT_BALANCE_BUILDING;
+    gi.LinkEntity(tower); gi.LinkEntity(building);
+
+    T_ASSERT(G_FindNearestEnemy(tower, 900.0f) == building);
+}
+
+TEST(wc3_combat, immobile_attacker_does_not_acquire_outside_weapon_range) {
+    edict_t *tower, *enemy;
+
+    setup_test_world();
+    tower = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    enemy = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 200.0f, 0.0f);
+    tower->s.player = 0; enemy->s.player = 1;
+    tower->unit_state->attack1.type = ATK_PIERCE;
+    tower->unit_state->attack1.cooldown = 1.0f;
+    tower->unit_state->attack1.damageBase = 10;
+    tower->unit_state->attack1.range = 100.0f;
+    tower->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    tower->aiflags |= AI_IMMOBILE;
+    enemy->targtype = TARG_GROUND;
+    gi.LinkEntity(tower); gi.LinkEntity(enemy);
+
+    T_NULL(G_FindNearestEnemy(tower, 300.0f));
+
+    gi.UnlinkEntity(enemy);
+    enemy->s.origin.x = enemy->s.origin2.x = 80.0f;
+    enemy->bounds.min.x = 64.0f; enemy->bounds.max.x = 96.0f;
+    gi.LinkEntity(enemy);
+    T_ASSERT(G_FindNearestEnemy(tower, 300.0f) == enemy);
+}
+
+TEST(wc3_combat, immobile_attacker_cancels_explicit_attack_it_cannot_reach) {
+    edict_t *tower, *enemy;
+
+    setup_test_world();
+    tower = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    enemy = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 200.0f, 0.0f);
+    tower->s.player = 0; enemy->s.player = 1;
+    tower->unit_state->attack1.type = ATK_PIERCE;
+    tower->unit_state->attack1.range = 100.0f;
+    tower->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    tower->aiflags |= AI_IMMOBILE;
+    enemy->targtype = TARG_GROUND;
+
+    order_attack(tower, enemy);
+    T_ASSERT(tower->goalentity == enemy);
+    T_NOT_NULL(tower->currentmove);
+    T_NOT_NULL(tower->currentmove->think);
+
+    tower->currentmove->think(tower);
+
+    T_NULL(tower->goalentity);
+    T_STREQ(tower->currentmove->animation, "stand");
+}
+
+TEST(wc3_combat, alliance_change_stops_active_attack_before_next_hit) {
+    edict_t *attacker, *target;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 60.0f, 0.0f);
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    attacker->s.player = 0; target->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttack);
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[1].ps, ALLIANCE_PASSIVE, true);
+    attacker->currentmove->think(attacker);
+
+    T_NULL(attacker->goalentity);
+    T_STREQ(attacker->currentmove->animation, "stand");
+}
+
+TEST(wc3_combat, explicit_attack_continues_against_allied_target) {
+    edict_t *attacker, *target;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','b','a','r'), 420.0f, 60.0f, 0.0f);
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    attacker->s.player = 0; target->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_STRUCTURE;
+    target->targtype = TARG_STRUCTURE;
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[1].ps, ALLIANCE_PASSIVE, true);
+
+    T_ASSERT(S_OrderAttack(attacker, target));
+    attacker->currentmove->think(attacker);
+
+    T_ASSERT(attacker->goalentity == target);
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttack);
+}
+
+TEST(wc3_combat, undead_campaign_arthas_can_attack_a_ground_unit) {
+    edict_t *arthas, *target;
+
+    setup_test_world(); reset_entities();
+    arthas = make_combat_unit(MAKEFOURCC('U','e','a','r'), 700.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 48.0f, 0.0f);
+    arthas->s.player = 0;
+    target->s.player = 1;
+    arthas->targtype = target->targtype = TARG_GROUND;
+    arthas->unit_state->attack1.type = ATK_NORMAL;
+    arthas->unit_state->attack1.damageBase = 25;
+    arthas->unit_state->attack1.damagePoint = 0.01f;
+    arthas->unit_state->attack1.range = 100.0f;
+    arthas->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    arthas->wait = 40.0f; /* Birth's wait must not delay an explicit attack. */
+
+    T_ASSERT(S_OrderAttack(arthas, target));
+    T_ASSERT(arthas->currentmove && arthas->currentmove->proc == CAbilityAttack);
+    T_ASSERT(arthas->goalentity == target);
+    arthas->currentmove->think(arthas);
+    T_STREQ(arthas->currentmove->animation, "attack");
+    arthas->currentmove->think(arthas);
+
+    T_ASSERT(target->health.value < target->health.max_value);
+}
+
+TEST(wc3_combat, tdamage_lethal_calls_die) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    _die_call_count  = 0;
+    _die_last_attacker = NULL;
+
+    T_Damage(target, attacker, 100);
+
+    T_EQ(_die_call_count, 1);
+    T_ASSERT(target->health.value == 0.0f);
+    T_ASSERT(_die_last_attacker == attacker);
+}
+
+TEST(wc3_combat, tdamage_lethal_resets_attacker_to_stand) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 50.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    _die_call_count  = 0;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    T_Damage(target, attacker, 100);
+
+    /* After a kill the attacker's move should be the stand animation. */
+    T_NOT_NULL(attacker->currentmove);
+    T_STREQ(attacker->currentmove->animation, "stand");
+}
+
+TEST(wc3_combat, tdamage_non_lethal_does_not_call_die) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    _die_call_count  = 0;
+
+    T_Damage(target, attacker, 1);
+
+    T_EQ(_die_call_count, 0);
+    T_ASSERT(target->health.value > 0.0f);
+}
+
+TEST(wc3_combat, instant_kill_cheat_makes_owner_damage_lethal) {
+    edict_t *target;
+    edict_t *building;
+    edict_t *attacker;
+
+    setup_test_world();
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1200.0f, 100.0f, 0.0f);
+    attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    attacker->s.player = 0;
+    target->s.player = 1;
+    building->s.player = 1;
+    building->s.flags |= EF_BUILDING;
+    game.clients[0].cheat_instant_kill = true;
+    _die_call_count = 0;
+
+    T_Damage(target, attacker, 1);
+    T_EQ(_die_call_count, 1);
+    T_FEQ(target->health.value, 0.0f, 0.01f);
+
+    T_Damage(building, attacker, 1);
+    T_EQ(_die_call_count, 2);
+    T_FEQ(building->health.value, 0.0f, 0.01f);
+}
+
+TEST(wc3_combat, instant_kill_cheat_does_not_affect_other_players) {
+    edict_t *target;
+    edict_t *attacker;
+
+    setup_test_world();
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    attacker->s.player = 1;
+    target->s.player = 0;
+    game.clients[0].cheat_instant_kill = true;
+    _die_call_count = 0;
+
+    T_Damage(target, attacker, 1);
+    T_EQ(_die_call_count, 0);
+    T_FEQ(target->health.value, 419.0f, 0.01f);
+}
+
+
+TEST(wc3_combat, tdamage_invulnerable_ignores_damage) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 50.0f, 0.0f);
+    G_SetUnitFlag(target, UNIT_FLAG_INVULNERABLE, true);
+    _die_call_count = 0;
+
+    T_Damage(target, attacker, 9999);
+
+    T_FEQ(target->health.value, 420.0f, 0.01f);
+    T_EQ(_die_call_count, 0);
+}
+
+TEST(wc3_combat, friendly_damage_does_not_trigger_counterattack) {
+    edict_t *target   = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 50.0f, 0.0f);
+    target->s.player = 0;
+    attacker->s.player = 0;
+    target->unit_state->attack1.type = ATK_NORMAL;
+
+    T_Damage(target, attacker, 1);
+
+    T_ASSERT(target->goalentity != attacker);
+}
+
+/* Explicit Attack-button targeting deliberately differs from Smart/right-click:
+ * it may force-fire on friendly units and buildings. */
+TEST(wc3_combat, attack_button_accepts_owned_building) {
+    edict_t *clent = &g_edicts[0];
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    edict_t *building = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 100.0f, 0.0f);
+
+    clent->s.player = 0;
+    attacker->s.player = 0;
+    { static UnitWeapons_t const weapons = { .attacksEnabled = 3 }; attacker->data.UnitWeapons = &weapons; }
+    building->s.player = 0;
+    building->targtype = TARG_STRUCTURE;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_STRUCTURE;
+    attacker->selected = 1 << clent->client->ps.number;
+    building->svflags |= SVF_MONSTER;
+    building->health.value = 100.0f;
+    building->health.max_value = 100.0f;
+
+    T_ASSERT(attack_menu_selecttarget(clent, building));
+    T_ASSERT(attacker->goalentity == building);
+}
+
+TEST(wc3_combat, attack_button_accepts_owned_nonbuilding_unit) {
+    edict_t *clent = &g_edicts[0];
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    edict_t *friendly = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 100.0f, 0.0f);
+
+    clent->s.player = 0;
+    attacker->s.player = 0;
+    { static UnitWeapons_t const weapons = { .attacksEnabled = 3 }; attacker->data.UnitWeapons = &weapons; }
+    friendly->s.player = 0;
+    friendly->targtype = TARG_GROUND;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->selected = 1 << clent->client->ps.number;
+    friendly->svflags |= SVF_MONSTER;
+    friendly->health.value = 100.0f;
+    friendly->health.max_value = 100.0f;
+
+    T_ASSERT(attack_menu_selecttarget(clent, friendly));
+    T_ASSERT(attacker->goalentity == friendly);
+}
+
+TEST(wc3_combat, attack_button_accepts_allied_unit) {
+    edict_t *clent = &g_edicts[0];
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    edict_t *friendly = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 100.0f, 0.0f);
+
+    clent->s.player = 0;
+    attacker->s.player = 0;
+    { static UnitWeapons_t const weapons = { .attacksEnabled = 3 }; attacker->data.UnitWeapons = &weapons; }
+    friendly->s.player = 1;
+    friendly->targtype = TARG_GROUND;
+    /* Allied targeting requires active map slots; the old test set only a raw alliance bit for an inactive owner. */
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[1].ps, ALLIANCE_PASSIVE, true);
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->selected = 1 << clent->client->ps.number;
+    friendly->svflags |= SVF_MONSTER;
+    friendly->health.value = 100.0f;
+    friendly->health.max_value = 100.0f;
+
+    T_ASSERT(attack_menu_selecttarget(clent, friendly));
+    T_ASSERT(attacker->goalentity == friendly);
+}
+
+TEST(wc3_combat, attack_button_does_not_order_unit_to_attack_itself) {
+    edict_t *clent = &g_edicts[0];
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+
+    clent->s.player = 0;
+    unit->s.player = 0;
+    unit->selected = 1 << clent->client->ps.number;
+    unit->svflags |= SVF_MONSTER;
+    unit->health.value = 100.0f;
+    unit->health.max_value = 100.0f;
+
+    T_ASSERT(!attack_menu_selecttarget(clent, unit));
+    T_NULL(unit->goalentity);
+}
+
+/* Building attacks use the authored no-walk footprint as their interaction
+ * boundary.  A melee unit beside a large building may be well outside attack
+ * range of the building centre while already being in range of its wall. */
+TEST(wc3_combat, attack_owned_building_starts_at_pathing_footprint_range) {
+    enum { W = 8, H = 8 };
+    edict_t *attacker;
+    edict_t *building;
+    pathTex_t *pathtex;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+    building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1500.0f, 0.0f, 0.0f);
+    attacker->s.player = 0;
+    building->s.player = 0;
+    attacker->collision = 16.0f;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.range = 90.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_STRUCTURE;
+    building->targtype = TARG_STRUCTURE;
+
+    pathtex = gi.MemAlloc(sizeof(*pathtex) + W * H * sizeof(color32_t));
+    T_NOT_NULL(pathtex);
+    pathtex->width = W;
+    pathtex->height = H;
+    FOR_LOOP(i, W * H)
+        pathtex->map[i] = (color32_t){ 0, 0, 255, 255 };
+    building->pathtex = pathtex;
+
+    /* Centre distance is intentionally beyond melee range. */
+    T_ASSERT(Vector2_distance(&attacker->s.origin2, &building->s.origin2) >
+             attacker->unit_state->attack1.range);
+    T_ASSERT(CM_DistanceToPathingFootprint(building, &attacker->s.origin2) <=
+             attacker->collision + attacker->unit_state->attack1.range);
+
+    order_attack(attacker, building);
+    T_STREQ(attacker->currentmove->animation, "walk");
+    attacker->currentmove->think(attacker);
+
+    T_STREQ(attacker->currentmove->animation, "attack");
+    gi.MemFree(pathtex);
+}
+
+TEST(wc3_combat, attack_destructable_starts_at_pathing_footprint_range) {
+    enum { W = 8, H = 8 };
+    edict_t *attacker;
+    edict_t *gate;
+    pathTex_t *pathtex;
+
+    setup_test_world();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+    gate = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 400.0f, 0.0f);
+    gate->svflags &= ~SVF_MONSTER;
+    gate->targtype = TARG_DEBRIS;
+    gate->health.value = gate->health.max_value = 500.0f;
+    gate->collision = 50.0f;
+    if (!gate->destructable) gate->destructable = G_AllocDestructable();
+    assert(gate->destructable);
+    gate->destructable->placement_solid = true;
+    gate->destructable->pathing_active = true;
+    attacker->s.player = 0;
+    attacker->collision = 16.0f;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.range = 90.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_DEBRIS;
+
+    pathtex = gi.MemAlloc(sizeof(*pathtex) + W * H * sizeof(color32_t));
+    T_NOT_NULL(pathtex);
+    pathtex->width = W;
+    pathtex->height = H;
+    FOR_LOOP(i, W * H)
+        pathtex->map[i] = (color32_t){ 0, 0, 255, 255 };
+    gate->pathtex = pathtex;
+
+    T_ASSERT(Vector2_distance(&attacker->s.origin2, &gate->s.origin2) > attacker->unit_state->attack1.range);
+    T_ASSERT(CM_DistanceToPathingFootprint(gate, &attacker->s.origin2) <=
+             attacker->collision + attacker->unit_state->attack1.range);
+
+    order_attack(attacker, gate);
+    T_STREQ(attacker->currentmove->animation, "walk");
+    attacker->currentmove->think(attacker);
+
+    T_STREQ(attacker->currentmove->animation, "attack");
+    gi.MemFree(pathtex);
+}
+
+TEST(wc3_combat, secondary_attack_can_target_destructables) {
+    edict_t *attacker, *gate;
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    gate = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 128.0f, 0.0f);
+    gate->svflags &= ~SVF_MONSTER;
+    gate->targtype = TARG_DEBRIS;
+    if (!gate->destructable) gate->destructable = G_AllocDestructable();
+    assert(gate->destructable);
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack2.type = ATK_SIEGE;
+    attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_DEBRIS;
+
+    T_ASSERT(S_AttackCanTarget(attacker, gate));
+}
+
+TEST(wc3_combat, secondary_attack_selection_keeps_authored_profiles) {
+    edict_t *attacker, *target;
+    UnitWeapons_t weapons = { .attacksEnabled = 3 };
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    attacker->data.UnitWeapons = &weapons;
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 256.0f, 0.0f);
+    target->targtype = TARG_AIR;
+    attacker->unit_state->attack1.type = ATK_NORMAL; attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack2.type = ATK_PIERCE; attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_AIR;
+    attacker->unit_state->attack2.damageBase = 17;
+    T_ASSERT(S_OrderAttack(attacker, target));
+    T_EQ(attacker->unit_state->attack1.type, ATK_NORMAL); T_EQ(attacker->unit_state->attack1.targetsAllowed, WC3_TARGET_FLAG_GROUND);
+    T_EQ(attacker->unit_state->attack2.type, ATK_PIERCE); T_EQ(attacker->unit_state->attack2.damageBase, 17);
+}
+
+TEST(wc3_combat, disabled_secondary_attack_cannot_target_air) {
+    edict_t *attacker, *target;
+    UnitWeapons_t weapons = { .attacksEnabled = 1 };
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 64.0f, 0.0f);
+    target->targtype = TARG_AIR;
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_NORMAL; attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack2.type = ATK_PIERCE; attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_AIR;
+    T_ASSERT(!S_AttackCanTarget(attacker, target));
+}
+
+TEST(wc3_combat, missing_weapon_data_disables_authored_attack_slots) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 64.0f, 0.0f);
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_GROUND;
+    attacker->data.UnitWeapons = NULL;
+    T_ASSERT(!S_UnitAttackSlotEnabled(attacker, 0));
+    T_ASSERT(!S_AttackCanTarget(attacker, target));
+}
+
+TEST(wc3_combat, missile_impact_uses_attack2_type_selected_at_launch) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3 };
+    edict_t *attacker;
+    edict_t *target;
+    edict_t *missile = NULL;
+
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 200.0f, 0.0f);
+    attacker->data.UnitWeapons = &weapons;
+    attacker->goalentity = target;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_MISSILE;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 500.0f;
+    attacker->unit_state->attack2.type = ATK_PIERCE;
+    attacker->unit_state->attack2.weapon = WPN_MISSILE;
+    attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_AIR;
+    attacker->unit_state->attack2.damageBase = 100;
+    attacker->unit_state->attack2.numberOfDice = 0;
+    attacker->unit_state->attack2.damagePoint = 0.1f;
+    attacker->unit_state->attack2.cooldown = 1.0f;
+    attacker->unit_state->attack2.projectile.speed = 1000;
+    attacker->unit_state->attack2.range = 500.0f;
+    target->targtype = TARG_AIR;
+    target->unit_state->defense_type = 0; /* Pierce deals 200%; Normal deals 100%. */
+    target->unit_state->armor_value = 0.0f;
+
+    T_ASSERT(S_OrderAttack(attacker, target));
+    attack_ranged(attacker);
+    attacker->wait = 0.01f;
+    attacker->currentmove->think(attacker);
+    FILTER_EDICTS(ent, ent->owner == attacker && ent->movetype == MOVETYPE_FLYMISSILE) { missile = ent; break; }
+    T_NOT_NULL(missile);
+    if (!missile) return;
+    T_EQ(missile->missile->attack_type, ATK_PIERCE);
+
+    target->targtype = TARG_GROUND; /* Transform after launch; slot 1 no longer matches. */
+    missile->s.origin.x = target->s.origin.x - 1.0f;
+    missile->s.origin.y = target->s.origin.y;
+    missile->s.origin.z = target->s.origin.z;
+    missile->velocity = 1.0f;
+    SV_Physics_Toss(missile);
+
+    T_FEQ(target->health.value, 220.0f, 0.001f);
+}
+
+/* ==========================================================================
+ * M_MoveFrame
+ * ========================================================================== */
+
+static int _endfunc_called = 0;
+static void stub_endfunc(edict_t *ent) {
+    (void)ent;
+    _endfunc_called++;
+}
+
+static umove_t _stub_move = { "stand", NULL, stub_endfunc, NULL };
+
+static void stub_transition_endfunc(edict_t *ent) {
+    _endfunc_called++;
+    ent->currentmove = &_replacement_move;
+    ent->animation = &_replacement_anim;
+}
+
+TEST(wc3_combat, mmoveframe_no_animation_is_noop) {
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    ent->animation   = NULL;
+    ent->currentmove = &_stub_move;
+    ent->s.frame     = 0;
+
+    M_MoveFrame(ent);
+
+    T_EQ((int)ent->s.frame, 0);
+}
+
+TEST(wc3_combat, mmoveframe_hold_frame_flag_inhibits) {
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    ent->s.frame     = 100;
+    ent->aiflags    |= AI_HOLD_FRAME;
+
+    M_MoveFrame(ent);
+
+    T_EQ((int)ent->s.frame, 100);
+}
+
+TEST(wc3_combat, mmoveframe_normal_advance) {
+    /* FRAMETIME = 100, animation interval [0, 300].
+     * Start at frame 50 → next frame = 150 (still inside interval). */
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    ent->s.frame     = 50;
+    _endfunc_called  = 0;
+
+    M_MoveFrame(ent);
+
+    T_EQ((int)ent->s.frame, 150);
+    T_EQ(_endfunc_called, 0);
+}
+
+TEST(wc3_combat, mmoveframe_uses_animation_time_scale) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    ent->animation_speed = 0.5f;
+    ent->s.frame = 50;
+
+    M_MoveFrame(ent);
+
+    T_EQ((int)ent->s.frame, 100);
+}
+
+TEST(wc3_combat, paused_unit_advances_scripted_animation_only) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    G_SetUnitFlag(ent, UNIT_FLAG_PAUSED, true);
+    ent->s.frame = 50;
+
+    monster_think(ent);
+
+    T_EQ((int)ent->s.frame, 50);
+    G_SetUnitFlag(ent, UNIT_FLAG_ANIMATION_OVERRIDE, true);
+    monster_think(ent);
+    T_EQ((int)ent->s.frame, 150);
+}
+
+TEST(wc3_combat, mmoveframe_at_end_calls_endfunc_and_wraps) {
+    /* Start at frame 250 → next = 350 >= 300 (end) → endfunc, wrap to 0. */
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    ent->s.frame     = 250;
+    _endfunc_called  = 0;
+
+    M_MoveFrame(ent);
+
+    T_EQ(_endfunc_called, 1);
+    /* Without AI_HOLD_FRAME the frame resets to interval[0]. */
+    T_EQ((int)ent->s.frame, 0);
+}
+
+TEST(wc3_combat, mmoveframe_endfunc_transition_starts_replacement_animation) {
+    animation_t old_anim = {
+        .name = "morph alternate",
+        .interval = { 0, 300 },
+    };
+    umove_t old_move = { "morph alternate", NULL, stub_transition_endfunc, NULL };
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+
+    ent->animation = &old_anim;
+    ent->currentmove = &old_move;
+    ent->s.frame = 250;
+    _endfunc_called = 0;
+
+    M_MoveFrame(ent);
+
+    T_EQ(_endfunc_called, 1);
+    T_ASSERT(ent->animation == &_replacement_anim);
+    T_ASSERT(ent->currentmove == &_replacement_move);
+    T_EQ((int)ent->s.frame, 1000);
+}
+
+TEST(wc3_combat, mmoveframe_out_of_range_frame_resets) {
+    /* frame > interval[1] → clamped to interval[0]. */
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    attach_stub_anim(ent);
+    ent->currentmove = &_stub_move;
+    ent->s.frame     = 9999;
+    _endfunc_called  = 0;
+
+    M_MoveFrame(ent);
+
+    T_EQ((int)ent->s.frame, 0);
+    T_EQ(_endfunc_called, 0);
+}
+
+/* ==========================================================================
+ * G_RunEntity
+ * ========================================================================== */
+
+TEST(wc3_combat, runentity_stat_fields_updated) {
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    /* Manually set health below max so we get a non-trivial compressed value. */
+    ent->health.max_value = 400.0f;
+    ent->health.value     = 200.0f;   /* 50% → 127 */
+    ent->mana.max_value   = 100.0f;
+    ent->mana.value       = 100.0f;   /* 100% → 255 */
+    ent->movetype         = MOVETYPE_NONE;
+
+    G_RunEntity(ent);
+
+    T_EQ((int)ent->s.stats[ENT_HEALTH], 127);
+    T_EQ((int)ent->s.stats[ENT_MANA],   255);
+}
+
+TEST(wc3_combat, sethealth_updates_ability_level_only_when_health_byte_changes) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+
+    ent->s.flags |= EF_BUILDING;
+    ent->s.effect = 77; ent->s.effect_flags = EFX_MODEL;
+    G_SetHealth(ent, 419.0f);
+    T_EQ(ent->s.effect, 0);
+    T_EQ(ent->s.effect_flags, 0);
+    ent->s.effect = 77; ent->s.effect_flags = EFX_MODEL;
+    G_SetHealth(ent, 418.9f);
+    T_EQ(ent->s.effect, 77);
+    T_EQ(ent->s.effect_flags, EFX_MODEL);
+}
+
+TEST(wc3_combat, sethealth_zero_clears_building_fire_when_already_zero) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','b','a','r'), 420.0f, 0.0f, 0.0f);
+
+    ent->s.flags |= EF_BUILDING;
+    ent->health.value = 0.0f;
+    ent->s.effect = 77;
+    ent->s.effect_flags = EFX_MODEL;
+    G_SetHealth(ent, 0.0f);
+
+    T_EQ(ent->s.effect, 0);
+    T_EQ(ent->s.effect_flags, 0);
+}
+
+TEST(wc3_combat, runentity_ability_index_from_currentmove) {
+    /* Use order_move to place the entity into the walk state.  The walk
+     * umove_t has ability == CAbilityMove, whose index in abilitylist[] is
+     * non-zero (CAbilityStop is at index 0).  This ensures the assertion
+     * would catch G_RunEntity hard-coding s.ability = 0. */
+    edict_t *ent      = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    ent->movetype    = MOVETYPE_NONE;
+    vec2_t dest     = MAKE(vec2_t, 100.0f, 100.0f);
+    edict_t *waypoint = Waypoint_add(&dest);
+    order_move(ent, waypoint);  /* sets currentmove->proc = CAbilityMove */
+    T_NOT_NULL(ent->currentmove);
+    T_NOT_NULL(ent->currentmove->proc);
+
+    G_RunEntity(ent);
+
+    uint32_t expected = GetAbilityIndex(ent->currentmove->proc);
+    T_ASSERT(expected != 0);  /* CAbilityMove is not the first entry (CAbilityStop is) */
+    T_EQ((int)ent->s.ability, (int)expected);
+}
+
+/* Hit-point regeneration (WC3 'uhpr'/'uhrt'): a wounded "always"-regen unit
+ * heals by rate * frametime each frame; "none" never heals; healing caps at
+ * max HP.  Test data (test_harness.c): hfoo regenHP 0.5 "always", hbar "none". */
+TEST(wc3_combat, runentity_hp_regen_always) {
+    edict_t *ent           = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    ent->health.max_value = 420.0f;
+    ent->health.value     = 200.0f;
+    ent->mana.max_value   = 0.0f;
+    ent->movetype         = MOVETYPE_NONE;
+
+    G_RunEntity(ent);
+
+    T_FEQ(ent->health.value, 200.0f + G_UnitBalance(ent->class_id)->healthRegen *
+          (FRAMETIME / 1000.0f), 0.0001f);
+}
+
+TEST(wc3_combat, runentity_hp_regen_caps_at_max) {
+    edict_t *ent           = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    ent->health.max_value = 420.0f;
+    ent->health.value     = 419.99f;   /* less than one frame's regen from full */
+    ent->movetype         = MOVETYPE_NONE;
+
+    G_RunEntity(ent);
+
+    T_FEQ(ent->health.value, 420.0f, 0.0001f);
+}
+
+TEST(wc3_combat, runentity_hp_regen_none_does_not_heal) {
+    /* regenType "none" must not heal even though regenHP is positive. */
+    edict_t *ent           = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1500.0f, 0.0f, 0.0f);
+    ent->health.max_value = 1500.0f;
+    ent->health.value     = 1000.0f;
+    ent->movetype         = MOVETYPE_NONE;
+
+    G_RunEntity(ent);
+
+    T_FEQ(ent->health.value, 1000.0f, 0.0001f);
+}
+
+TEST(wc3_combat, regeneration_aura_heals_when_natural_regen_type_is_none) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X7\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"targs\"\n"
+        "C;Y1;X4;K\"Area1\"\nC;Y1;X5;K\"DataA1\"\nC;Y1;X6;K\"DataB1\"\nC;Y1;X7;K\"levels\"\n"
+        "C;Y2;X1;K\"ACnr\"\nC;Y2;X2;K\"Aoar\"\nC;Y2;X3;K\"ground,friend,organic,vuln,invu\"\n"
+        "C;Y2;X4;K\"500\"\nC;Y2;X5;K\"0.01\"\nC;Y2;X6;K\"1\"\nC;Y2;X7;K\"1\"\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+
+    reset_entities();
+    setup_test_world();
+    edict_t *fountain = make_combat_unit(MAKEFOURCC('h','p','e','a'), 220.0f, 0.0f, 0.0f);
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1500.0f, 100.0f, 0.0f);
+    fountain->s.player = ent->s.player = 0;
+    fountain->targtype = ent->targtype = TARG_GROUND;
+    fountain->unit_state->overrides.added[0] = MAKEFOURCC('A','C','n','r');
+    ARRAY_COUNT(fountain->unit_state->overrides.added) = 1;
+    ent->health.max_value = 1500.0f;
+    ent->health.value = 1000.0f;
+    ent->movetype = MOVETYPE_NONE;
+
+    G_RunEntity(ent);
+
+    T_FEQ(ent->health.value, 1000.0f + 15.0f * (FRAMETIME / 1000.0f), 0.001f);
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+/* Hero attribute -> derived-stat scaling (G_RecomputeHeroStats).  Test hero
+ * "Hpal" (test_harness.c) has real Paladin bases: realHP 650, realM 255,
+ * realdef 3.9, STR 22 / INT 17 / AGI 13.  Per WC3: +25 HP/STR, +15 mana/INT,
+ * +0.3 armor/AGI. */
+TEST(wc3_combat, hero_strength_adds_hp) {
+    edict_t *hero          = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    hero->unit_state->hero.str        = 22;            /* base */
+    hero->health.max_value = 650.0f;
+    hero->health.value     = 650.0f;
+
+    hero->unit_state->hero.str = 25;                   /* +3 STR */
+    G_RecomputeHeroStats(hero);
+
+    T_FEQ(hero->health.max_value, 650.0f + 3 * 25.0f, 0.01f); /* 725 */
+    T_FEQ(hero->health.value,     650.0f + 3 * 25.0f, 0.01f); /* heals by gain */
+}
+
+TEST(wc3_combat, hero_intelligence_adds_mana) {
+    edict_t *hero        = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    hero->unit_state->hero.intel    = 17;              /* base */
+    hero->mana.max_value = 255.0f;
+    hero->mana.value     = 255.0f;
+
+    hero->unit_state->hero.intel = 20;                 /* +3 INT */
+    G_RecomputeHeroStats(hero);
+
+    T_FEQ(hero->mana.max_value, 255.0f + 3 * 15.0f, 0.01f); /* 300 */
+}
+
+TEST(wc3_combat, hero_agility_adds_armor) {
+    edict_t *hero       = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    hero->unit_state->hero.agi     = 13;               /* base */
+    hero->unit_state->armor_value  = 3.9f;
+
+    hero->unit_state->hero.agi = 23;                    /* +10 AGI */
+    G_RecomputeHeroStats(hero);
+
+    T_FEQ(hero->unit_state->armor_value, 3.9f + 10 * 0.3f, 0.01f); /* 6.9 */
+}
+
+/* A hero's Strength adds +0.05 HP regen/sec per point; Intelligence adds +0.05
+ * mana regen/sec per point (on top of the unit's base regen). */
+TEST(wc3_combat, hero_strength_hp_regen_bonus) {
+    edict_t *h            = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.str          = 22;
+    h->health.max_value  = 650.0f; h->health.value = 600.0f;  /* wounded */
+    h->mana.max_value    = 0.0f;                              /* no mana regen */
+    h->movetype          = MOVETYPE_NONE;
+
+    G_RunEntity(h);
+
+    T_FEQ(h->health.value, 600.0f + (G_UnitBalance(h->class_id)->healthRegen + 22 * 0.05f) *
+          (FRAMETIME / 1000.0f), 0.001f);
+}
+
+TEST(wc3_combat, hero_intelligence_mana_regen_bonus) {
+    edict_t *h          = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.intel      = 17;
+    h->health.max_value = 650.0f; h->health.value = 650.0f;   /* full -> no HP regen */
+    h->mana.max_value  = 255.0f; h->mana.value = 100.0f;
+    h->movetype        = MOVETYPE_NONE;
+
+    G_RunEntity(h);
+
+    T_FEQ(h->mana.value, 100.0f + 17 * 0.05f * (FRAMETIME / 1000.0f), 0.001f);
+}
+
+TEST(wc3_combat, hero_primary_attribute_adds_damage) {
+    /* Hpal's Primary is STR, so attack damage rises +1 per Strength point. */
+    edict_t *h     = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.str   = 22;
+    G_RecomputeHeroStats(h);
+    float const dmg0 = h->unit_state->attack1.damageBase;
+
+    h->unit_state->hero.str = 30;            /* +8 Strength */
+    G_RecomputeHeroStats(h);
+
+    T_FEQ(h->unit_state->attack1.damageBase, dmg0 + 8.0f, 0.01f);
+}
+
+TEST(wc3_combat, hero_recompute_preserves_attack_and_armor_modifiers) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.str = 22;
+    h->unit_state->hero.agi = 13;
+    h->unit_state->attack1.permanentDamageBonus = 2.0f;
+    h->unit_state->attack1.temporaryDamageBonus = 5.0f;
+    h->unit_state->permanent_armor_bonus = 2.0f;
+    h->unit_state->temporary_armor_bonus = 3.0f;
+
+    G_RecomputeHeroStats(h);
+    T_FEQ(h->unit_state->attack1.temporaryDamageBonus, 5.0f, 0.001f);
+    T_EQ(h->unit_state->attack1.damageBase, h->data.UnitWeapons->attack1.damageBase + 22 + 2);
+    T_FEQ(h->unit_state->armor_value, h->data.UnitBalance->armor + 5.0f, 0.001f);
+
+    h->unit_state->hero.str = 30;
+    h->unit_state->hero.agi = 23;
+    G_RecomputeHeroStats(h);
+    T_FEQ(h->unit_state->attack1.temporaryDamageBonus, 5.0f, 0.001f);
+    T_EQ(h->unit_state->attack1.damageBase, h->data.UnitWeapons->attack1.damageBase + 30 + 2);
+    T_FEQ(h->unit_state->armor_value, h->data.UnitBalance->armor + 10 * 0.3f + 5.0f, 0.001f);
+}
+
+TEST(wc3_combat, hero_stats_noop_for_non_hero) {
+    /* Footman has no attributes — recompute must leave its stats untouched. */
+    edict_t *u            = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    u->health.max_value  = 420.0f;
+    u->health.value      = 300.0f;
+    u->unit_state->hero.str          = 99;             /* bogus; must be ignored */
+
+    G_RecomputeHeroStats(u);
+
+    T_FEQ(u->health.max_value, 420.0f, 0.01f);
+    T_FEQ(u->health.value,     300.0f, 0.01f);
+}
+
+/* Hero XP / leveling.  NeedHeroXP stores per-level requirements; when Misc
+ * data is unavailable the stock fallback is 200,300,400,..., yielding the
+ * familiar cumulative thresholds below.  Hpal: STR/INT/AGI per level
+ * 2.7/1.8/1.5. */
+TEST(wc3_combat, hero_xp_for_level_table) {
+    void *old_misc = game.config.misc.source;
+    uint32_t xp1, xp2, xp3, xp4, xp10;
+    game.config.misc.source = NULL; /* exercise the documented stock fallback */
+
+    xp1 = G_HeroXPForLevel(1);
+    xp2 = G_HeroXPForLevel(2);
+    xp3 = G_HeroXPForLevel(3);
+    xp4 = G_HeroXPForLevel(4);
+    xp10 = G_HeroXPForLevel(10);
+    game.config.misc.source = old_misc;
+
+    T_EQ((int)xp1, 0);
+    T_EQ((int)xp2, 200);
+    T_EQ((int)xp3, 500);
+    T_EQ((int)xp4, 900);
+    T_EQ((int)xp10, 5400);
+}
+
+TEST(wc3_combat, hero_xp_for_level_uses_misc_table_and_formula) {
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+    uint32_t xp2, xp3, xp4, xp5;
+
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXP.txt"));
+    game.config.misc.source = custom.source;
+    xp2 = G_HeroXPForLevel(2);
+    xp3 = G_HeroXPForLevel(3);
+    xp4 = G_HeroXPForLevel(4);
+    xp5 = G_HeroXPForLevel(5);
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+
+    T_EQ((int)xp2, 100);  /* first authored requirement */
+    T_EQ((int)xp3, 350);  /* + second authored requirement (250) */
+    T_EQ((int)xp4, 700);  /* + f(2) = 1*250 + 50*2 = 350 */
+    T_EQ((int)xp5, 1200); /* + f(3) = 1*350 + 50*3 = 500 */
+}
+
+TEST(wc3_combat, stock_misc_hero_xp_formula_matches_retail_thresholds) {
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+    uint32_t xp2, xp3, xp4, xp10;
+
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\StockHeroXP.txt"));
+    game.config.misc.source = custom.source;
+    xp2 = G_HeroXPForLevel(2);
+    xp3 = G_HeroXPForLevel(3);
+    xp4 = G_HeroXPForLevel(4);
+    xp10 = G_HeroXPForLevel(10);
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+
+    T_EQ((int)xp2, 200);
+    T_EQ((int)xp3, 500);
+    T_EQ((int)xp4, 900);
+    T_EQ((int)xp10, 5400);
+}
+
+TEST(wc3_combat, hero_level_for_xp) {
+    T_EQ((int)G_HeroLevelForXP(0),   1);
+    T_EQ((int)G_HeroLevelForXP(199), 1);
+    T_EQ((int)G_HeroLevelForXP(200), 2);
+    T_EQ((int)G_HeroLevelForXP(499), 2);
+    T_EQ((int)G_HeroLevelForXP(500), 3);
+    T_EQ((int)G_HeroLevelForXP(99999999), 10); /* capped at MaxHeroLevel */
+}
+
+TEST(wc3_combat, hero_apply_level_truncates_attributes) {
+    edict_t *h            = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->health.max_value  = 650.0f; h->health.value = 650.0f;
+    h->mana.max_value    = 255.0f; h->mana.value   = 255.0f;
+    h->unit_state->armor_value       = 3.9f;
+
+    G_HeroApplyLevel(h, 3);  /* steps=2: STR+trunc(5.4)=5, INT+trunc(3.6)=3, AGI+trunc(3.0)=3 */
+
+    T_EQ((int)h->unit_state->hero.str,   27);
+    T_EQ((int)h->unit_state->hero.intel, 20);
+    T_EQ((int)h->unit_state->hero.agi,   16);
+    T_EQ((int)h->unit_state->hero.level, 3);
+    T_FEQ(h->health.max_value, 650.0f + 5 * 25.0f, 0.01f); /* 775 */
+    T_FEQ(h->mana.max_value,   255.0f + 3 * 15.0f, 0.01f); /* 300 */
+    T_FEQ(h->unit_state->armor_value,      3.9f + 3 * 0.3f,    0.01f); /* 4.8 */
+}
+
+TEST(wc3_combat, hero_setxp_levels_up) {
+    edict_t *h           = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->health.max_value = 650.0f; h->health.value = 650.0f;
+    h->mana.max_value   = 255.0f; h->mana.value   = 255.0f;
+    h->unit_state->hero.level       = 1;
+    h->unit_state->hero.skillpoints = 1;
+
+    G_HeroSetXP(h, 500);  /* crosses the level-3 threshold */
+
+    T_EQ((int)h->unit_state->hero.level, 3);
+    T_EQ((int)h->unit_state->hero.xp,    500);
+    T_EQ((int)h->unit_state->hero.skillpoints, 3);
+    T_FEQ(h->health.max_value, 775.0f, 0.01f);
+}
+
+/* XP-on-kill (G_GrantKillXP). Mounted ROC/TFT data supplies the victim level;
+ * GlobalExperience falls back to eligible allied heroes when none is in range. */
+TEST(wc3_combat, grant_kill_xp_awards_base) {
+    edict_t *killer = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    killer->s.player = 0; killer->unit_state->hero.level = 1; killer->unit_state->hero.xp = 0;
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    victim->s.player = 1;
+
+    G_GrantKillXP(victim, killer);
+
+    T_ASSERT(killer->unit_state->hero.xp == 25 || killer->unit_state->hero.xp == 40); /* ROC / TFT MiscData formulas */
+}
+
+TEST(wc3_combat, grant_kill_xp_global_fallback_reaches_out_of_range_hero) {
+    edict_t *killer = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 5000.0f, 0.0f);
+    void *old_misc = game.config.misc.source;
+    uint32_t awarded;
+    killer->s.player = 0; killer->unit_state->hero.level = 1; killer->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    game.config.misc.source = NULL; /* stock GlobalExperience fallback is enabled */
+
+    G_GrantKillXP(victim, killer);
+    awarded = killer->unit_state->hero.xp;
+    game.config.misc.source = old_misc;
+
+    T_EQ((int)awarded, 25); /* no nearby receiver: award globally */
+}
+
+TEST(wc3_combat, grant_kill_xp_respects_disabled_global_experience) {
+    edict_t *killer = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 5000.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+    uint32_t awarded;
+
+    killer->s.player = 0; killer->unit_state->hero.level = 1; killer->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXP.txt"));
+    game.config.misc.source = custom.source; /* GlobalExperience=0 */
+    G_GrantKillXP(victim, killer);
+    awarded = killer->unit_state->hero.xp;
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+
+    T_EQ((int)awarded, 0);
+}
+
+TEST(wc3_combat, grant_kill_xp_splits_between_nearby_owned_heroes) {
+    edict_t *killer = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    /* The test archive has one hero row; a second Hpal still proves per-entity XP splitting. */
+    edict_t *ally = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 100.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    killer->s.player = ally->s.player = 0;
+    killer->unit_state->hero.level = ally->unit_state->hero.level = 1;
+    killer->unit_state->hero.xp = ally->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+
+    G_GrantKillXP(victim, killer);
+
+    T_ASSERT(killer->unit_state->hero.xp > 0);
+    T_EQ((int)killer->unit_state->hero.xp, (int)ally->unit_state->hero.xp);
+    T_ASSERT(killer->unit_state->hero.xp < 25);
+}
+
+TEST(wc3_combat, grant_kill_xp_honors_directional_shared_xp) {
+    edict_t *killer = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *alliedHero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 100.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    killer->s.player = 0;
+    alliedHero->s.player = 1;
+    alliedHero->unit_state->hero.level = 1;
+    alliedHero->unit_state->hero.xp = 0;
+    victim->s.player = 2;
+    memset(level.alliances, 0, sizeof(level.alliances));
+
+    G_GrantKillXP(victim, killer);
+    T_EQ((int)alliedHero->unit_state->hero.xp, 0);
+
+    level.alliances[1][0] |= 1 << ALLIANCE_SHARED_XP;
+    G_GrantKillXP(victim, killer);
+    T_EQ((int)alliedHero->unit_state->hero.xp, 0); /* reverse direction does not grant killer-side sharing */
+
+    level.alliances[0][1] |= 1 << ALLIANCE_SHARED_XP;
+    G_GrantKillXP(victim, killer);
+    T_ASSERT(alliedHero->unit_state->hero.xp > 0);
+}
+
+TEST(wc3_combat, grant_kill_xp_creep_factor_uses_receiver_level_only_for_creeps) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 4; hero->unit_state->hero.xp = 0;
+    victim->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPModifiers.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 50); /* HeroFactorXP for receiving level 4 = 50%, independent of victim level. */
+
+    hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 100); /* player-controlled victims do not use creep reduction */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_applies_summoned_unit_factor) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    victim->summon_ability = MAKEFOURCC('A','H','w','e');
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPModifiers.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 50);
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_respects_max_level_drain_toggle) {
+    edict_t *low = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *max = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 100.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    low->s.player = max->s.player = 0;
+    low->unit_state->hero.level = 1; low->unit_state->hero.xp = 0;
+    max->unit_state->hero.level = G_MaxHeroLevel(); max->unit_state->hero.xp = G_HeroXPForLevel(max->unit_state->hero.level);
+    victim->s.player = 1;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPModifiers.txt"));
+    game.config.misc.source = custom.source; /* MaxLevelHeroesDrainExp=0 */
+
+    G_GrantKillXP(victim, low);
+    T_EQ((int)low->unit_state->hero.xp, 100); /* max-level Hero is excluded from the divisor */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_building_killer_and_victim_rules) {
+    static UnitWeapons_t const no_attacks = { .attacksEnabled = 0 };
+    static UnitWeapons_t const attacks = { .attacksEnabled = 1 };
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1200.0f, 50.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = building->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPModifiers.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, building);
+    T_EQ((int)hero->unit_state->hero.xp, 0); /* BuildingKillsGiveExp=0 checks the killer. */
+
+    building->s.player = 1;
+    building->data.UnitWeapons = &no_attacks;
+    G_GrantKillXP(building, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 0); /* passive buildings do not grant XP */
+
+    building->data.UnitWeapons = &attacks;
+    G_GrantKillXP(building, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 100); /* attacking buildings do */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, bounty_awards_authored_fixed_gold_and_lumber_once_per_death) {
+    static UnitBalance_t const bounty = {
+        .goldBountyBase = 6, .lumberBountyBase = 4,
+        .maxHealth = 100.0f
+    };
+    edict_t *killer, *victim;
+    gameClient_t *receiver = game.clients, *owner = game.clients + 1;
+
+    setup_test_world();
+    killer = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100, 0, 0);
+    victim = make_combat_unit(MAKEFOURCC('n','k','o','b'), 100, 128, 0);
+    killer->s.player = 0; victim->s.player = 1;
+    victim->data.UnitBalance = &bounty;
+    receiver->ps.number = 0; owner->ps.number = 1;
+    receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 10;
+    receiver->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 10;
+    receiver->ps.stats[PLAYERSTATE_GOLD_UPKEEP_RATE] = 100;
+    receiver->ps.stats[PLAYERSTATE_LUMBER_UPKEEP_RATE] = 100;
+    owner->ps.stats[PLAYERSTATE_GIVES_BOUNTY] = 1;
+
+    unit_die(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 16);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 14);
+    unit_die(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 16);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 14);
+}
+
+TEST(wc3_combat, bounty_requires_victim_flag_and_enemy_killer) {
+    static UnitBalance_t const bounty = { .goldBountyBase = 9, .maxHealth = 100.0f };
+    edict_t *killer, *victim;
+    gameClient_t *receiver = game.clients, *owner = game.clients + 1;
+
+    setup_test_world();
+    killer = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100, 0, 0);
+    victim = make_combat_unit(MAKEFOURCC('n','k','o','b'), 100, 128, 0);
+    killer->s.player = 0; victim->s.player = 1;
+    victim->data.UnitBalance = &bounty;
+    receiver->ps.number = 0; owner->ps.number = 1;
+    receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 100;
+    receiver->ps.stats[PLAYERSTATE_GOLD_UPKEEP_RATE] = 100;
+    owner->ps.stats[PLAYERSTATE_GIVES_BOUNTY] = 0;
+    G_AwardKillBounty(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 100);
+    owner->ps.stats[PLAYERSTATE_GIVES_BOUNTY] = 1;
+    G_AwardKillBounty(victim, NULL);
+    G_AwardKillBounty(victim, victim);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 100);
+    G_AwardKillBounty(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 109);
+    victim->aiflags |= AI_ILLUSION;
+    G_AwardKillBounty(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 109);
+}
+
+/* Retail upkeep taxes only gold returned from mines; a kill bounty is credited
+ * in full, the same way Bundle of Gold / Lumber pickups bypass the tax. */
+TEST(wc3_combat, bounty_clamps_to_resource_cap_and_bypasses_upkeep) {
+    static UnitBalance_t const bounty = { .goldBountyBase = 10, .lumberBountyBase = 5, .maxHealth = 100.0f };
+    edict_t *killer, *victim;
+    gameClient_t *receiver = game.clients, *owner = game.clients + 1;
+
+    setup_test_world();
+    killer = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100, 0, 0);
+    victim = make_combat_unit(MAKEFOURCC('n','k','o','b'), 100, 128, 0);
+    killer->s.player = 0; victim->s.player = 1;
+    victim->data.UnitBalance = &bounty;
+    receiver->ps.number = 0; owner->ps.number = 1;
+    owner->ps.stats[PLAYERSTATE_GIVES_BOUNTY] = 1;
+    receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 65532;
+    receiver->ps.stats[PLAYERSTATE_GOLD_UPKEEP_RATE] = 70;
+    receiver->ps.stats[PLAYERSTATE_LUMBER_UPKEEP_RATE] = 40;
+    G_AwardKillBounty(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], USHRT_MAX);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 5);
+    receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 100;
+    G_AwardKillBounty(victim, killer);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 110);
+    T_EQ(receiver->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 10);
+}
+
+TEST(wc3_combat, grant_kill_xp_applies_receiving_player_handicap) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    game.clients[0].jass.handicap_xp = 0.5f; /* native multiplier: 50% */
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPModifiers.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 50);
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, unit_death_awards_prologue_300_percent_xp) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 1.0f, 50.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    victim->die = unit_die;
+    game.clients[0].jass.handicap_xp = 3.0f; /* SetPlayerHandicapXPBJ(..., 300.00). */
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPPrologue.txt"));
+    game.config.misc.source = custom.source;
+
+    T_Damage(victim, hero, 1);
+
+    T_FEQ(victim->health.value, 0.0f, 0.001f);
+    T_EQ((int)hero->unit_state->hero.xp, 75); /* level-1 25 XP victim x Prologue01's 300% XP handicap */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_extends_normal_table_with_formula) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    UnitBalance_t victim_balance = *victim->data.UnitBalance;
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    victim_balance.level = 2;
+    victim->data.UnitBalance = &victim_balance;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPFormula.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 40); /* 25 + 5*level(2) + 5 */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_extends_hero_table_with_formula) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1; victim->unit_state->hero.level = 3;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPFormula.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 220); /* 120 + GrantHeroXPFormulaC(100) */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_uses_stock_hero_table_without_misc_data) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1; victim->unit_state->hero.level = 2;
+    game.config.misc.source = NULL;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 120);
+
+    game.config.misc.source = old_misc;
+}
+
+TEST(wc3_combat, grant_kill_xp_reports_malformed_data_and_uses_safe_fallback) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    UnitBalance_t victim_balance = *victim->data.UnitBalance;
+    stbIniCache_t custom = { 0 };
+    void *old_misc = game.config.misc.source;
+
+    hero->s.player = 0; hero->unit_state->hero.level = 1; hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    victim_balance.level = 2;
+    victim->data.UnitBalance = &victim_balance;
+    T_ASSERT(Stb_IniCacheLoad(&custom, "TestData\\HeroXPInvalid.txt"));
+    game.config.misc.source = custom.source;
+
+    G_GrantKillXP(victim, hero);
+    T_EQ((int)hero->unit_state->hero.xp, 40); /* malformed entries use safe stock recurrence defaults */
+
+    game.config.misc.source = old_misc;
+    Stb_IniCacheFree(&custom);
+}
+
+TEST(wc3_combat, grant_kill_xp_does_not_reward_passive_ally_kill) {
+    edict_t *hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *victim = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    hero->s.player = 0;
+    hero->unit_state->hero.level = 1;
+    hero->unit_state->hero.xp = 0;
+    victim->s.player = 1;
+    memset(level.alliances, 0, sizeof(level.alliances));
+    level.alliances[0][1] |= 1 << ALLIANCE_PASSIVE;
+
+    G_GrantKillXP(victim, hero);
+
+    T_EQ((int)hero->unit_state->hero.xp, 0);
+}
+
+TEST(wc3_combat, attack_completion_resumes_persistent_follow) {
+    edict_t *follower = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    edict_t *leader = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 100.0f, 0.0f);
+    edict_t *enemy = make_combat_unit(MAKEFOURCC('h','g','r','u'), 100.0f, 50.0f, 0.0f);
+    follower->s.player = leader->s.player = 0;
+    enemy->s.player = 1;
+    follower->unit_state->attack1.type = ATK_HERO;
+    follower->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    enemy->targtype = TARG_GROUND;
+
+    order_follow(follower, leader);
+    T_ASSERT(follower->orders->follow_target == leader);
+    order_attack(follower, enemy);
+    T_Damage(enemy, follower, 100);
+
+    T_ASSERT(follower->orders->follow_target == leader);
+    T_ASSERT(follower->goalentity == leader);
+    T_ASSERT(follower->currentmove && follower->currentmove->proc == CAbilityMove);
+}
+
+/* unit_learnability (used by the SelectHeroSkill native): learning an ability
+ * adds it at level 1; learning it again raises its level; a second ability
+ * takes its own slot. */
+TEST(wc3_combat, hero_learn_skill) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    memset(h->unit_state->ranks, 0, sizeof(h->unit_state->ranks));
+
+    unit_learnability(h, MAKEFOURCC('A','H','h','b'));   /* Holy Light */
+    T_EQ((int)h->unit_state->ranks[0].code, (int)MAKEFOURCC('A','H','h','b'));
+    T_EQ((int)h->unit_state->ranks[0].level, 1);
+
+    unit_learnability(h, MAKEFOURCC('A','H','h','b'));   /* upgrade to level 2 */
+    T_EQ((int)h->unit_state->ranks[0].level, 2);
+
+    unit_learnability(h, MAKEFOURCC('A','H','d','s'));   /* Divine Shield in slot 1 */
+    T_EQ((int)h->unit_state->ranks[1].code, (int)MAKEFOURCC('A','H','d','s'));
+    T_EQ((int)h->unit_state->ranks[1].level, 1);
+}
+
+static const char slk_hero_skill_progression[] =
+    "ID;PWXL;N;E\n"
+    "C;Y1;X1;K\"alias\"\n"
+    "C;Y1;X2;K\"code\"\n"
+    "C;Y1;X3;K\"levels\"\n"
+    "C;Y1;X4;K\"reqLevel\"\n"
+    "C;Y1;X5;K\"levelSkip\"\n"
+    "C;Y2;X1;K\"AHhb\"\n"
+    "C;Y2;X2;K\"AHhb\"\n"
+    "C;Y2;X3;K3\n"
+    "C;Y2;X4;K1\n"
+    "C;Y2;X5;K2\n"
+    "C;Y3;X1;K\"AHds\"\n"
+    "C;Y3;X2;K\"AHds\"\n"
+    "C;Y3;X3;K1\n"
+    "C;Y3;X4;K6\n"
+    "C;Y3;X5;K0\n"
+    "C;Y4;X1;K\"AHtb\"\n"
+    "C;Y4;X2;K\"AHtb\"\n"
+    "C;Y4;X3;K2\n"
+    "C;Y4;X4;K1\n"
+    "C;Y4;X5;K0\n"
+    "E\n";
+
+TEST(wc3_combat, hero_progression_initializes_preleveled_map_point_budget) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+
+    memset(h->unit_state->ranks, 0, sizeof(h->unit_state->ranks));
+    h->unit_state->hero.level = 3;
+    h->unit_state->hero.skillpoints = 0;
+    h->unit_state->ranks[0].code = MAKEFOURCC('A','H','h','b');
+    h->unit_state->ranks[0].level = 1;
+
+    G_HeroInitializeProgression(h);
+    T_EQ((int)h->unit_state->hero.level, 3);
+    T_EQ((int)h->unit_state->hero.skillpoints, 2);
+
+    h->unit_state->hero.level = 0;
+    h->unit_state->hero.skillpoints = 0;
+    memset(h->unit_state->ranks, 0, sizeof(h->unit_state->ranks));
+    G_HeroInitializeProgression(h);
+    T_EQ((int)h->unit_state->hero.level, 1);
+    T_EQ((int)h->unit_state->hero.skillpoints, 1);
+}
+
+TEST(wc3_combat, hero_skill_progression_uses_candidate_points_level_and_max_rank) {
+    UnitAbilities_t const tree = { .abilList = "AInv", .heroAbilList = "AHhb,AHds,AHtb" };
+    slkTestData_t *rows = parse_slk_string(slk_hero_skill_progression);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    uint32_t const holy = MAKEFOURCC('A','H','h','b');
+    uint32_t const shield = MAKEFOURCC('A','H','d','s');
+    uint32_t const thunder = MAKEFOURCC('A','H','t','b');
+    uint32_t next = 0, required = 0;
+
+    h->data.UnitAbilities = &tree;
+    h->unit_state->hero.level = 1;
+    h->unit_state->hero.skillpoints = 1;
+    memset(h->unit_state->ranks, 0, sizeof(h->unit_state->ranks));
+
+    T_EQ((int)G_UnitAbilityLevel(h, MAKEFOURCC('A','I','n','v')), 1);
+    G_SetPlayerAbilityAvailable(&game.clients[0], holy, false);
+    T_EQ((int)G_HeroSkillState(h, holy, &next, &required), HERO_SKILL_DISABLED);
+    T_ASSERT(!G_HeroLearnSkill(h, holy));
+    T_EQ((int)h->unit_state->hero.skillpoints, 1);
+    G_SetPlayerAbilityAvailable(&game.clients[0], holy, true);
+    T_EQ((int)G_HeroSkillState(h, holy, &next, &required), HERO_SKILL_AVAILABLE);
+    T_EQ((int)next, 1);
+    T_EQ((int)required, 1);
+    T_ASSERT(G_HeroLearnSkill(h, holy));
+    T_EQ((int)G_UnitAbilityLevel(h, holy), 1);
+    T_EQ((int)h->unit_state->hero.skillpoints, 0);
+
+    T_EQ((int)G_HeroSkillState(h, holy, &next, &required), HERO_SKILL_NO_POINTS);
+    h->unit_state->hero.skillpoints = 1;
+    T_EQ((int)G_HeroSkillState(h, holy, &next, &required), HERO_SKILL_LEVEL_LOCKED);
+    T_EQ((int)next, 2);
+    T_EQ((int)required, 3);
+
+    h->unit_state->hero.level = 3;
+    T_ASSERT(G_HeroLearnSkill(h, holy));
+    T_EQ((int)G_UnitAbilityLevel(h, holy), 2);
+
+    h->unit_state->hero.level = 5;
+    h->unit_state->hero.skillpoints = 1;
+    T_ASSERT(G_HeroLearnSkill(h, holy));
+    T_EQ((int)G_UnitAbilityLevel(h, holy), 3);
+    h->unit_state->hero.skillpoints = 1;
+    T_EQ((int)G_HeroSkillState(h, holy, &next, &required), HERO_SKILL_MAXED);
+
+    h->unit_state->hero.level = 1;
+    h->unit_state->hero.skillpoints = 1;
+    T_ASSERT(G_HeroLearnSkill(h, thunder));
+    h->unit_state->hero.level = 2;
+    h->unit_state->hero.skillpoints = 1;
+    T_EQ((int)G_HeroSkillState(h, thunder, &next, &required), HERO_SKILL_LEVEL_LOCKED);
+    T_EQ((int)required, 3);
+    h->unit_state->hero.level = 3;
+    T_EQ((int)G_HeroSkillState(h, thunder, &next, &required), HERO_SKILL_AVAILABLE);
+
+    h->unit_state->hero.level = 5;
+    T_EQ((int)G_HeroSkillState(h, shield, &next, &required), HERO_SKILL_LEVEL_LOCKED);
+    T_EQ((int)required, 6);
+    h->unit_state->hero.level = 6;
+    T_EQ((int)G_HeroSkillState(h, shield, &next, &required), HERO_SKILL_AVAILABLE);
+    T_EQ((int)G_HeroSkillState(h, MAKEFOURCC('A','H','w','e'), NULL, NULL), HERO_SKILL_ABSENT);
+
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, player_disabled_hero_skill_is_omitted_from_select_skill_menu) {
+    UnitAbilities_t const tree = { .heroAbilList = "AHhb,AHds,AHtb" };
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    int (*old_image_index)(cstring_t) = gi.ImageIndex;
+    gameClient_t *old_ui = ui_current_client;
+    gameClient_t *client;
+    edict_t *clent, *hero;
+    gameClient_t *old_clent_client;
+    uint32_t const holy = MAKEFOURCC('A','H','h','b');
+    slkTestData_t *rows = parse_slk_string(slk_hero_skill_progression);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    bool old_connected, old_clent_inuse, old_holy_available;
+    uint32_t old_player_number;
+    bool holy_visible = false, thunder_visible = false;
+
+    setup_test_world();
+    client = &game.clients[0];
+    old_connected = client->connected;
+    old_player_number = client->ps.number;
+    client->connected = true;
+    client->ps.number = 0;
+    clent = &g_edicts[0];
+    old_clent_inuse = clent->inuse;
+    old_clent_client = clent->client;
+    clent->inuse = true;
+    clent->client = client;
+    hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    hero->s.player = client->ps.number;
+    hero->data.UnitAbilities = &tree;
+    hero->unit_state->hero.level = 1;
+    hero->unit_state->hero.skillpoints = 1;
+    G_SelectEntity(client, hero);
+    old_holy_available = G_IsPlayerAbilityAvailable(client, holy);
+    G_SetPlayerAbilityAvailable(client, holy, false);
+
+    memset(_hero_menu_clicks, 0, sizeof(_hero_menu_clicks));
+    _hero_menu_click_count = 0;
+    _hero_menu_command_button_count = 0;
+    gi.Write = hero_menu_capture_write;
+    gi.ImageIndex = hero_menu_test_image_index;
+    UI_SetCurrentClient(client);
+    ui_selectskill(client);
+
+    FOR_LOOP(i, _hero_menu_click_count) {
+        if (strstr(_hero_menu_clicks[i], "AHhb")) holy_visible = true;
+        if (strstr(_hero_menu_clicks[i], "AHtb")) thunder_visible = true;
+    }
+    T_ASSERT(!holy_visible);
+    T_ASSERT(thunder_visible);
+    /* Thunderbolt and level-locked Divine Shield remain listed; disabled Holy Light is omitted. */
+    T_EQ((int)_hero_menu_command_button_count, 3);
+
+    G_DeselectEntity(client, hero);
+    G_SetPlayerAbilityAvailable(client, holy, old_holy_available);
+    client->connected = old_connected;
+    client->ps.number = old_player_number;
+    clent->inuse = old_clent_inuse;
+    clent->client = old_clent_client;
+    UI_SetCurrentClient(old_ui);
+    gi.Write = old_write;
+    gi.ImageIndex = old_image_index;
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+/* ReviveHero: a dead hero comes back to life at the given point with HP/mana
+ * from the revive factors (defaults: full life, no mana). */
+TEST(wc3_combat, hero_revive) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *h           = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->health.max_value = 650.0f; h->health.value = 0.0f;   /* dead */
+    h->mana.max_value   = 255.0f; h->mana.value   = 0.0f;
+    h->svflags         |= SVF_DEADMONSTER;
+    h->s.player         = client->ps.number;
+    client->ps.stats[PLAYERSTATE_RESOURCE_FOOD_CAP] = 100;
+    client->ps.stats[PLAYERSTATE_RESOURCE_FOOD_USED] = 0;
+
+    G_ReviveHero(h, 100.0f, 200.0f);
+
+    T_FEQ(h->health.value, 650.0f, 0.01f);   /* HeroReviveLifeFactor 1.0 */
+    T_FEQ(h->mana.value,   0.0f,   0.01f);   /* HeroReviveManaFactor 0.0 */
+    T_ASSERT((h->svflags & SVF_DEADMONSTER) == 0);       /* alive again */
+    T_FEQ(h->s.origin2.x, 100.0f, 0.01f);
+    T_FEQ(h->s.origin2.y, 200.0f, 0.01f);
+    T_EQ(h->food->used, h->data.UnitBalance->foodUsed);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_FOOD_USED], h->data.UnitBalance->foodUsed);
+}
+
+TEST(wc3_combat, hero_levelup_fires_player_and_unit_events) {
+    edict_t *h           = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.level       = 1;
+    h->health.max_value = 650.0f; h->health.value = 650.0f;
+    level.events.write  = 0;
+    level.events.read   = 0;
+
+    G_HeroSetXP(h, 500);  /* level 1 -> 3: two transitions, two event families each */
+
+    T_EQ((int)level.events.write, 4);
+    T_EQ((int)level.events.queue[0].type, EVENT_PLAYER_HERO_LEVEL);
+    T_ASSERT(level.events.queue[0].edict == h);
+    T_EQ((int)level.events.queue[1].type, EVENT_UNIT_HERO_LEVEL);
+    T_ASSERT(level.events.queue[1].edict == h);
+    T_EQ((int)level.events.queue[2].type, EVENT_PLAYER_HERO_LEVEL);
+    T_EQ((int)level.events.queue[3].type, EVENT_UNIT_HERO_LEVEL);
+}
+
+TEST(wc3_combat, hero_setxp_does_not_lower_xp_or_level) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.level = 1;
+    h->unit_state->hero.skillpoints = 1;
+    G_HeroSetXP(h, 500);
+    T_EQ((int)h->unit_state->hero.level, 3);
+    T_EQ((int)h->unit_state->hero.xp, 500);
+
+    G_HeroSetXP(h, 100);
+
+    T_EQ((int)h->unit_state->hero.level, 3);
+    T_EQ((int)h->unit_state->hero.xp, 500);
+}
+
+TEST(wc3_combat, hero_strip_levels_recomputes_stats_and_preserves_tomes) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.level = 1;
+    h->unit_state->hero.str = 22; h->unit_state->hero.agi = 13; h->unit_state->hero.intel = 17;
+    h->unit_state->hero.skillpoints = 1;
+    h->health.max_value = h->health.value = 650.0f;
+    h->mana.max_value = h->mana.value = 255.0f;
+    G_HeroSetXP(h, 650); /* Level 3, with partial XP progress. */
+    T_EQ(h->unit_state->hero.level, 3);
+    h->unit_state->hero.str += 3; /* Permanent tome/SetHeroStr bonus survives stripping. */
+    G_RecomputeHeroStats(h);
+    level.events.write = level.events.read = 0;
+
+    T_ASSERT(G_HeroStripLevels(h, 1));
+    T_EQ(h->unit_state->hero.level, 2);
+    T_EQ(h->unit_state->hero.xp, G_HeroXPForLevel(2));
+    T_EQ(h->unit_state->hero.str, 27); /* 22 + trunc(2.7) + 3 */
+    T_EQ(h->unit_state->hero.agi, 14); /* 13 + trunc(1.5) */
+    T_EQ(h->unit_state->hero.intel, 18); /* 17 + trunc(1.8) */
+    T_EQ(h->unit_state->hero.skillpoints, 2);
+    T_FEQ(h->health.max_value, 650.0f + 5 * 25.0f, 0.01f);
+    T_FEQ(h->mana.max_value, 255.0f + 1 * 15.0f, 0.01f);
+    T_EQ(level.events.write, 0); /* Stripping is not a level-up event. */
+
+    T_ASSERT(G_HeroStripLevels(h, UINT32_MAX));
+    T_EQ(h->unit_state->hero.level, 1);
+    T_EQ(h->unit_state->hero.xp, 0);
+    T_EQ(h->unit_state->hero.str, 25);
+    T_EQ(h->unit_state->hero.agi, 13);
+    T_EQ(h->unit_state->hero.intel, 17);
+    T_EQ(h->unit_state->hero.skillpoints, 1);
+    T_ASSERT(!G_HeroStripLevels(h, 1));
+    T_ASSERT(!G_HeroStripLevels(h, 0));
+    T_EQ(level.events.write, 0);
+}
+
+TEST(wc3_combat, hero_strip_levels_reconciles_spent_skill_ranks) {
+    UnitAbilities_t const tree = { .heroAbilList = "AHhb,AHtb" };
+    slkTestData_t *rows = parse_slk_string(slk_hero_skill_progression);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    uint32_t const holy = MAKEFOURCC('A','H','h','b');
+    uint32_t const thunder = MAKEFOURCC('A','H','t','b');
+
+    h->data.UnitAbilities = &tree;
+    h->unit_state->hero.level = 1;
+    h->unit_state->hero.str = 22; h->unit_state->hero.agi = 13; h->unit_state->hero.intel = 17;
+    h->unit_state->hero.skillpoints = 1;
+    G_HeroSetXP(h, 500);
+    T_ASSERT(G_HeroLearnSkill(h, holy));
+    T_ASSERT(G_HeroLearnSkill(h, holy));
+    T_ASSERT(G_HeroLearnSkill(h, thunder));
+    T_EQ(h->unit_state->hero.skillpoints, 0);
+    T_EQ(G_UnitAbilityLevel(h, holy), 2);
+    T_EQ(G_UnitAbilityLevel(h, thunder), 1);
+
+    T_ASSERT(G_HeroStripLevels(h, 2));
+    T_EQ(h->unit_state->hero.level, 1);
+    T_EQ(h->unit_state->hero.skillpoints, 0);
+    T_EQ(G_UnitAbilityLevel(h, holy), 1); /* Rank 2 requires level 3. */
+    T_EQ(G_UnitAbilityLevel(h, thunder), 0); /* Reclaim remaining spent point. */
+    T_ASSERT(G_HeroStripLevels(h, 0) == false);
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+/* Attack timing: after damage point, the next swing must wait for both the
+ * remaining weapon cooldown and the authored backswing. */
+TEST(wc3_combat, attack_recovery_respects_cooldown_and_backswing) {
+    edict_t *u              = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    u->unit_state->attack1.cooldown = 1.5f;
+    u->unit_state->attack1.damagePoint = 0.3f;
+    u->unit_state->attack1.backswingPoint = 0.5f;
+    attack_melee_cooldown(u);
+    T_FEQ(u->wait, 1.2f, 0.001f);   /* cooldown - damagePoint wins */
+
+    u->unit_state->attack_cooldown_end_time = G_Time();
+    u->unit_state->attack1.cooldown = 1.0f;
+    u->unit_state->attack1.damagePoint = 0.5f;
+    u->unit_state->attack1.backswingPoint = 0.8f;
+    attack_ranged_cooldown(u);
+    T_FEQ(u->wait, 0.8f, 0.001f);   /* backswing wins */
+
+    /* If cooldown has elapsed by damage point but backswing remains, the
+     * attack still cannot begin its next swing before backswing completes. */
+    u->unit_state->attack_cooldown_end_time = G_Time();
+    u->unit_state->attack1.cooldown = 0.4f;
+    u->unit_state->attack1.damagePoint = 0.5f;
+    u->unit_state->attack1.backswingPoint = 0.2f;
+    attack_melee_cooldown(u);
+    T_STREQ(u->currentmove->animation, "stand ready");
+    T_FEQ(u->wait, 0.2f, 0.001f);
+}
+
+TEST(wc3_combat, attack_ground_recovery_respects_backswing) {
+    edict_t *unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, 0.0f, 0.0f);
+    unit->unit_state->attack1.cooldown = 0.4f;
+    unit->unit_state->attack1.damagePoint = 0.3f;
+    unit->unit_state->attack1.backswingPoint = 0.8f;
+
+    attack_ground_cooldown(unit);
+
+    T_STREQ(unit->currentmove->animation, "stand ready");
+    T_FEQ(unit->wait, 0.8f, 0.001f);
+}
+
+TEST(wc3_combat, ranged_zero_recovery_immediately_starts_next_attack) {
+    edict_t *u = make_combat_unit(MAKEFOURCC('h','r','i','f'), 535.0f, 0.0f, 0.0f);
+    u->unit_state->attack1.cooldown = 0.25f;
+    u->unit_state->attack1.damagePoint = 0.4f;
+
+    attack_ranged_cooldown(u);
+
+    T_STREQ(u->currentmove->animation, "attack range");
+    T_FEQ(u->wait, 0.4f, 0.001f);
+}
+
+TEST(wc3_combat, cooldown_range_buffer_holds_then_chases_at_ready_time) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 130.0f, 0.0f);
+    vec2_t const origin = attacker->s.origin2;
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 40.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unitinfo.MoveSpeed = 200.0f;
+    target->targtype = TARG_GROUND;
+    attacker->goalentity = target;
+
+    attack_melee_cooldown(attacker);
+    attacker->currentmove->think(attacker);
+    T_FEQ(attacker->s.origin2.x, origin.x, 0.001f);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+
+    attacker->wait = FRAMETIME / 1000.0f;
+    attacker->unit_state->attack_cooldown_end_time = G_Time();
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+}
+
+TEST(wc3_combat, attack_animation_end_does_not_restart_swing_cooldown) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    vec2_t const origin = attacker->s.origin2;
+    uint32_t swing_cooldown_end;
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.damageBase = 10.0f;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 40.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damagePoint = 0.03f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack");
+    T_NULL(attacker->movement);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+    swing_cooldown_end = attacker->unit_state->attack_cooldown_end_time;
+
+    /* Commit a real hit at damage point while a finite animation remains
+     * active. The weapon cooldown began at swing start. */
+    attach_stub_anim(attacker);
+    attacker->wait = FRAMETIME / 1000.0f;
+    attacker->currentmove->think(attacker);
+    T_ASSERT(target->health.value < target->health.max_value);
+    T_NULL(attacker->movement);
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, swing_cooldown_end);
+
+    /* The attack animation's end callback happens later than damage point.
+     * It must preserve the existing swing deadline rather than start a second
+     * cooldown from animation completion. */
+    level.time += 600;
+    target->s.origin2.x = 130.0f;
+    attacker->currentmove->endfunc(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_FEQ(attacker->s.origin2.x, origin.x, 0.001f);
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, swing_cooldown_end);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) < 500);
+
+    /* The same target becomes too far for the buffer, so chase begins. */
+    target->s.origin2.x = 150.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+
+    /* Returning inside buffered range before the original swing deadline
+     * stops the chase; it must not start another swing early. */
+    target->s.origin2.x = 130.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, swing_cooldown_end);
+}
+
+TEST(wc3_combat, attack_animation_end_does_not_restart_expired_swing_cooldown) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    uint32_t swing_cooldown_end;
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.damageBase = 10.0f;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.cooldown = 0.4f;
+    attacker->unit_state->attack1.damagePoint = 0.03f;
+    attacker->unit_state->attack1.backswingPoint = 0.8f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    swing_cooldown_end = attacker->unit_state->attack_cooldown_end_time;
+    attach_stub_anim(attacker);
+    attacker->wait = FRAMETIME / 1000.0f;
+    attacker->currentmove->think(attacker);
+    T_ASSERT(target->health.value < target->health.max_value);
+
+    /* Ability think observes the expired cooldown before the attack animation
+     * ends. Recovery must still recognize the move as an existing swing. */
+    level.time = swing_cooldown_end + 100;
+    attacker->currentmove->think(attacker);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) <= 0);
+    level.time = swing_cooldown_end + 200;
+    attacker->currentmove->endfunc(attacker);
+
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, swing_cooldown_end);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) <= 0);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_FEQ(attacker->wait, 0.2f, 0.01f);
+}
+
+TEST(wc3_combat, backswing_recovery_uses_damage_point_deadline) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    uint32_t swing_cooldown_end;
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.damageBase = 10.0f;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damagePoint = 0.03f;
+    attacker->unit_state->attack1.backswingPoint = 0.8f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    swing_cooldown_end = attacker->unit_state->attack_cooldown_end_time;
+    attach_stub_anim(attacker);
+    attacker->wait = FRAMETIME / 1000.0f;
+    attacker->currentmove->think(attacker);
+    T_ASSERT(target->health.value < target->health.max_value);
+
+    /* Damage point is at 30 ms; by animation end at 600 ms, only 230 ms of
+     * the authored 800 ms backswing remains. Cooldown still has 400 ms. */
+    level.time += 600;
+    attacker->currentmove->endfunc(attacker);
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, swing_cooldown_end);
+    T_FEQ(attacker->wait, 0.4f, 0.01f);
+}
+
+TEST(wc3_combat, attack_max_range_uses_both_unit_collision_edges) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+
+    attacker->collision = 20.0f;
+    target->collision = 20.0f;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 110.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack");
+}
+
+TEST(wc3_combat, attack_minimum_range_uses_unit_collision_edges) {
+    static UnitWeapons_t const weapons = { .attacksEnabled = 3, .minimumAttackRange = 120.0f };
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->collision = 20.0f;
+    target->collision = 20.0f;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 200.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+}
+
+TEST(wc3_combat, cooldown_buffer_survives_chase_until_weapon_is_ready) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 60.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    target->targtype = TARG_GROUND;
+    attacker->goalentity = target;
+
+    attack_melee_cooldown(attacker);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+
+    target->s.origin2.x = 180.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+
+    target->s.origin2.x = 150.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_ASSERT(attacker->wait > 0.0f);
+}
+
+TEST(wc3_combat, attack2_uses_its_own_cooldown_range_buffer) {
+    static UnitWeapons_t const weapons = { .attacksEnabled = 3 };
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','r','i','f'), 535.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 150.0f, 0.0f);
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_AIR;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 0.0f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unit_state->attack2.type = ATK_PIERCE;
+    attacker->unit_state->attack2.weapon = WPN_MISSILE;
+    attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack2.range = 100.0f;
+    attacker->unit_state->attack2.rangeBuffer = 60.0f;
+    attacker->unit_state->attack2.cooldown = 1.0f;
+    attacker->unit_state->attack2.damagePoint = 0.1f;
+    target->targtype = TARG_GROUND;
+    attacker->goalentity = target;
+
+    attack_ranged_cooldown(attacker);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    target->s.origin2.x = 170.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+}
+
+TEST(wc3_combat, target_leaving_true_range_before_damage_point_cancels_windup) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    float const health = target->health.value;
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 100.0f;
+    attacker->unit_state->attack1.damagePoint = 0.3f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack");
+
+    target->s.origin2.x = 180.0f;
+    attacker->currentmove->think(attacker);
+
+    T_STREQ(attacker->currentmove->animation, "walk");
+    T_FEQ(target->health.value, health, 0.001f);
+}
+
+TEST(wc3_combat, canceled_windup_cooldown_survives_chase_and_reacquisition) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 40.0f;
+    attacker->unit_state->attack1.damagePoint = 0.3f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack");
+    T_ASSERT(attacker->wait > 0.0f);
+
+    target->s.origin2.x = 180.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+
+    target->s.origin2.x = 80.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_ASSERT(attacker->wait > 0.0f);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+}
+
+TEST(wc3_combat, canceled_windup_cooldown_advances_after_attack_order_is_replaced) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.damagePoint = 0.3f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    target->targtype = TARG_GROUND;
+
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    target->s.origin2.x = 180.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+
+    vec2_t const replacement = { 240.0f, 0.0f };
+    T_ASSERT(unit_issueorder(attacker, "move", &replacement));
+    T_ASSERT(attacker->currentmove->proc != CAbilityAttack);
+    uint32_t const deadline = attacker->unit_state->attack_cooldown_end_time;
+    level.time = deadline - 1;
+    target->s.origin2.x = 80.0f;
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_EQ(attacker->unit_state->attack_cooldown_end_time, deadline);
+    /* Reissuing at expiry clears the replaced move's wait, as ordinary orders do. */
+    level.time = deadline;
+    target->s.origin2.x = 180.0f;
+    order_attack(attacker, target);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) <= 0);
+    target->s.origin2.x = 80.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack");
+    T_ASSERT(attacker->unit_state->attack_cooldown_end_time > deadline);
+}
+
+TEST(wc3_combat, backswing_still_blocks_attack_after_cooldown_during_chase) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.cooldown = 0.2f;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unit_state->attack1.backswingPoint = 0.8f;
+    target->targtype = TARG_GROUND;
+    attacker->goalentity = target;
+
+    attack_melee_cooldown(attacker);
+    target->s.origin2.x = 180.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "walk");
+
+    target->s.origin2.x = 80.0f;
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "stand ready");
+    T_ASSERT(attacker->wait > 0.0f);
+}
+
+TEST(wc3_combat, attack_chase_cooldown_and_target_survive_save_load) {
+    cstring_t filename = Test_TempPath("attack-chase-cooldown.bin");
+    edict_t *attacker;
+    edict_t *target;
+
+    setup_test_world();
+    reset_entities();
+    attacker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 180.0f, 0.0f);
+    attacker->stand = unit_stand;
+    unit_stand(attacker);
+    attacker->s.player = 0;
+    target->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    attacker->unit_state->attack1.rangeBuffer = 60.0f;
+    target->targtype = TARG_GROUND;
+    T_ASSERT(S_OrderAttack(attacker, target));
+    T_EQ(attacker->unit_state->attack_target_spawn_time, target->spawn_time);
+    attacker->unit_state->attack_cooldown_end_time = G_Time() + 730;
+
+    T_ASSERT(WriteGame(filename));
+    {
+        int const attacker_index = (int)(attacker - g_edicts);
+        int const target_index = (int)(target - g_edicts);
+        attacker->goalentity = NULL;
+        attacker->unit_state->attack_cooldown_end_time = 0;
+        T_ASSERT(ReadGame(filename));
+
+        attacker = g_edicts + attacker_index;
+        target = g_edicts + target_index;
+    }
+    T_ASSERT(attacker->goalentity == target);
+    T_EQ(attacker->unit_state->attack_target_spawn_time, target->spawn_time);
+    T_ASSERT(attacker->currentmove != NULL);
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttack);
+    T_ASSERT((int32_t)(attacker->unit_state->attack_cooldown_end_time - G_Time()) > 0);
+    T_EQ(attacker->unit_state->attack_cooldown_end_time - G_Time(), 730);
+    remove(filename);
+}
+
+TEST(wc3_combat, direct_attack_rejects_reused_target_edict) {
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 80.0f, 0.0f);
+    uint32_t const target_number = (uint32_t)(target - g_edicts);
+
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 100.0f;
+    target->targtype = TARG_GROUND;
+    order_attack(attacker, target);
+    T_EQ(attacker->unit_state->attack_target_spawn_time, target->spawn_time);
+
+    G_FreeEdict(target);
+    level.time = target->freetime + 1001;
+    target = G_Spawn();
+    T_EQ((uint32_t)(target - g_edicts), target_number);
+    target->spawn_time = level.time;
+    G_InitUnitOrders(target);
+    G_InitUnitState(target);
+    target->svflags |= SVF_MONSTER;
+    target->health.value = target->health.max_value = 420.0f;
+    target->targtype = TARG_GROUND;
+    target->s.origin2.x = 80.0f;
+    target->data.UnitWeapons = attacker->data.UnitWeapons;
+    target->unit_state->attack1.type = ATK_NORMAL;
+    target->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->health.value = 420.0f;
+
+    attacker->currentmove->think(attacker);
+    T_NULL(attacker->goalentity);
+    T_EQ(target->health.value, 420.0f);
+}
+
+TEST(wc3_combat, animationless_ranged_attack_enters_recovery_after_launch) {
+    edict_t *u;
+    edict_t *target;
+
+    setup_test_world(); reset_entities();
+    u = make_combat_unit(MAKEFOURCC('h','r','i','f'), 535.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 64.0f, 0.0f);
+
+    u->goalentity = target;
+    u->unit_state->attack1.type = ATK_NORMAL;
+    u->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    u->unit_state->attack1.range = 500.0f;
+    target->targtype = TARG_GROUND;
+    u->unit_state->attack1.weapon = WPN_MISSILE;
+    u->unit_state->attack1.cooldown = 1.0f;
+    u->unit_state->attack1.damagePoint = 0.1f;
+    u->unit_state->attack1.projectile.speed = 900;
+    G_SetUnitColorOverride(u, 6);
+    u->animation = NULL;
+
+    attack_ranged(u);
+    /* Simulate a model for which neither "attack range" nor its "attack"
+     * fallback resolves. The damage-point callback must still move the unit
+     * into recovery so it can attack again. */
+    u->animation = NULL;
+    u->wait = 0.01f;
+    u->currentmove->think(u);
+
+    edict_t *missile = NULL;
+    FILTER_EDICTS(ent, ent->owner == u && ent->movetype == MOVETYPE_FLYMISSILE) { missile = ent; break; }
+    T_NOT_NULL(missile);
+    if (!missile) return;
+    T_EQ((missile->s.effect_flags & EFX_TEAM_COLOR_MASK) >> EFX_TEAM_COLOR_SHIFT, 7);
+    T_STREQ(u->currentmove->animation, "stand ready");
+    T_ASSERT(u->wait > 0.0f);
+    T_ASSERT(u->goalentity == target);
+}
+
+
+TEST(wc3_combat, artillery_uses_ranged_attack_state) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .minimumAttackRange = 0.0f };
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 200.0f, 0.0f);
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_SIEGE;
+    attacker->unit_state->attack1.weapon = WPN_ARTILLERY;
+    attacker->unit_state->attack1.range = 500.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_GROUND;
+    order_attack(attacker, target);
+    T_NOT_NULL(attacker->currentmove);
+    attacker->currentmove->think(attacker);
+    T_STREQ(attacker->currentmove->animation, "attack range");
+}
+
+TEST(wc3_combat, artillery_minimum_range_makes_mobile_attacker_back_away) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .minimumAttackRange = 100.0f };
+    setup_test_world();
+    reset_entities();
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, 0.0f, 0.0f);
+    edict_t *target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 50.0f, 0.0f);
+    float before, after;
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_SIEGE;
+    attacker->unit_state->attack1.weapon = WPN_ARTILLERY;
+    attacker->unit_state->attack1.range = 500.0f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unitinfo.MoveSpeed = 220.0f;
+    target->targtype = TARG_GROUND;
+    order_attack(attacker, target);
+    before = Vector2_distance(&attacker->s.origin2, &target->s.origin2);
+    attacker->currentmove->think(attacker);
+    after = Vector2_distance(&attacker->s.origin2, &target->s.origin2);
+    T_ASSERT(after > before);
+    T_STREQ(attacker->currentmove->animation, "walk");
+}
+
+TEST(wc3_combat, artillery_splash_uses_authored_three_damage_bands) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .attack1 = { .areaTargets = WC3_TARGET_FLAG_GROUND } };
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, -300.0f, 0.0f);
+    edict_t *primary = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 0.0f, 0.0f);
+    edict_t *medium = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 75.0f, 0.0f);
+    edict_t *small = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 125.0f, 0.0f);
+    edict_t *outside = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 175.0f, 0.0f);
+    edict_t *units[] = { primary, medium, small, outside };
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_ARTILLERY;
+    attacker->unit_state->attack1.areaFull = 50.0f;
+    attacker->unit_state->attack1.areaMedium = 100.0f;
+    attacker->unit_state->attack1.areaSmall = 150.0f;
+    attacker->unit_state->attack1.factorMedium = 0.5f;
+    attacker->unit_state->attack1.factorSmall = 0.25f;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    FOR_LOOP(i, sizeof(units) / sizeof(units[0])) {
+        units[i]->targtype = TARG_GROUND;
+        units[i]->unit_state->defense_type = 7; /* none: default damage table multiplier 1 */
+        units[i]->unit_state->armor_value = 0.0f;
+    }
+
+    S_ResolveArtilleryHit(attacker, primary, 100);
+
+    T_FEQ(primary->health.value, 400.0f, 0.001f);
+    T_FEQ(medium->health.value, 450.0f, 0.001f);
+    T_FEQ(small->health.value, 475.0f, 0.001f);
+    T_FEQ(outside->health.value, 500.0f, 0.001f);
+}
+
+/* Warsmash snapshots an ARTILLERY unit target to a point at the damage point.
+ * Moving the original target after launch therefore does not make the missile
+ * home; splash resolves around the launch-time coordinates. */
+TEST(wc3_combat, artillery_projectile_locks_target_position_at_damage_point) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .attack1 = { .areaTargets = WC3_TARGET_FLAG_GROUND },
+                              .attack2 = { .areaTargets = WC3_TARGET_FLAG_AIR } };
+    edict_t *attacker;
+    edict_t *target;
+    edict_t *bystander;
+    edict_t *retarget;
+    edict_t *missile = NULL;
+
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 200.0f, 0.0f);
+    bystander = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 200.0f, 0.0f);
+    retarget = make_combat_unit(MAKEFOURCC('h','f','o','o'), 500.0f, 500.0f, 0.0f);
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->goalentity = target;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.weapon = WPN_ARTILLERY;
+    attacker->unit_state->attack1.damageBase = 100.0f;
+    attacker->unit_state->attack1.numberOfDice = 0;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.projectile.speed = 1000;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->unit_state->attack1.range = 500.0f;
+    attacker->unit_state->attack1.areaFull = 40.0f;
+    attacker->unit_state->attack1.areaMedium = 80.0f;
+    attacker->unit_state->attack1.areaSmall = 120.0f;
+    attacker->unit_state->attack1.factorMedium = 0.5f;
+    attacker->unit_state->attack1.factorSmall = 0.25f;
+    attacker->unit_state->attack2.type = ATK_SIEGE;
+    attacker->unit_state->attack2.targetsAllowed = WC3_TARGET_FLAG_AIR;
+    attacker->unit_state->attack2.areaFull = attacker->unit_state->attack2.areaMedium = attacker->unit_state->attack2.areaSmall = 1.0f;
+    attacker->unit_state->attack2.projectile.speed = 1000;
+    target->targtype = bystander->targtype = TARG_GROUND;
+    retarget->targtype = TARG_AIR;
+    target->unit_state->defense_type = bystander->unit_state->defense_type = 7;
+    target->unit_state->armor_value = bystander->unit_state->armor_value = 0.0f;
+    bystander->unit_state->defense_type = 1; /* normal launch attack is 150%; current siege profile differs */
+
+    attack_ranged(attacker);
+    attacker->wait = 0.01f;
+    attacker->currentmove->think(attacker);
+    FILTER_EDICTS(ent, ent->owner == attacker && ent->movetype == MOVETYPE_FLYMISSILE) {
+        missile = ent; break;
+    }
+    T_NOT_NULL(missile);
+    if (missile) {
+        T_ASSERT(missile->aiflags & AI_PROJECTILE_FIXED_TARGET);
+        T_ASSERT(missile->goalentity == target);
+        T_EQ(missile->channel->target_spawn_time, target->spawn_time);
+        T_FEQ(missile->channel->origin.x, 200.0f, 0.001f);
+        T_FEQ(missile->channel->origin.y, 0.0f, 0.001f);
+        T_EQ(missile->artillery->attack_type, ATK_NORMAL);
+        T_EQ(missile->artillery->area_targets, WC3_TARGET_FLAG_GROUND);
+
+        attacker->goalentity = retarget; /* impact must retain the launch profile */
+        target->s.origin2.x = target->s.origin.x = 400.0f;
+        missile->s.origin.x = 199.0f;
+        missile->s.origin.y = 0.0f;
+        missile->s.origin.z = CM_GetHeightAtPoint(200.0f, 0.0f);
+        missile->velocity = 1.0f;
+        SV_Physics_Toss(missile);
+
+        T_FEQ(target->health.value, 500.0f, 0.001f);
+        T_FEQ(bystander->health.value, 350.0f, 0.001f);
+    }
+}
+
+TEST(wc3_combat, attack_ground_accepts_artillery_point_and_launches_fixed_projectile) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .minimumAttackRange = 50.0f,
+                              .attack1 = { .areaTargets = WC3_TARGET_FLAG_GROUND } };
+    edict_t *attacker = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380.0f, 0.0f, 0.0f);
+    vec2_t point = { 200.0f, 75.0f };
+    edict_t *missile = NULL;
+
+    attacker->data.UnitWeapons = &weapons;
+    attacker->unit_state->attack1.type = ATK_SIEGE;
+    attacker->unit_state->attack1.weapon = WPN_ARTILLERY;
+    attacker->unit_state->attack1.range = 500.0f;
+    attacker->unit_state->attack1.damageBase = 73.0f;
+    attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.projectile.speed = 900;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    attacker->aiflags |= AI_IMMOBILE; /* in-range static artillery may still fire */
+
+    T_ASSERT(S_OrderAttackGround(attacker, &point));
+    T_FEQ(attacker->channel->origin.x, point.x, 0.001f);
+    T_FEQ(attacker->channel->origin.y, point.y, 0.001f);
+    T_NOT_NULL(attacker->currentmove);
+    attacker->currentmove->think(attacker); /* walk state -> attack windup */
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttackGround);
+    T_STREQ(attacker->currentmove->animation, "attack range");
+    attacker->wait = 0.01f;
+    attacker->currentmove->think(attacker);
+
+    FILTER_EDICTS(ent, ent->owner == attacker && ent->movetype == MOVETYPE_FLYMISSILE) {
+        missile = ent; break;
+    }
+    T_NOT_NULL(missile);
+    if (missile) {
+        T_ASSERT(missile->aiflags & AI_PROJECTILE_FIXED_TARGET);
+        T_FEQ(missile->channel->origin.x, point.x, 0.001f);
+        T_FEQ(missile->channel->origin.y, point.y, 0.001f);
+    }
+}
+
+/* A hero's Agility increases attack speed (+2%/point), dividing the windup and
+ * recovery so the whole cycle speeds up. */
+TEST(wc3_combat, attack_speed_scales_with_agility) {
+    edict_t *h              = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.agi            = 20;       /* +40% -> divisor 1.4 */
+    h->unit_state->attack1.cooldown    = 1.5f;
+    h->unit_state->attack1.damagePoint = 0.3f;
+
+    attack_melee_cooldown(h);
+    T_FEQ(h->wait, (1.5f - 0.3f) / 1.4f, 0.001f);   /* recovery scaled */
+
+    attack_melee(h);
+    T_FEQ(h->wait, 0.3f / 1.4f, 0.001f);            /* windup scaled */
+}
+
+TEST(wc3_combat, endurance_aura_ignores_hidden_sources_and_recipients) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X6\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"Area1\"\n"
+        "C;Y1;X4;K\"DataA1\"\nC;Y1;X5;K\"DataB1\"\nC;Y1;X6;K\"levels\"\n"
+        "C;Y2;X1;K\"AOae\"\nC;Y2;X2;K\"AOae\"\nC;Y2;X3;K\"900\"\n"
+        "C;Y2;X4;K\"0.10\"\nC;Y2;X5;K\"0.20\"\nC;Y2;X6;K\"1\"\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+    edict_t *source, *target;
+
+    reset_entities();
+    setup_test_world();
+    source = make_combat_unit(MAKEFOURCC('O','b','l','m'), 725.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('o','g','r','u'), 700.0f, 100.0f, 0.0f);
+    source->s.player = target->s.player = 0;
+    source->unit_state->overrides.added[0] = MAKEFOURCC('A','O','a','e');
+    ARRAY_COUNT(source->unit_state->overrides.added) = 1;
+    target->unit_state->attack1.cooldown = 1.0f;
+    target->unit_state->attack1.damagePoint = 0.2f;
+    target->unit_state->hero.agi = 0;
+
+    T_FEQ(S_EnduranceMoveBonus(target), 0.10f, 0.001f);
+    T_FEQ(S_EnduranceAttackBonus(target), 0.20f, 0.001f);
+    attack_melee_cooldown(target);
+    T_FEQ(target->wait, 0.8f / 1.2f, 0.001f);
+
+    source->s.renderfx |= RF_HIDDEN;
+    attack_melee_cooldown(target);
+    T_FEQ(target->wait, 0.8f, 0.001f);
+    source->s.renderfx &= ~RF_HIDDEN;
+
+    target->s.renderfx |= RF_HIDDEN;
+    attack_melee_cooldown(target);
+    T_FEQ(target->wait, 0.8f, 0.001f);
+    target->s.renderfx &= ~RF_HIDDEN;
+
+    source->runtime.flags |= UNIT_BALANCE_PERMANENT_INVISIBLE;
+    G_InitVisibility(source);
+    source->vision->reveal_until = 0;
+    attack_melee_cooldown(target);
+    T_FEQ(target->wait, 0.8f, 0.001f);
+
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, endurance_aura_uses_map_authored_rank_five) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X6\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"Area1\"\n"
+        "C;Y1;X4;K\"DataA1\"\nC;Y1;X5;K\"DataB1\"\nC;Y1;X6;K\"levels\"\n"
+        "C;Y2;X1;K\"AOae\"\nC;Y2;X2;K\"AOae\"\nC;Y2;X3;K\"900\"\n"
+        "C;Y2;X4;K\"0.10\"\nC;Y2;X5;K\"0.20\"\nC;Y2;X6;K\"1\"\nE\n";
+    uint32_t id = MAKEFOURCC('A','O','a','e'), levels = 5;
+    float area = 900.0f, speed = 0.75f;
+    unitModification_t mods[] = {
+        { .modID = MAKEFOURCC('a','l','e','v'), .type = mod_int, .data = &levels },
+        { .modID = MAKEFOURCC('a','a','r','e'), .type = mod_real, .level = 5, .data = &area },
+        { .modID = MAKEFOURCC('O','a','e','2'), .type = mod_real, .level = 5, .dataPointer = 2, .data = &speed },
+    };
+    unitData_t original = { .originalUnitID = id, .numbeOfModifications = 3, .modifications = mods };
+    mapInfo_t info = { .num_originalAbilities = 1, .originalAbilities = &original };
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+    edict_t *source, *target;
+
+    reset_entities(); setup_test_world();
+    G_SetMapAbilityOverrides(&info);
+    source = make_combat_unit(MAKEFOURCC('O','b','l','m'), 725.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('o','g','r','u'), 700.0f, 100.0f, 0.0f);
+    source->s.player = target->s.player = 0;
+    source->unit_state->ranks[0] = (heroability_t){ .code = id, .level = 5 };
+    target->unit_state->attack1.cooldown = 1.0f;
+    target->unit_state->attack1.damagePoint = 0.2f;
+    target->unit_state->hero.agi = 0;
+
+    attack_melee_cooldown(target);
+    T_FEQ(target->wait, 0.8f / 1.75f, 0.001f);
+    G_SetMapAbilityOverrides(NULL);
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, attack_speed_agility_bonus_caps_at_five_times) {
+    edict_t *h = make_combat_unit(MAKEFOURCC('H','p','a','l'), 650.0f, 0.0f, 0.0f);
+    h->unit_state->hero.agi = 1000;
+    h->unit_state->attack1.cooldown = 1.5f;
+    h->unit_state->attack1.damagePoint = 0.3f;
+
+    attack_melee_cooldown(h);
+    T_FEQ(h->wait, (1.5f - 0.3f) / 5.0f, 0.001f);
+    attack_melee(h);
+    T_FEQ(h->wait, 0.3f / 5.0f, 0.001f);
+}
+
+/* Defend DataD is a fractional attack-speed reduction.  Use a non-stock 25%
+ * value so the test cannot pass from a hard-coded retail constant. */
+TEST(wc3_combat, defend_data_d_reduces_attack_speed_while_active) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X3\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"DataD1\"\n"
+        "C;Y2;X1;K\"Adef\"\nC;Y2;X2;K\"Adef\"\nC;Y2;X3;K\"0.25\"\nE\n";
+    slkTestData_t *rows = parse_slk_string(slk), *old = G_SetSLKRows("AbilityData", rows);
+    edict_t *footman = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+
+    footman->unit_state->attack1.cooldown = 1.5f;
+    footman->unit_state->attack1.damagePoint = 0.3f;
+    footman->unit_state->hero.agi = 0;
+
+    attack_melee_cooldown(footman);
+    T_FEQ(footman->wait, 1.2f, 0.001f);
+
+    unit_addstatus(footman, "Adef", 1);
+    attack_melee_cooldown(footman);
+    T_FEQ(footman->wait, 1.2f / 0.75f, 0.001f);
+
+    attack_melee(footman);
+    T_FEQ(footman->wait, 0.3f / 0.75f, 0.001f);
+
+    G_SetSLKRows("AbilityData", old);
+    free_slk_rows(rows);
+}
+
+/* ==========================================================================
+ * G_AttackDamage — attack×defense table and armor reduction
+ *
+ * Defense type indices (matches defense_type[] in g_monster.c):
+ *   0=small 1=medium 2=large 3=fort 4=normal 5=hero 6=divine 7=none
+ * Attack type indices (ATK_ enum in g_local.h):
+ *   0=none 1=normal 2=pierce 3=siege 4=spells 5=chaos 6=magic 7=hero
+ * ========================================================================== */
+
+static edict_t *make_attacker(uint32_t atk_type) {
+    edict_t *a = make_combat_unit(MAKEFOURCC('h','f','o','o'), 100.0f, 0.0f, 0.0f);
+    a->unit_state->attack1.type = atk_type;
+    return a;
+}
+
+static edict_t *make_target(uint32_t def_type, float armor) {
+    edict_t *t = make_combat_unit(MAKEFOURCC('h','f','o','o'), 1000.0f, 50.0f, 0.0f);
+    t->unit_state->defense_type = def_type;
+    t->unit_state->armor_value  = armor;
+    return t;
+}
+
+/* Pierce vs small = 2.0× (infantry shredded by arrows). */
+TEST(wc3_combat, attack_damage_pierce_vs_small) {
+    edict_t *a = make_attacker(ATK_PIERCE);
+    edict_t *t = make_target(0 /* small */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 200);
+}
+
+/* Normal vs medium = 1.5× (footmen effective vs soldiers). */
+TEST(wc3_combat, attack_damage_normal_vs_medium) {
+    edict_t *a = make_attacker(ATK_NORMAL);
+    edict_t *t = make_target(1 /* medium */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 150);
+}
+
+/* Siege vs fort = 1.5× (catapults effective vs buildings). */
+TEST(wc3_combat, attack_damage_siege_vs_fort) {
+    edict_t *a = make_attacker(ATK_SIEGE);
+    edict_t *t = make_target(3 /* fort */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 150);
+}
+
+/* Magic vs large = 2.0× (spells shred large units). */
+TEST(wc3_combat, attack_damage_magic_vs_large) {
+    edict_t *a = make_attacker(ATK_MAGIC);
+    edict_t *t = make_target(2 /* large */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 200);
+}
+
+/* Chaos ignores defense type — always 1.0× regardless of armor type. */
+TEST(wc3_combat, attack_damage_chaos_passthrough) {
+    edict_t *a = make_attacker(ATK_CHAOS);
+    T_EQ(G_AttackDamage(a, make_target(0, 0.0f), 100), 100); /* small  */
+    T_EQ(G_AttackDamage(a, make_target(2, 0.0f), 100), 100); /* large  */
+    T_EQ(G_AttackDamage(a, make_target(3, 0.0f), 100), 100); /* fort   */
+    T_EQ(G_AttackDamage(a, make_target(5, 0.0f), 100), 100); /* hero   */
+}
+
+/* Hero attack vs fort = 0.5× (heroes less effective vs buildings). */
+TEST(wc3_combat, attack_damage_hero_vs_fort) {
+    edict_t *a = make_attacker(ATK_HERO);
+    edict_t *t = make_target(3 /* fort */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 50);
+}
+
+/* Divine defense takes only 5% from ordinary attack classes; Chaos remains 100%. */
+TEST(wc3_combat, attack_damage_divine_uses_wc3_multiplier) {
+    edict_t *normal = make_attacker(ATK_NORMAL);
+    edict_t *chaos = make_attacker(ATK_CHAOS);
+    edict_t *divine = make_target(6 /* divine */, 0.0f);
+    T_EQ(G_AttackDamage(normal, divine, 100), 5);
+    T_EQ(G_AttackDamage(chaos, divine, 100), 100);
+}
+
+/* Active Misc/war3mapMisc values override the stock fallback table/coefficient. */
+TEST(wc3_combat, attack_damage_uses_loaded_gameplay_constants) {
+    bool const old_loaded = game.constants.combatConstantsLoaded;
+    float const old_mult = game.constants.damageBonus[ATK_NORMAL][4];
+    float const old_armor = game.constants.defenseArmor;
+    edict_t *a = make_attacker(ATK_NORMAL);
+    edict_t *t = make_target(4 /* normal */, 2.0f);
+
+    game.constants.combatConstantsLoaded = true;
+    game.constants.damageBonus[ATK_NORMAL][4] = 1.25f;
+    game.constants.defenseArmor = 0.10f;
+    T_EQ(G_AttackDamage(a, t, 100), 104); /* 125 / 1.2 = 104.16... */
+
+    game.constants.combatConstantsLoaded = old_loaded;
+    game.constants.damageBonus[ATK_NORMAL][4] = old_mult;
+    game.constants.defenseArmor = old_armor;
+}
+
+/* Armor reduction: dmg / (1 + armor * 0.06). 100 base, 2 armor: 100/1.12 ≈ 89. */
+TEST(wc3_combat, attack_damage_armor_reduces_damage) {
+    edict_t *a = make_attacker(ATK_NORMAL);
+    edict_t *t = make_target(4 /* normal */, 2.0f);
+    int result = G_AttackDamage(a, t, 100);
+    T_ASSERT(result >= 88 && result <= 90);
+}
+
+/* Negative armor uses Warsmash's exponential WC3 curve: 2-(1-K)^(-armor).
+ * At -10 armor and K=.06 this is about 1.4614x, clearly distinct from the old
+ * reciprocal approximation (~1.375x). */
+TEST(wc3_combat, attack_damage_negative_armor_uses_exponential_curve) {
+    edict_t *a = make_attacker(ATK_NORMAL);
+    edict_t *t = make_target(4 /* normal */, -10.0f);
+    int result = G_AttackDamage(a, t, 100);
+    T_ASSERT(result >= 145 && result <= 147);
+}
+
+/* Minimum 1: even a tiny base through heavy armor can't go below 1. */
+TEST(wc3_combat, attack_damage_minimum_one) {
+    edict_t *a = make_attacker(ATK_PIERCE);
+    edict_t *t = make_target(5 /* hero, pierce=0.5× */, 100.0f); /* enormous armor */
+    T_EQ(G_AttackDamage(a, t, 1), 1);
+}
+
+/* Zero armor: multiplier applied cleanly with no reduction. */
+TEST(wc3_combat, attack_damage_zero_armor_no_reduction) {
+    edict_t *a = make_attacker(ATK_NORMAL);
+    edict_t *t = make_target(4 /* normal */, 0.0f);
+    T_EQ(G_AttackDamage(a, t, 100), 100);
+}
+
+/* ==========================================================================
+ * Ability lookup
+ * ========================================================================== */
+
+TEST(wc3_combat, find_ability_stop) {
+    ability_t const *a = FindAbilityByClassname(STR_CmdStop);
+    T_NOT_NULL(a);
+}
+
+TEST(wc3_combat, find_ability_move) {
+    ability_t const *a = FindAbilityByClassname(STR_CmdMove);
+    T_NOT_NULL(a);
+}
+
+TEST(wc3_combat, command_lookup_preserves_engine_command_name) {
+    ability_t const *a = FindAbilityForCommand(STR_CmdBuild);
+    T_NOT_NULL(a);
+    T_ASSERT(a == FindAbilityByClassname(STR_CmdBuild));
+    T_EQ(GetAbilityIndex(a->proc), FindAbilityIndex(STR_CmdBuild));
+}
+
+TEST(wc3_combat, find_ability_unknown_returns_null) {
+    ability_t const *a = FindAbilityByClassname("NotAnAbility");
+    T_NULL(a);
+}
+
+TEST(wc3_combat, get_ability_by_index_zero) {
+    /* Index 0 is always the stop ability (first entry in abilitylist[]). */
+    ability_t const *a = GetAbilityByIndex(0);
+    T_NOT_NULL(a);
+    T_ASSERT(a == FindAbilityByClassname(STR_CmdStop));
+}
+
+TEST(wc3_combat, get_ability_by_index_out_of_range) {
+    ability_t const *a = GetAbilityByIndex(9999);
+    T_NULL(a);
+}
+
+TEST(wc3_combat, get_ability_index_roundtrip) {
+    ability_t const *a   = FindAbilityByClassname(STR_CmdMove);
+    uint32_t             idx = FindAbilityIndex(STR_CmdMove);
+    T_ASSERT(GetAbilityByIndex(idx) == a);
+}
+
+TEST(wc3_combat, registered_reference_ability_codes) {
+    static cstring_t codes[] = {
+        "AHhb", "AHwe", "AHbz", "AHtb", "ANfb", "Apxf", "AOsf",
+        "Abun", "Astd", "AEim", "Aenc", "Aent", "Aegm", "Aeat",
+        "Ambt", "ANch", "AIco", "AHca", "Agld", "Abgm",
+        "Abli", "Aaha", "Artn", "Ahar", "Awha", "Ahrl", "ANcl",
+        "AUcs", "AInv", "Arep", "Aren", "Arst", "Avul", "Apit",
+        "Aneu", "Aall", "Acoi", "AIhe", "AIma", "AIat", "AIab",
+        "AIim", "AIsm", "AIam", "AIxm", "AIde", "AIml", "AImm",
+        "AIfs", "AImi", "AIem", "AIlm", "AIda", "AIct", "Acar", "Aloa", "Adro",
+        "Adri", "Aroo"
+    };
+
+    FOR_LOOP(i, sizeof(codes) / sizeof(codes[0])) {
+        T_NOT_NULL(FindAbilityByClassname(codes[i]));
+    }
+}
+
+TEST(wc3_combat, registered_first_thirty_todo_ability_codes) {
+    static cstring_t codes[] = {
+        "AHab", "AHmt", "ANst", "ANsg", "ANsq", "ANsw", "AOww", "AOcr", "AHbn", "AHfs",
+        "AHdr", "AHpx", "AUcb", "AUim", "AUls", "AUts", "ANba", "ANsi", "AUan", "AUdc",
+        "AUdp", "AUau", "AEev", "AEme", "AUsl", "AUav", "AUin", "AOcl", "AOeq", "AOfs"
+    };
+
+    FOR_LOOP(i, sizeof(codes) / sizeof(codes[0]))
+        T_NOT_NULL(FindAbilityByClassname(codes[i]));
+}
+
+static const char slk_ability_helpers[] =
+    "ID;PWXL;N;EBB;Y4;X13\n"
+    "C;Y1;X1;K\"alias\"\n"
+    "C;Y1;X2;K\"code\"\n"
+    "C;Y1;X3;K\"targs\"\n"
+    "C;Y1;X4;K\"Cost1\"\n"
+    "C;Y1;X5;K\"Cool1\"\n"
+    "C;Y1;X6;K\"Rng1\"\n"
+    "C;Y1;X7;K\"Dur1\"\n"
+    "C;Y1;X8;K\"DataA1\"\n"
+    "C;Y1;X9;K\"DataB1\"\n"
+    "C;Y1;X10;K\"UnitID1\"\n"
+    "C;Y1;X11;K\"Area1\"\n"
+    "C;Y1;X12;K\"HeroDur1\"\n"
+    "C;Y1;X13;K\"DataE1\"\n"
+    "C;Y2;X1;K\"AHtb\"\n"
+    "C;Y2;X2;K\"AHtb\"\n"
+    "C;Y2;X3;K\"air,ground,enemy,neutral\"\n"
+    "C;Y2;X4;K\"75\"\n"
+    "C;Y2;X5;K\"9\"\n"
+    "C;Y2;X6;K\"600\"\n"
+    "C;Y2;X7;K\"5\"\n"
+    "C;Y2;X8;K\"100\"\n"
+    "C;Y2;X9;K\"55\"\n"
+    "C;Y2;X12;K\"3\"\n"
+    "C;Y2;X13;K\"42\"\n"
+    "C;Y3;X1;K\"AHwe\"\n"
+    "C;Y3;X2;K\"AHwe\"\n"
+    "C;Y3;X4;K\"140\"\n"
+    "C;Y3;X5;K\"20\"\n"
+    "C;Y3;X7;K\"75\"\n"
+    "C;Y3;X8;K\"2\"\n"
+    "C;Y3;X9;K\"0\"\n"
+    "C;Y3;X10;K\"hwat\"\n"
+    "C;Y4;X1;K\"Ahrp\"\n"
+    "C;Y4;X2;K\"Arep\"\n"
+    "E\n";
+
+TEST(wc3_combat, command_lookup_resolves_fourcc_ability_alias) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    ability_t const *resolved = FindAbilityForCommand("Ahrp");
+
+    T_NOT_NULL(resolved);
+    T_ASSERT(resolved == FindAbilityByClassname("Arep"));
+
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+static const char slk_ability_helpers_roc[] =
+    "ID;PWXL;N;EBB;Y3;X4\n"
+    "C;Y1;X1;K\"alias\"\n"
+    "C;Y1;X2;K\"Data11\"\n"
+    "C;Y1;X3;K\"Data12\"\n"
+    "C;Y1;X4;K\"Data13\"\n"
+    "C;Y2;X1;K\"Ahar\"\n"
+    "C;Y2;X2;K1\n"
+    "C;Y2;X3;K10\n"
+    "C;Y2;X4;K10\n"
+    "C;Y3;X1;K\"Agld\"\n"
+    "C;Y3;X2;K12500\n"
+    "C;Y3;X3;K1\n"
+    "C;Y3;X4;K1\n"
+    "E\n";
+
+/* ROC and TFT store the same semantic ability slots under different headers. */
+TEST(wc3_combat, ability_data_resolves_roc_and_tft_columns) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers_roc);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    T_FEQ(AB_Data("Ahar", 1, 1), 1.0f, 0.01f);
+    T_FEQ(AB_Data("Ahar", 1, 2), 10.0f, 0.01f);
+    T_FEQ(S_SpellData(MAKEFOURCC('A','h','a','r'), 1, 3), 10.0f, 0.01f);
+    free_slk_rows(rows);
+
+    rows = parse_slk_string(slk_ability_helpers);
+    G_SetSLKRows("AbilityData", rows);
+    T_FEQ(AB_Data("AHtb", 1, 1), 100.0f, 0.01f);
+    T_FEQ(AB_Data("AHtb", 1, 2), 55.0f, 0.01f);
+    T_FEQ(S_SpellData(MAKEFOURCC('A','H','t','b'), 1, 5), 42.0f, 0.01f);
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+/* Gold-mine tuning stays in AbilityData instead of being copied into shared
+ * process-wide globals. Abstract class markers are not gameplay definitions. */
+TEST(wc3_combat, gold_mine_data_remains_authoritative_in_ability_rows) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers_roc);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    T_FEQ(AB_Data("Agld", 1, 1), 12500.0f, 0.01f);
+    T_FEQ(AB_Data("Agld", 1, 2), 1.0f, 0.01f);
+    T_FEQ(AB_Data("Agld", 1, 3), 1.0f, 0.01f);
+    T_ASSERT(!(FindAbilityByClassname("Agld")->flags & (AB_COMMAND | AB_SPELL | AB_ITEM | AB_UPDATE)));
+    T_NULL(FindAbilityByClassname("Agl2"));
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, blight_growth_is_passive_innate_update_not_command) {
+    ability_t const *ability = FindAbilityByClassname("Abli");
+    T_NOT_NULL(ability);
+    T_ASSERT(ability->flags & AB_PASSIVE);
+    T_ASSERT(ability->flags & AB_UPDATE);
+    T_ASSERT(ability->flags & AB_INNATE);
+    T_ASSERT(!(ability->flags & AB_COMMAND));
+}
+
+
+TEST(wc3_combat, blight_growth_uses_authored_expansion_and_availability) {
+    static const char blight_slk[] =
+        "C;Y1;X1;K\"alias\"\n"
+        "C;Y1;X2;K\"code\"\n"
+        "C;Y1;X3;K\"Dur1\"\n"
+        "C;Y1;X4;K\"DataA1\"\n"
+        "C;Y1;X5;K\"DataB1\"\n"
+        "C;Y1;X6;K\"Area1\"\n"
+        "C;Y2;X1;K\"Abl1\"\n"
+        "C;Y2;X2;K\"Abli\"\n"
+        "C;Y2;X3;K0.2\n"
+        "C;Y2;X4;K1\n"
+        "C;Y2;X5;K73\n"
+        "C;Y2;X6;K219\n"
+        "E\n";
+    uint32_t const code = MAKEFOURCC('A','b','l','1');
+    vec2_t first_ring = { 48.0f, 0.0f }, second_ring = { 176.0f, 0.0f };
+    slkTestData_t *rows = parse_slk_string(blight_slk);
+    slkTestData_t *old = G_SetSLKRows("AbilityData", rows);
+    edict_t *unit;
+
+    setup_test_world(); level.time = 0;
+    unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    unit->s.player = 0; unit->think = monster_think;
+    unit->unit_state->overrides.added[0] = code; ARRAY_COUNT(unit->unit_state->overrides.added) = 1;
+    T_ASSERT(S_UnitAbilityEvent(unit, A_UNIT_INIT));
+    T_FEQ(unit->blight_growth->radius, 0.0f, 0.001f);
+    T_ASSERT(!G_IsPointBlighted(&first_ring));
+
+    level.time = 200; G_RunEntities();
+    T_FEQ(unit->blight_growth->radius, 73.0f, 0.001f);
+    T_ASSERT(G_IsPointBlighted(&first_ring)); T_ASSERT(!G_IsPointBlighted(&second_ring));
+
+    level.time = 400; G_RunEntities();
+    T_FEQ(unit->blight_growth->radius, 146.0f, 0.001f);
+    T_ASSERT(G_IsPointBlighted(&second_ring));
+
+    G_SetPlayerAbilityAvailable(&game.clients[0], code, false);
+    level.time = 600; G_RunEntities();
+    T_FEQ(unit->blight_growth->radius, 146.0f, 0.001f);
+    G_SetPlayerAbilityAvailable(&game.clients[0], code, true);
+    G_RunEntities();
+    T_FEQ(unit->blight_growth->radius, 219.0f, 0.001f);
+
+    G_SetSLKRows("AbilityData", old); free_slk_rows(rows);
+}
+
+TEST(wc3_combat, blight_growth_reads_roc_data_columns) {
+    static const char blight_roc_slk[] =
+        "C;Y1;X1;K\"alias\"\n"
+        "C;Y1;X2;K\"code\"\n"
+        "C;Y1;X3;K\"Dur1\"\n"
+        "C;Y1;X4;K\"Area1\"\n"
+        "C;Y1;X5;K\"Data11\"\n"
+        "C;Y1;X6;K\"Data12\"\n"
+        "C;Y2;X1;K\"Abl1\"\n"
+        "C;Y2;X2;K\"Abli\"\n"
+        "C;Y2;X3;K0.2\n"
+        "C;Y2;X4;K219\n"
+        "C;Y2;X5;K1\n"
+        "C;Y2;X6;K73\n"
+        "E\n";
+    uint32_t const code = MAKEFOURCC('A','b','l','1');
+    vec2_t first_ring = { 48.0f, 0.0f };
+    slkTestData_t *rows = parse_slk_string(blight_roc_slk);
+    slkTestData_t *old = G_SetSLKRows("AbilityData", rows);
+    edict_t *unit;
+
+    setup_test_world(); level.time = 0;
+    unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    unit->s.player = 0; unit->unit_state->overrides.added[0] = code; ARRAY_COUNT(unit->unit_state->overrides.added) = 1;
+    T_ASSERT(S_UnitAbilityEvent(unit, A_UNIT_INIT));
+    level.time = 200; S_RunAbilityUpdates(unit);
+    T_FEQ(unit->blight_growth->radius, 73.0f, 0.001f);
+    T_ASSERT(G_IsPointBlighted(&first_ring));
+
+    G_SetSLKRows("AbilityData", old); free_slk_rows(rows);
+}
+
+TEST(wc3_combat, blight_regeneration_tracks_world_state_without_movement) {
+    edict_t *unit;
+    UnitBalance_t balance;
+    vec2_t point = { 0.0f, 0.0f };
+
+    setup_test_world();
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), point.x, point.y);
+    balance = *unit->data.UnitBalance;
+    balance.healthRegenType = "blight"; balance.healthRegen = 10.0f;
+    unit->data.UnitBalance = &balance;
+    unit->health.max_value = 100.0f; unit->health.value = 50.0f;
+
+    G_RunEntity(unit); T_FEQ(unit->health.value, 50.0f, 0.001f);
+    G_SetBlightPoint(&point, true);
+    G_RunEntity(unit); T_ASSERT(unit->health.value > 50.0f);
+    {
+        float const healed = unit->health.value;
+        G_SetBlightPoint(&point, false);
+        G_RunEntity(unit); T_FEQ(unit->health.value, healed, 0.001f);
+    }
+}
+
+TEST(wc3_combat, spell_helpers_read_slk_fields) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    uint32_t thunder = MAKEFOURCC('A', 'H', 't', 'b');
+    uint32_t water = MAKEFOURCC('A', 'H', 'w', 'e');
+
+    T_FEQ(S_SpellNumber(thunder, ABILITY_NUMBER_COST, 1), 75.0f, 0.01f);
+    T_FEQ(S_SpellRange(thunder, 1), 600.0f, 0.01f);
+    T_FEQ(S_SpellDuration(thunder, 1, true), 3.0f, 0.01f);
+    T_FEQ(S_SpellData(thunder, 1, 1), 100.0f, 0.01f); /* DataA1 */
+    T_FEQ(S_SpellData(thunder, 1, 2), 55.0f, 0.01f);  /* DataB1 */
+    /* index 5 -> DataE1: the columns are Data<Letter><Level>, and index must
+     * reach past D (the old code built numeric "Data15" and clamped index to 4,
+     * so every DataE+ read — e.g. Shadow Strike's Initial Damage — returned 0). */
+    T_FEQ(S_SpellData(thunder, 1, 5), 42.0f, 0.01f);  /* DataE1 */
+    T_EQ((int)S_SpellUnitId(water, 1), (int)MAKEFOURCC('h','w','a','t'));
+
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, spell_mana_and_cooldown) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    uint32_t thunder = MAKEFOURCC('A', 'H', 't', 'b');
+    edict_t *caster = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    caster->mana.value = 100.0f;
+    caster->mana.max_value = 100.0f;
+    level.time = 1000;
+    T_ASSERT(S_SpellCooldownReady(caster, thunder));
+    T_ASSERT(S_SpellSpendMana(caster, thunder, 1));
+    T_FEQ(caster->mana.value, 25.0f, 0.01f);
+    T_ASSERT(!S_SpellSpendMana(caster, thunder, 1));
+
+    S_SpellStartCooldown(caster, thunder, 1);
+    T_ASSERT(!S_SpellCooldownReady(caster, thunder));
+    T_FEQ(S_SpellCooldownRemaining(caster, thunder), 9.0f, 0.01f);
+    T_FEQ(S_SpellCooldownLength(caster, thunder), 9.0f, 0.01f);
+    /* Just used -> full cooldown shade on the command-card icon. */
+    T_FEQ(S_SpellCooldownFraction(caster, thunder, 1), 1.0f, 0.01f);
+    level.time += 4500; /* halfway through the 9s cooldown */
+    T_FEQ(S_SpellCooldownFraction(caster, thunder, 1), 0.5f, 0.01f);
+    /* The fraction is captured from the running cooldown, not a newly learned level. */
+    T_FEQ(S_SpellCooldownFraction(caster, thunder, 4), 0.5f, 0.01f);
+    level.time += 4501; /* past the end */
+    T_ASSERT(S_SpellCooldownReady(caster, thunder));
+    /* Ready again -> no shade. */
+    T_FEQ(S_SpellCooldownFraction(caster, thunder, 1), 0.0f, 0.01f);
+
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, spell_cooldowns_do_not_consume_buff_slots_and_share_base_code) {
+    slkTestData_t *rows = parse_slk_string(slk_ability_helpers);
+    slkTestData_t *old_abilities = G_SetSLKRows("AbilityData", rows);
+    uint32_t const alias = MAKEFOURCC('A','h','r','p');
+    uint32_t const base = MAKEFOURCC('A','r','e','p');
+    edict_t *caster = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+
+    level.time = 2000;
+    FOR_LOOP(i, MAX_UNIT_STATUSES) {
+        caster->unit_state->statuses[i].code = MAKEFOURCC('B','0','0','0') + i;
+        caster->unit_state->statuses[i].level = 1;
+    }
+    S_SpellStartCooldownDuration(caster, alias, 3.0f);
+    T_ASSERT(!S_SpellCooldownReady(caster, alias));
+    T_ASSERT(!S_SpellCooldownReady(caster, base));
+    T_FEQ(S_SpellCooldownRemaining(caster, base), 3.0f, 0.01f);
+    FOR_LOOP(i, MAX_UNIT_STATUSES) T_EQ(caster->unit_state->statuses[i].level, 1);
+
+    S_SpellEndCooldown(caster, base);
+    T_ASSERT(S_SpellCooldownReady(caster, alias));
+
+    G_SetSLKRows("AbilityData", old_abilities);
+    free_slk_rows(rows);
+}
+
+TEST(wc3_combat, timed_stun_status_expires_without_touching_pause) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    G_SetUnitFlag(ent, UNIT_FLAG_PAUSED, true);
+    level.time = 100;
+
+    unit_addtimedstatus(ent, "Bstu", 1, 0.05f);
+
+    T_ASSERT(unit_hasstatusstate(ent, WC3_STATUS_STATE_STUNNED));
+    T_ASSERT(G_UnitHasFlag(ent, UNIT_FLAG_PAUSED));
+    level.time = 151;
+    unit_updatestatuses(ent);
+    T_ASSERT(!unit_hasstatusstate(ent, WC3_STATUS_STATE_STUNNED));
+    T_ASSERT(G_UnitHasFlag(ent, UNIT_FLAG_PAUSED));
+}
+
+TEST(wc3_combat, status_replace_reinitializes_existing_slot) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    heroabilitystatus_t *slot;
+    level.time = 1000;
+    unit_addtimedstatus(ent, "Bstu", 1, 5.0f);
+    slot = unit_findstatus(ent, MAKEFOURCC('B','s','t','u'));
+    T_NOT_NULL(slot);
+    slot->data = MAKEFOURCC('A','x','x','x');
+    slot->rank = 3;
+    slot->next_tick = 2500;
+    unit_addtimedstatus(ent, "Bstu", 2, 10.0f);
+    T_EQ(slot->level, 2);
+    T_EQ(slot->timestamp, 11000);
+    T_EQ(slot->data, 0);
+    T_EQ(slot->rank, 0);
+    T_EQ(slot->next_tick, 0);
+    T_ASSERT(unit_hasstatusstate(ent, WC3_STATUS_STATE_STUNNED));
+}
+
+TEST(wc3_combat, scripted_status_removal_preserves_independent_stun) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    heroabilitystatus_t *slot;
+    level.time = 1000;
+    unit_addtimedstatus(ent, "Bstu", 1, 10.0f);
+    unit_addtimedstatus(ent, "Beng", 1, 10.0f);
+    slot = unit_findstatus(ent, MAKEFOURCC('B','e','n','g'));
+    T_NOT_NULL(slot);
+    unit_removestatus(ent, slot, STATUS_REMOVE_SCRIPT);
+    unit_refreshstatusflags(ent);
+    T_ASSERT(unit_hasstatusstate(ent, WC3_STATUS_STATE_STUNNED));
+    T_NOT_NULL(unit_findstatus(ent, MAKEFOURCC('B','s','t','u')));
+    T_ASSERT(!unit_findstatus(ent, MAKEFOURCC('B','e','n','g')));
+}
+
+TEST(wc3_combat, timed_life_status_kills_unit) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    _die_call_count = 0;
+    level.time = 200;
+
+    unit_addtimedstatus(ent, "BTLF", 1, 0.05f);
+    level.time = 251;
+    unit_updatestatuses(ent);
+
+    T_FEQ(ent->health.value, 0.0f, 0.01f);
+    T_EQ(_die_call_count, 1);
+}
+
+TEST(wc3_combat, timed_status_bar_keeps_duration_and_uses_last_eligible_status) {
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    heroabilitystatus_t const *status;
+
+    level.time = 1000;
+    unit_addtimedstatus(ent, "BTLF", 1, 20.0f);
+    status = unit_findtimedbarstatus(ent);
+    T_NOT_NULL(status);
+    T_EQ(status->code, MAKEFOURCC('B','T','L','F'));
+    T_EQ(status->duration_ms, 20000);
+    T_FEQ(unit_statusremainingfraction(status), 1.0f, 0.0001f);
+
+    level.time = 11000;
+    T_FEQ(unit_statusremainingfraction(status), 0.5f, 0.0001f);
+
+    /* Bmil is also a timed-status-bar buff; the later slot owns Warsmash's
+     * single countdown presentation when both are present. */
+    unit_addtimedstatus(ent, "Bmil", 1, 45.0f);
+    status = unit_findtimedbarstatus(ent);
+    T_NOT_NULL(status);
+    T_EQ(status->code, MAKEFOURCC('B','m','i','l'));
+    T_EQ(status->duration_ms, 45000);
+    T_FEQ(unit_statusremainingfraction(status), 1.0f, 0.0001f);
+
+    T_ASSERT(unit_statusshowstimedbar(MAKEFOURCC('B','T','L','F')));
+    T_ASSERT(unit_statusshowstimedbar(MAKEFOURCC('B','m','i','l')));
+    T_ASSERT(!unit_statusshowstimedbar(MAKEFOURCC('B','s','t','u')));
+}
+
+/* ==========================================================================
+ * player_pay
+ * ========================================================================== */
+
+/* Costs come from the mounted ROC/TFT UnitBalance table. */
+
+TEST(wc3_combat, player_pay_deducts_gold) {
+    player_t *p = &game.clients[0].ps;
+    p->stats[PLAYERSTATE_RESOURCE_GOLD]   = 200;
+    p->stats[PLAYERSTATE_RESOURCE_LUMBER] = 0;
+
+    uint32_t unit = MAKEFOURCC('h','p','e','a');
+    int32_t gold = G_UnitBalance(unit)->goldCost;
+    bool ok = player_pay(p, unit);
+
+    T_ASSERT(ok);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD], 200 - gold);
+}
+
+TEST(wc3_combat, player_pay_insufficient_gold_fails) {
+    player_t *p = &game.clients[0].ps;
+    p->stats[PLAYERSTATE_RESOURCE_GOLD]   = 50;  /* need 75 */
+    p->stats[PLAYERSTATE_RESOURCE_LUMBER] = 0;
+
+    bool ok = player_pay(p, MAKEFOURCC('h','p','e','a'));
+
+    T_ASSERT(!ok);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD], 50); /* unchanged */
+}
+
+TEST(wc3_combat, player_pay_insufficient_lumber_fails) {
+    player_t *p = &game.clients[0].ps;
+    uint32_t project = MAKEFOURCC('h','b','a','r');
+    int32_t gold = G_UnitBalance(project)->goldCost, lumber = G_UnitBalance(project)->lumberCost;
+    T_ASSERT(gold > 0 && lumber > 0);
+    p->stats[PLAYERSTATE_RESOURCE_GOLD]   = gold;
+    p->stats[PLAYERSTATE_RESOURCE_LUMBER] = lumber - 1;
+
+    bool ok = player_pay(p, project);
+
+    T_ASSERT(!ok);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD], gold);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_LUMBER], lumber - 1);
+}
+
+TEST(wc3_combat, player_pay_null_player_fails) {
+    bool ok = player_pay(NULL, MAKEFOURCC('h','p','e','a'));
+    T_ASSERT(!ok);
+}
+
+/* ==========================================================================
+ * unit_add_build_queue
+ * ========================================================================== */
+
+TEST(wc3_combat, build_queue_first_item) {
+    edict_t *producer = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    edict_t *item1    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 10.0f, 0.0f);
+    producer->build  = NULL;
+
+    unit_add_build_queue(producer, item1);
+
+    T_ASSERT(producer->build == item1);
+    T_NULL(item1->build);
+}
+
+TEST(wc3_combat, build_queue_chained_items) {
+    edict_t *producer = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    edict_t *item1    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 10.0f, 0.0f);
+    edict_t *item2    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 20.0f, 0.0f);
+    producer->build  = NULL;
+    item1->build     = NULL;
+    item2->build     = NULL;
+
+    unit_add_build_queue(producer, item1);
+    unit_add_build_queue(producer, item2);
+
+    T_ASSERT(producer->build == item1);
+    T_ASSERT(item1->build    == item2);
+    T_NULL(item1->currentmove);
+    T_NULL(item2->currentmove);
+    T_NULL(item2->build);
+}
+
+TEST(wc3_combat, build_queue_three_items_linked) {
+    edict_t *producer = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    edict_t *item1    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 10.0f, 0.0f);
+    edict_t *item2    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 20.0f, 0.0f);
+    edict_t *item3    = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 30.0f, 0.0f);
+    producer->build = item1->build = item2->build = item3->build = NULL;
+
+    unit_add_build_queue(producer, item1);
+    unit_add_build_queue(producer, item2);
+    unit_add_build_queue(producer, item3);
+
+    T_ASSERT(producer->build == item1);
+    T_ASSERT(item1->build    == item2);
+    T_ASSERT(item2->build    == item3);
+    T_NULL(item3->build);
+}
+
+/* ==========================================================================
+ * Quest system
+ * ========================================================================== */
+
+TEST(wc3_combat, quest_make_non_null) {
+    quest_t *q = G_MakeQuest();
+    T_NOT_NULL(q);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_fields_default_state) {
+    quest_t *q = G_MakeQuest();
+    T_ASSERT(!q->completed);
+    T_ASSERT(!q->failed);
+    T_ASSERT(!q->discovered);
+    T_ASSERT(!q->required);
+    T_ASSERT(q->enabled);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_set_title) {
+    quest_t *q = G_MakeQuest();
+    q->title = strdup("Defeat the Lich King");
+    T_STREQ(q->title, "Defeat the Lich King");
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_set_completed) {
+    quest_t *q = G_MakeQuest();
+    q->completed = true;
+    T_ASSERT(q->completed);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_set_failed) {
+    quest_t *q = G_MakeQuest();
+    q->failed = true;
+    T_ASSERT(q->failed);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_remove_clears_from_list) {
+    /* Reset the quest list to a known-empty state. */
+    memset(level.quests, 0, sizeof(level.quests));
+    quest_t *q = G_MakeQuest();
+    T_ASSERT(q && q->inuse);
+
+    G_RemoveQuest(q);
+
+    /* After removing the only quest the list must be empty. */
+    T_ASSERT(!q->inuse);
+}
+
+TEST(wc3_combat, quest_discovered_required_enabled_flags) {
+    quest_t *q = G_MakeQuest();
+    q->discovered = true;
+    q->required   = true;
+    q->enabled    = true;
+    T_ASSERT(q->discovered);
+    T_ASSERT(q->required);
+    T_ASSERT(q->enabled);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_item_create_non_null) {
+    quest_t *q = G_MakeQuest();
+    questItem_t *item = &q->items[q->num_items++]; item->inuse = true;
+    T_NOT_NULL(item);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_item_set_description) {
+    quest_t *q = G_MakeQuest();
+    questItem_t *item = &q->items[q->num_items++]; item->inuse = true;
+    item->description = strdup("Kill 10 footmen");
+    T_STREQ(item->description, "Kill 10 footmen");
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_item_set_completed) {
+    quest_t *q = G_MakeQuest();
+    questItem_t *item = &q->items[q->num_items++]; item->inuse = true;
+    item->completed = true;
+    T_ASSERT(item->completed);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_item_defaults_incomplete) {
+    quest_t *q = G_MakeQuest();
+    questItem_t *item = &q->items[q->num_items++]; item->inuse = true;
+    T_ASSERT(!item->completed);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_multiple_items_linked) {
+    quest_t *q = G_MakeQuest();
+    questItem_t *a = &q->items[q->num_items++]; a->inuse = true;
+    questItem_t *b = &q->items[q->num_items++]; b->inuse = true;
+    /* Both items must be reachable from the quest's bounded storage. */
+    bool found_a = false, found_b = false;
+    FOR_EACH_QUESTITEM(q, it) {
+        if (it == a) found_a = true;
+        if (it == b) found_b = true;
+    }
+    T_ASSERT(found_a);
+    T_ASSERT(found_b);
+    G_RemoveQuest(q);
+}
+
+TEST(wc3_combat, quest_multiple_quests_in_list) {
+    memset(level.quests, 0, sizeof(level.quests));
+    quest_t *q1 = G_MakeQuest();
+    quest_t *q2 = G_MakeQuest();
+    T_NOT_NULL(q1);
+    T_NOT_NULL(q2);
+    /* Both quests must be reachable from the fixed quest slots. */
+    bool found_q1 = false, found_q2 = false;
+    FOR_EACH_QUEST(q) {
+        if (q == q1) found_q1 = true;
+        if (q == q2) found_q2 = true;
+    }
+    T_ASSERT(found_q1);
+    T_ASSERT(found_q2);
+    G_RemoveQuest(q1);
+    G_RemoveQuest(q2);
+    T_ASSERT(!q1->inuse && !q2->inuse);
+}
+
+/* ==========================================================================
+ * G_PublishEvent
+ * ========================================================================== */
+
+TEST(wc3_combat, publish_event_fills_queue) {
+    /* Reset the event queue. */
+    level.events.write = 0;
+    level.events.read  = 0;
+
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    gameEvent_t *evt = G_PublishEvent(ent, EVENT_UNIT_DEATH);
+
+    T_NOT_NULL(evt);
+    T_EQ((int)evt->type, (int)EVENT_UNIT_DEATH);
+}
+
+TEST(wc3_combat, publish_event_sequential) {
+    level.events.write = 0;
+    level.events.read  = 0;
+
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    G_PublishEvent(ent, EVENT_UNIT_DEATH);
+    gameEvent_t *evt2 = G_PublishEvent(ent, EVENT_PLAYER_UNIT_TRAIN_FINISH);
+
+    T_NOT_NULL(evt2);
+    T_EQ((int)evt2->type, (int)EVENT_PLAYER_UNIT_TRAIN_FINISH);
+}
+
+/* ==========================================================================
+ * Win conditions — EVENT_PLAYER_VICTORY / EVENT_PLAYER_DEFEAT
+ * ========================================================================== */
+
+TEST(wc3_combat, publish_event_player_victory) {
+    level.events.write = 0;
+    level.events.read  = 0;
+
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    gameEvent_t *evt = G_PublishEvent(ent, EVENT_PLAYER_VICTORY);
+
+    T_NOT_NULL(evt);
+    T_EQ((int)evt->type, (int)EVENT_PLAYER_VICTORY);
+    T_EQ(evt->edict, ent);
+}
+
+TEST(wc3_combat, publish_event_player_defeat) {
+    level.events.write = 0;
+    level.events.read  = 0;
+
+    edict_t *ent = make_combat_unit(MAKEFOURCC('h','p','e','a'), 250.0f, 0.0f, 0.0f);
+    gameEvent_t *evt = G_PublishEvent(ent, EVENT_PLAYER_DEFEAT);
+
+    T_NOT_NULL(evt);
+    T_EQ((int)evt->type, (int)EVENT_PLAYER_DEFEAT);
+    T_EQ(evt->edict, ent);
+}
+
+TEST(wc3_combat, victory_and_defeat_are_distinct_event_types) {
+    T_ASSERT(EVENT_PLAYER_VICTORY != EVENT_PLAYER_DEFEAT);
+    T_EQ((int)EVENT_PLAYER_VICTORY, 14);
+    T_EQ((int)EVENT_PLAYER_DEFEAT,  13);
+}
+
+/* ==========================================================================
+ * Suite runner
+ * ========================================================================== */
+
+#endif /* BZ_TESTS */
+
+#ifdef BZ_TESTS
+/* Attack Ground must not translate while movement is locked. Ensnare applied
+ * before the order holds the unit at its origin (repro from #476). */
+TEST(wc3_combat, attack_ground_ensnare_before_order_holds_position) {
+    edict_t *unit;
+    vec2_t point = { 1000, 0 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    T_ASSERT(S_UnitIsEnsnared(unit));
+    S_OrderAttackGround(unit, &point);
+    FOR_LOOP(i, 10) {
+        level.time += FRAMETIME;
+        if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    }
+    T_FEQ(unit->s.origin2.x, 0, 0.001f);
+    T_FEQ(unit->s.origin2.y, 0, 0.001f);
+}
+
+/* Lock applied mid-approach freezes further steps; the order is retained. */
+TEST(wc3_combat, attack_ground_ensnare_mid_approach_freezes) {
+    edict_t *unit;
+    vec2_t point = { 1000, 0 };
+    float frozen_x, frozen_y;
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    S_OrderAttackGround(unit, &point);
+    level.time += FRAMETIME;
+    if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    frozen_x = unit->s.origin2.x; frozen_y = unit->s.origin2.y;
+    T_ASSERT(frozen_x > 0.001f);
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    T_ASSERT(S_UnitIsEnsnared(unit));
+    FOR_LOOP(i, 10) {
+        level.time += FRAMETIME;
+        if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    }
+    T_FEQ(unit->s.origin2.x, frozen_x, 0.001f);
+    T_FEQ(unit->s.origin2.y, frozen_y, 0.001f);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityAttackGround);
+}
+
+/* A point inside minimum range must not cause retreat while locked. */
+TEST(wc3_combat, attack_ground_min_range_no_retreat_while_locked) {
+    UnitWeapons_t weapons = { .attacksEnabled = 3, .minimumAttackRange = 150.0f };
+    edict_t *unit;
+    vec2_t point = { 50, 0 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->data.UnitWeapons = &weapons;
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 500; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    S_OrderAttackGround(unit, &point);
+    FOR_LOOP(i, 10) {
+        level.time += FRAMETIME;
+        if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    }
+    T_FEQ(unit->s.origin2.x, 0, 0.001f);
+    T_FEQ(unit->s.origin2.y, 0, 0.001f);
+}
+
+/* Movement lock must not disable stationary firing at an in-range point. */
+TEST(wc3_combat, attack_ground_locked_still_fires_in_range) {
+    edict_t *unit, *missile = NULL;
+    vec2_t point = { 200, 75 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 500; unit->unit_state->attack1.damageBase = 73;
+    unit->unit_state->attack1.damagePoint = 0.1f; unit->unit_state->attack1.cooldown = 1.0f;
+    unit->unit_state->attack1.projectile.speed = 900; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    T_ASSERT(!S_UnitCanTranslate(unit));
+    T_ASSERT(S_OrderAttackGround(unit, &point));
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityAttackGround);
+    unit->currentmove->think(unit);
+    unit->wait = 0.01f;
+    level.time += FRAMETIME;
+    unit->currentmove->think(unit);
+    FILTER_EDICTS(ent, ent->owner == unit && ent->movetype == MOVETYPE_FLYMISSILE) { missile = ent; break; }
+    T_NOT_NULL(missile);
+    if (missile) T_FEQ(missile->channel->origin.x, point.x, 0.001f);
+}
+
+/* Expiry removes the restriction; the retained order then progresses. */
+TEST(wc3_combat, attack_ground_resumes_after_lock_expiry) {
+    edict_t *unit;
+    vec2_t point = { 1000, 0 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    S_OrderAttackGround(unit, &point);
+    FOR_LOOP(i, 3) {
+        level.time += FRAMETIME;
+        if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    }
+    T_FEQ(unit->s.origin2.x, 0, 0.001f);
+    level.time += 13000; unit_updatestatuses(unit);
+    T_ASSERT(!S_UnitIsEnsnared(unit));
+    T_ASSERT(S_UnitCanTranslate(unit));
+    FOR_LOOP(i, 10) {
+        level.time += FRAMETIME;
+        if (unit->currentmove && unit->currentmove->think) unit->currentmove->think(unit);
+    }
+    T_ASSERT(unit->s.origin2.x > 0.001f);
+}
+
+/* Stop and replacement orders stay effective while locked. */
+TEST(wc3_combat, attack_ground_stop_and_replace_while_locked) {
+    edict_t *unit;
+    vec2_t point = { 1000, 0 }, other = { 10, 0 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    S_OrderAttackGround(unit, &point);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityAttackGround);
+    if (unit->stand) unit->stand(unit);
+    T_ASSERT(!unit->currentmove || unit->currentmove->proc != CAbilityAttackGround);
+    S_OrderAttackGround(unit, &point);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityAttackGround);
+    T_FEQ(unit->channel->origin.x, point.x, 0.001f);
+    S_OrderAttackGround(unit, &other);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityAttackGround);
+    T_FEQ(unit->channel->origin.x, other.x, 0.001f);
+}
+
+
+TEST(wc3_combat, entangling_roots_pauses_existing_attack_without_cancelling_order) {
+    edict_t *attacker, *target;
+    heroabilitystatus_t *roots;
+    setup_test_world(); reset_entities(); level.time = 1000;
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    target = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 50.0f, 0.0f);
+    attacker->s.player = 0; target->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_NORMAL; attacker->unit_state->attack1.weapon = WPN_NORMAL;
+    attacker->unit_state->attack1.range = 100.0f; attacker->unit_state->attack1.damageBase = 25.0f;
+    attacker->unit_state->attack1.numberOfDice = 0; attacker->unit_state->attack1.damagePoint = 0.1f;
+    attacker->unit_state->attack1.cooldown = 1.0f; attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    target->targtype = TARG_GROUND; target->unit_state->defense_type = 0; target->unit_state->armor_value = 0.0f;
+    target->health.value = target->health.max_value = 200.0f;
+
+    T_ASSERT(S_OrderAttack(attacker, target));
+    attacker->currentmove->think(attacker); /* attack walk -> melee windup */
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttack);
+    unit_addtimedstatus(attacker, "BEer", 1, 12.0f);
+    roots = unit_findstatus(attacker, MAKEFOURCC('B','E','e','r'));
+    T_NOT_NULL(roots);
+    attacker->wait = 0.01f;
+    attacker->currentmove->think(attacker);
+    T_FEQ(target->health.value, 200.0f, 0.001f);
+    T_EQ(attacker->goalentity, target);
+    T_ASSERT(attacker->currentmove && attacker->currentmove->proc == CAbilityAttack);
+
+    unit_expirestatus(attacker, roots);
+    attacker->wait = 0.01f;
+    attacker->currentmove->think(attacker);
+    T_FEQ(target->health.value, 175.0f, 0.001f);
+}
+
+/* Roots are a disarm as well as a movement lock; ordinary immobile artillery
+ * still fires because AI_IMMOBILE alone is not an attack restriction. */
+TEST(wc3_combat, attack_ground_roots_disarm_but_immobile_artillery_fires) {
+    edict_t *unit, *tower, *missile = NULL;
+    vec2_t near_rooted = { 50, 0 }, near = { 200, 75 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "BEer", 1, 12);
+    T_ASSERT(!S_UnitCanTranslate(unit));
+    T_ASSERT(!S_OrderAttackGround(unit, &near_rooted));
+    T_FEQ(unit->s.origin2.x, 0, 0.001f);
+    FILTER_EDICTS(ent, ent->owner == unit && ent->movetype == MOVETYPE_FLYMISSILE) missile = ent;
+    T_NULL(missile);
+    tower = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 0, 0);
+    tower->unit_state->attack1.type = ATK_SIEGE; tower->unit_state->attack1.weapon = WPN_ARTILLERY;
+    tower->unit_state->attack1.range = 500; tower->unit_state->attack1.damageBase = 73;
+    tower->unit_state->attack1.damagePoint = 0.1f; tower->unit_state->attack1.cooldown = 1.0f;
+    tower->unit_state->attack1.projectile.speed = 900; tower->aiflags |= AI_IMMOBILE;
+    tower->targtype = TARG_GROUND;
+    T_ASSERT(S_OrderAttackGround(tower, &near));
+    tower->currentmove->think(tower);
+    tower->wait = 0.01f;
+    level.time += FRAMETIME;
+    tower->currentmove->think(tower);
+    FILTER_EDICTS(ent, ent->owner == tower && ent->movetype == MOVETYPE_FLYMISSILE) { missile = ent; break; }
+    T_NOT_NULL(missile);
+}
+
+/* Scheduler-path coverage: issued point order advances through G_RunEntities. */
+TEST(wc3_combat, attack_ground_issued_order_holds_while_ensnared) {
+    edict_t *unit;
+    vec2_t point = { 1000, 0 };
+    setup_test_world(); reset_entities(); level.time = 1000;
+    unit = make_combat_unit(MAKEFOURCC('u','m','t','w'), 380, 100, 0);
+    unit->s.player = 0;
+    unit->unit_state->attack1.type = ATK_SIEGE; unit->unit_state->attack1.weapon = WPN_ARTILLERY;
+    unit->unit_state->attack1.range = 100; unit->unitinfo.MoveSpeed = 270;
+    unit->targtype = TARG_GROUND;
+    unit_addtimedstatus(unit, "Beng", 1, 12);
+    T_ASSERT(G_IssueUnitPointOrder(unit, "attackground", &point, false, 0, 0.0f));
+    FOR_LOOP(i, 5) { level.time += FRAMETIME; G_RunEntities(); }
+    T_FEQ(unit->s.origin2.x, 100, 0.001f);
+    T_FEQ(unit->s.origin2.y, 0, 0.001f);
+}
+
+TEST(wc3_bot, target_heroes_policy_prioritizes_farther_hero_for_ai_acquisition) {
+    edict_t *attacker, *near_unit, *far_hero;
+    bot_t *bot;
+
+    setup_test_world(); reset_entities();
+    attacker = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 0.0f, 0.0f);
+    near_unit = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 40.0f, 0.0f);
+    far_hero = make_combat_unit(MAKEFOURCC('H','p','a','l'), 1000.0f, 90.0f, 0.0f);
+    attacker->s.player = 0; near_unit->s.player = far_hero->s.player = 1;
+    attacker->unit_state->attack1.type = ATK_NORMAL;
+    attacker->unit_state->attack1.cooldown = 1.0f;
+    attacker->unit_state->attack1.damageBase = 10;
+    attacker->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    near_unit->targtype = far_hero->targtype = TARG_GROUND;
+    gi.LinkEntity(attacker); gi.LinkEntity(near_unit); gi.LinkEntity(far_hero);
+
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == near_unit);
+    T_ASSERT(G_BotStart(&game.clients[0].ps, "test_idle.ai", BOT_MELEE));
+    bot = level.bots + 0;
+    bot->flags |= BOT_TARGET_HEROES;
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == far_hero);
+    bot->flags &= ~BOT_TARGET_HEROES;
+    T_ASSERT(G_FindNearestEnemy(attacker, 128.0f) == near_unit);
+    G_BotStop(0);
+}
+
+TEST(wc3_bot, smart_artillery_prioritizes_farther_structure_for_siege_ai) {
+    edict_t *siege, *near_unit, *far_building;
+    bot_t *bot;
+
+    setup_test_world(); reset_entities();
+    siege = make_combat_unit(MAKEFOURCC('h','m','t','m'), 360.0f, 0.0f, 0.0f);
+    near_unit = make_combat_unit(MAKEFOURCC('h','f','o','o'), 420.0f, 40.0f, 0.0f);
+    far_building = make_combat_unit(MAKEFOURCC('h','b','a','r'), 1500.0f, 90.0f, 0.0f);
+    siege->s.player = 0; near_unit->s.player = far_building->s.player = 1;
+    siege->unit_state->attack1.type = ATK_SIEGE;
+    siege->unit_state->attack1.cooldown = 1.0f;
+    siege->unit_state->attack1.damageBase = 10;
+    siege->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND | WC3_TARGET_FLAG_STRUCTURE;
+    near_unit->targtype = TARG_GROUND;
+    far_building->targtype = TARG_STRUCTURE;
+    far_building->runtime.flags |= UNIT_BALANCE_BUILDING;
+    gi.LinkEntity(siege); gi.LinkEntity(near_unit); gi.LinkEntity(far_building);
+
+    T_ASSERT(G_FindNearestEnemy(siege, 128.0f) == near_unit);
+    T_ASSERT(G_BotStart(&game.clients[0].ps, "test_idle.ai", BOT_MELEE));
+    bot = level.bots + 0;
+    bot->flags |= BOT_SMART_ARTILLERY;
+    T_ASSERT(G_FindNearestEnemy(siege, 128.0f) == far_building);
+    bot->flags &= ~BOT_SMART_ARTILLERY;
+    T_ASSERT(G_FindNearestEnemy(siege, 128.0f) == near_unit);
+    G_BotStop(0);
+}
+
+#endif
+
+#ifdef BZ_TESTS
+/* Phase 5: categorical contributors participate in the authoritative damage gate. */
+TEST(wc3_combat, status_invulnerability_blocks_damage_without_mutating_base_flag) {
+    edict_t *target = make_attacker(ATK_NORMAL);
+    edict_t *source = make_attacker(ATK_NORMAL);
+    float before = target->health.value;
+    status_application_t app = { .buff = "BHds", .level = 1, .duration = 5.0f,
+                                 .state_mask = WC3_STATUS_STATE_INVULNERABLE };
+    T_NOT_NULL(unit_applystatus(target, &app));
+    T_ASSERT(!G_UnitHasFlag(target, UNIT_FLAG_INVULNERABLE));
+    T_Damage(target, source, 10);
+    T_FEQ(target->health.value, before, 0.001f);
+}
+#endif

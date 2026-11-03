@@ -1,0 +1,728 @@
+/*
+ * cl_movie.c — optional full-screen pre-rendered movie playback.
+ *
+ * The client owns decoding/presentation. Game modules only queue an asset path
+ * at a deferred session boundary, matching the Quake cinematic separation:
+ * simulation chooses what should play; the client owns media I/O, A/V timing,
+ * rendering, and skip input.
+ */
+#include "client.h"
+#include "tr_public.h"
+#include "sound/s_local.h"
+
+#ifdef BZ_FFMPEG
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <errno.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/mem.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+#endif
+
+#define CL_MOVIE_VIDEO_QUEUE 3
+#define CL_MOVIE_AUDIO_TARGET_FRAMES 44100
+
+typedef struct {
+    uint8_t *rgba;
+    int64_t pts_ms;
+} clMovieVideoFrame_t;
+
+typedef struct {
+    bool active;
+    bool extracted;
+    bool music_suspended;
+    PATHSTR source_path;
+    PATHSTR disk_path;
+    uint32_t width;
+    uint32_t height;
+    uint32_t start_ticks;
+    uint8_t *current_rgba;
+    bool current_valid;
+#ifdef BZ_FFMPEG
+    AVFormatContext *format;
+    AVCodecContext *video_codec;
+    AVCodecContext *audio_codec;
+    AVPacket *packet;
+    AVFrame *video_frame;
+    AVFrame *audio_frame;
+    struct SwsContext *sws;
+    SwrContext *swr;
+    int video_stream;
+    int audio_stream;
+    bool demux_eof;
+    bool video_flushed;
+    bool audio_flushed;
+    int64_t video_pts_origin;
+    int64_t synthetic_video_pts;
+    int64_t frame_duration_ms;
+    uint8_t *audio_buffer;
+    unsigned int audio_buffer_size;
+    clMovieVideoFrame_t frames[CL_MOVIE_VIDEO_QUEUE];
+    uint32_t frame_head;
+    uint32_t frame_count;
+#endif
+} clMovieState_t;
+
+static clMovieState_t cl_movie;
+
+/* MDX cinematics render in an isolated scene, independently of FFmpeg. */
+typedef struct {
+    model_t *model;
+    uint32_t sequence, count, camera_count, duration;
+    uint32_t sequence_started, previous_ticks, generation;
+    bool active;
+    bool music_suspended;
+} clModelCinematic_t;
+
+static clModelCinematic_t cl_model_cinematic;
+static uint32_t cl_model_cinematic_generation;
+
+static bool CL_ModelCinematicSequence(uint32_t sequence) {
+    char name[24];
+    uint32_t duration;
+    snprintf(name, sizeof(name), "#%u", sequence);
+    if (!re.GetModelAnimationDuration(cl_model_cinematic.model, name, &duration)) return false;
+    cl_model_cinematic.sequence = sequence;
+    cl_model_cinematic.duration = MAX(1u, duration);
+    cl_model_cinematic.sequence_started = SDL_GetTicks();
+    cl_model_cinematic.previous_ticks = cl_model_cinematic.sequence_started;
+    return true;
+}
+
+static void CL_ModelCinematicClose(void) {
+    if (!cl_model_cinematic.active) return;
+    re.ReleaseEntityCameraEvents((uintptr_t)&cl_model_cinematic);
+    re.ReleaseModel(cl_model_cinematic.model);
+    if (cl_model_cinematic.music_suspended) CL_MusicResumeFromSuspend();
+    memset(&cl_model_cinematic, 0, sizeof(cl_model_cinematic));
+}
+
+bool CL_PlayModelCinematic(cstring_t path) {
+    modelInfo_t info;
+    model_t *model;
+    if (!path || !*path || cl_movie.active) return false;
+    if (cl_model_cinematic.active) CL_ModelCinematicClose();
+    model = re.LoadModel(path);
+    if (!model || !re.GetModelInfo(model, &info) || !info.sequenceCount || !info.cameraCount) {
+        if (model) re.ReleaseModel(model);
+        fprintf(stderr, "WC3 model cinematic: unable to load %s or find sequences/cameras\n", path);
+        CON_printf("Unable to play model cinematic: %s", path);
+        return false;
+    }
+    cl_model_cinematic.model = model;
+    cl_model_cinematic.count = info.sequenceCount;
+    cl_model_cinematic.camera_count = info.cameraCount;
+    cl_model_cinematic.generation = ++cl_model_cinematic_generation;
+    cl_model_cinematic.active = true;
+    /* BZ_COMPAT_GUESS: the Warsmash Arthas/Illidan viewer begins with sequence
+     * 1, but the original engine's generic start rule is undocumented. Start
+     * at 0 for non-specialised assets, and don't loop once the last ends. */
+    if (!CL_ModelCinematicSequence(0)) { CL_ModelCinematicClose(); return false; }
+    /* BZ_COMPAT_GUESS: isolate background gameplay music as for video movies;
+     * model event sounds are still emitted through the normal MDX renderer.
+     * Do not force an unverified Arthas/Illidan soundtrack here. */
+    if (!CL_MusicIsSuspended()) {
+        CL_MusicSuspend();
+        cl_model_cinematic.music_suspended = true;
+    }
+    S_StopAllSounds();
+    return true;
+}
+
+static void CL_ModelCinematicUpdateAt(uint32_t now) {
+    if (!cl_model_cinematic.active) return;
+    /* Use the SDL presentation clock while the server simulation is paused. */
+    while (cl_model_cinematic.active &&
+           now - cl_model_cinematic.sequence_started >= cl_model_cinematic.duration) {
+        uint32_t next_started = cl_model_cinematic.sequence_started + cl_model_cinematic.duration;
+        if (cl_model_cinematic.sequence + 1 >= cl_model_cinematic.count ||
+            !CL_ModelCinematicSequence(cl_model_cinematic.sequence + 1)) {
+            CL_ModelCinematicClose();
+            break;
+        }
+        /* Preserve overshoot when presentation frames are delayed. Resetting
+         * to 'now' would stretch every animation at a low frame rate. */
+        cl_model_cinematic.sequence_started = next_started;
+    }
+}
+
+static void CL_ModelCinematicUpdate(void) {
+    CL_ModelCinematicUpdateAt(SDL_GetTicks());
+}
+
+/* BZ_COMPAT_GUESS: sequence-to-camera correspondence matches the Warsmash
+ * Arthas/Illidan viewer. Clamp the camera for a model with fewer cameras. */
+static uint32_t CL_ModelCinematicCameraIndex(clModelCinematic_t const *cine) {
+    return cine->camera_count ? MIN(cine->sequence, cine->camera_count - 1) : 0;
+}
+
+static void CL_ModelCinematicDraw(void) {
+    clModelCinematic_t *cine = &cl_model_cinematic;
+    rect_t scene = re.GetUISceneRect();
+    renderEntity_t entity = {0};
+    viewDef_t view = {0};
+    char anim[64];
+    uint32_t elapsed;
+    if (!cine->active) return;
+    re.DrawFill(&scene, COLOR32_BLACK);
+    elapsed = MIN(cine->duration, SDL_GetTicks() - cine->sequence_started);
+    snprintf(anim, sizeof(anim), "#%u@%.8f", cine->sequence,
+             (float)elapsed / (float)cine->duration);
+    entity.model = cine->model;
+    entity.scale = 1.0f;
+    entity.instance_id = (uintptr_t)cine;
+    entity.generation = cine->generation;
+    entity.flags = RF_NO_SHADOW | RF_NO_FOGOFWAR;
+    /* BZ_COMPAT_GUESS: the fight model pairs animation and camera indices. */
+    entity.camera_index = CL_ModelCinematicCameraIndex(cine);
+    if (!re.SetEntityAnimFrame(entity.model, anim, &entity)) return;
+    view.viewport = MAKE(rect_t, 0, 0, 1, 1);
+    view.scissor = view.viewport;
+    view.rdflags = RDF_NOWORLDMODEL | RDF_NOFRUSTUMCULL | RDF_NOFOG |
+                   RDF_USE_ENTITY_CAMERA | RDF_ISOLATED_PARTICLES;
+    view.num_entities = 1;
+    view.entities = &entity;
+    view.time = SDL_GetTicks();
+    view.deltaTime = view.time - cine->previous_ticks;
+    cine->previous_ticks = view.time;
+    re.RenderFrame(&view);
+}
+
+
+#ifdef BZ_FFMPEG
+static void CL_MovieReleaseFrames(void) {
+    FOR_LOOP(i, CL_MOVIE_VIDEO_QUEUE) {
+        av_freep(&cl_movie.frames[i].rgba);
+    }
+    cl_movie.frame_head = 0;
+    cl_movie.frame_count = 0;
+}
+
+static void CL_MovieClose(void) {
+    S_StreamStop(S_STREAM_MOVIE);
+    if (cl_movie.music_suspended) CL_MusicResumeFromSuspend();
+    re.DrawCinematicFrame(NULL);
+    CL_MovieReleaseFrames();
+    av_freep(&cl_movie.current_rgba);
+    sws_freeContext(cl_movie.sws);
+    cl_movie.sws = NULL;
+    swr_free(&cl_movie.swr);
+    av_freep(&cl_movie.audio_buffer);
+    cl_movie.audio_buffer_size = 0;
+    av_frame_free(&cl_movie.video_frame);
+    av_frame_free(&cl_movie.audio_frame);
+    av_packet_free(&cl_movie.packet);
+    avcodec_free_context(&cl_movie.video_codec);
+    avcodec_free_context(&cl_movie.audio_codec);
+    avformat_close_input(&cl_movie.format);
+    if (cl_movie.extracted && cl_movie.disk_path[0]) remove(cl_movie.disk_path);
+    memset(&cl_movie, 0, sizeof(cl_movie));
+}
+
+static bool CL_MovieResolveDiskPath(cstring_t path) {
+    if (FS_ResolveLoosePath(path, cl_movie.disk_path, sizeof(cl_movie.disk_path))) {
+        return true;
+    }
+
+    FS_UserPath("openrealm-movie.tmp", cl_movie.disk_path, sizeof(cl_movie.disk_path));
+    remove(cl_movie.disk_path);
+    if (!FS_ExtractFile(path, cl_movie.disk_path)) {
+        cl_movie.disk_path[0] = '\0';
+        return false;
+    }
+    cl_movie.extracted = true;
+    return true;
+}
+
+static bool CL_MovieOpenCodec(int stream_index, AVCodecContext **out) {
+    AVStream *stream;
+    AVCodec const *codec;
+    AVCodecContext *ctx;
+
+    if (stream_index < 0 || !out) return false;
+    stream = cl_movie.format->streams[stream_index];
+    codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!codec) return false;
+    ctx = avcodec_alloc_context3(codec);
+    if (!ctx) return false;
+    if (avcodec_parameters_to_context(ctx, stream->codecpar) < 0 ||
+        avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        return false;
+    }
+    *out = ctx;
+    return true;
+}
+
+static int64_t CL_MovieFrameDuration(void) {
+    AVRational rate = cl_movie.format->streams[cl_movie.video_stream]->avg_frame_rate;
+    if (rate.num > 0 && rate.den > 0) {
+        return MAX(1, av_rescale_q(1, av_inv_q(rate), (AVRational){1, 1000}));
+    }
+    return 40;
+}
+
+static int64_t CL_MovieVideoPtsMs(AVFrame const *frame) {
+    int64_t pts;
+    AVStream *stream = cl_movie.format->streams[cl_movie.video_stream];
+
+    pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = cl_movie.synthetic_video_pts;
+        cl_movie.synthetic_video_pts += cl_movie.frame_duration_ms;
+        return pts;
+    }
+    pts = av_rescale_q(pts, stream->time_base, (AVRational){1, 1000});
+    if (cl_movie.video_pts_origin == AV_NOPTS_VALUE) {
+        cl_movie.video_pts_origin = pts;
+    }
+    pts = MAX((int64_t)0, pts - cl_movie.video_pts_origin);
+    cl_movie.synthetic_video_pts = pts + cl_movie.frame_duration_ms;
+    return pts;
+}
+
+static bool CL_MovieEnsureVideoConversion(AVFrame const *frame) {
+    if (cl_movie.sws) return true;
+    cl_movie.width = (uint32_t)frame->width;
+    cl_movie.height = (uint32_t)frame->height;
+    if (!cl_movie.width || !cl_movie.height) return false;
+    cl_movie.sws = sws_getContext(frame->width, frame->height, (enum AVPixelFormat)frame->format,
+                                  frame->width, frame->height, AV_PIX_FMT_RGBA,
+                                  SWS_BILINEAR, NULL, NULL, NULL);
+    if (!cl_movie.sws) return false;
+    FOR_LOOP(i, CL_MOVIE_VIDEO_QUEUE) {
+        cl_movie.frames[i].rgba = av_malloc((size_t)cl_movie.width * cl_movie.height * 4);
+        if (!cl_movie.frames[i].rgba) return false;
+    }
+    cl_movie.current_rgba = av_malloc((size_t)cl_movie.width * cl_movie.height * 4);
+    if (!cl_movie.current_rgba) return false;
+    return true;
+}
+
+static bool CL_MovieQueueVideoFrame(AVFrame const *frame) {
+    uint32_t index;
+    uint8_t *dst_data[4] = {0};
+    int dst_linesize[4] = {0};
+
+    if (cl_movie.frame_count >= CL_MOVIE_VIDEO_QUEUE) return false;
+    if (!CL_MovieEnsureVideoConversion(frame)) return false;
+    index = (cl_movie.frame_head + cl_movie.frame_count) % CL_MOVIE_VIDEO_QUEUE;
+    dst_data[0] = cl_movie.frames[index].rgba;
+    dst_linesize[0] = (int)cl_movie.width * 4;
+    sws_scale(cl_movie.sws,
+              (uint8_t const *const *)frame->data,
+              frame->linesize,
+              0,
+              frame->height,
+              dst_data,
+              dst_linesize);
+    cl_movie.frames[index].pts_ms = CL_MovieVideoPtsMs(frame);
+    cl_movie.frame_count++;
+    return true;
+}
+
+static bool CL_MovieDrainVideo(void) {
+    int result;
+
+    while (cl_movie.frame_count < CL_MOVIE_VIDEO_QUEUE) {
+        result = avcodec_receive_frame(cl_movie.video_codec, cl_movie.video_frame);
+        if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return true;
+        if (result < 0) return false;
+        if (!CL_MovieQueueVideoFrame(cl_movie.video_frame)) return false;
+        av_frame_unref(cl_movie.video_frame);
+    }
+    return true;
+}
+
+static bool CL_MovieEnsureAudioConversion(AVFrame const *frame) {
+    AVChannelLayout output_layout = AV_CHANNEL_LAYOUT_STEREO;
+    int result;
+
+    if (cl_movie.swr) return true;
+    if (frame->sample_rate <= 0 || frame->ch_layout.nb_channels <= 0) return false;
+    result = swr_alloc_set_opts2(&cl_movie.swr,
+                                 &output_layout,
+                                 AV_SAMPLE_FMT_S16,
+                                 44100,
+                                 &frame->ch_layout,
+                                 (enum AVSampleFormat)frame->format,
+                                 frame->sample_rate,
+                                 0,
+                                 NULL);
+    if (result < 0 || !cl_movie.swr || swr_init(cl_movie.swr) < 0) {
+        swr_free(&cl_movie.swr);
+        return false;
+    }
+    return true;
+}
+
+static bool CL_MovieQueueAudioFrame(AVFrame const *frame) {
+    int output_frames;
+    int required_bytes;
+    int converted;
+    uint8_t *out;
+
+    if (!CL_MovieEnsureAudioConversion(frame)) return false;
+    output_frames = (int)av_rescale_rnd(swr_get_delay(cl_movie.swr, frame->sample_rate) + frame->nb_samples,
+                                        44100,
+                                        frame->sample_rate,
+                                        AV_ROUND_UP);
+    required_bytes = av_samples_get_buffer_size(NULL, 2, output_frames, AV_SAMPLE_FMT_S16, 1);
+    if (required_bytes <= 0) return false;
+    av_fast_malloc(&cl_movie.audio_buffer, &cl_movie.audio_buffer_size, (size_t)required_bytes);
+    if (!cl_movie.audio_buffer) return false;
+    out = cl_movie.audio_buffer;
+    converted = swr_convert(cl_movie.swr,
+                            &out,
+                            output_frames,
+                            (uint8_t const **)frame->extended_data,
+                            frame->nb_samples);
+    if (converted < 0) return false;
+    S_StreamSamples(S_STREAM_MOVIE, (int16_t const *)cl_movie.audio_buffer, (uint32_t)converted);
+    return true;
+}
+
+static bool CL_MovieDrainAudio(void) {
+    int result;
+
+    if (!cl_movie.audio_codec) return true;
+    while (true) {
+        result = avcodec_receive_frame(cl_movie.audio_codec, cl_movie.audio_frame);
+        if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return true;
+        if (result < 0) return false;
+        if (!CL_MovieQueueAudioFrame(cl_movie.audio_frame)) return false;
+        av_frame_unref(cl_movie.audio_frame);
+        if (S_StreamBufferedFrames(S_STREAM_MOVIE) >= CL_MOVIE_AUDIO_TARGET_FRAMES) return true;
+    }
+}
+
+static bool CL_MovieFlushDecoders(void) {
+    if (!cl_movie.video_flushed) {
+        int result = avcodec_send_packet(cl_movie.video_codec, NULL);
+        if (result >= 0 || result == AVERROR_EOF) cl_movie.video_flushed = true;
+    }
+    if (cl_movie.audio_codec && !cl_movie.audio_flushed) {
+        int result = avcodec_send_packet(cl_movie.audio_codec, NULL);
+        if (result >= 0 || result == AVERROR_EOF) cl_movie.audio_flushed = true;
+    }
+    return CL_MovieDrainVideo() && CL_MovieDrainAudio();
+}
+
+static bool CL_MoviePump(void) {
+    int guard = 0;
+
+    if (!CL_MovieDrainVideo() || !CL_MovieDrainAudio()) return false;
+    while (!cl_movie.demux_eof && guard++ < 128) {
+        int result;
+        bool video_ready = cl_movie.frame_count >= CL_MOVIE_VIDEO_QUEUE;
+        bool audio_ready = !cl_movie.audio_codec || S_StreamBufferedFrames(S_STREAM_MOVIE) >= CL_MOVIE_AUDIO_TARGET_FRAMES;
+
+        if (video_ready || (cl_movie.frame_count > 0 && audio_ready)) break;
+        result = av_read_frame(cl_movie.format, cl_movie.packet);
+        if (result < 0) {
+            cl_movie.demux_eof = true;
+            break;
+        }
+        if (cl_movie.packet->stream_index == cl_movie.video_stream) {
+            result = avcodec_send_packet(cl_movie.video_codec, cl_movie.packet);
+            av_packet_unref(cl_movie.packet);
+            if (result < 0 && result != AVERROR(EAGAIN)) return false;
+            if (!CL_MovieDrainVideo()) return false;
+        } else if (cl_movie.packet->stream_index == cl_movie.audio_stream && cl_movie.audio_codec) {
+            result = avcodec_send_packet(cl_movie.audio_codec, cl_movie.packet);
+            av_packet_unref(cl_movie.packet);
+            if (result < 0 && result != AVERROR(EAGAIN)) return false;
+            if (!CL_MovieDrainAudio()) return false;
+        } else {
+            av_packet_unref(cl_movie.packet);
+        }
+    }
+    if (cl_movie.demux_eof) return CL_MovieFlushDecoders();
+    return true;
+}
+
+static void CL_MoviePresentFrames(void) {
+    uint32_t elapsed = SDL_GetTicks() - cl_movie.start_ticks;
+
+    while (cl_movie.frame_count) {
+        clMovieVideoFrame_t *frame = &cl_movie.frames[cl_movie.frame_head];
+        if ((uint32_t)frame->pts_ms > elapsed && cl_movie.current_valid) break;
+        memcpy(cl_movie.current_rgba, frame->rgba, (size_t)cl_movie.width * cl_movie.height * 4);
+        cl_movie.current_valid = true;
+        cl_movie.frame_head = (cl_movie.frame_head + 1) % CL_MOVIE_VIDEO_QUEUE;
+        cl_movie.frame_count--;
+    }
+}
+#endif
+
+void CL_MovieInit(void) {
+    Cmd_AddCommand("playmovie", CL_Movie_f);
+}
+
+/* Cancel presentation without unregistering the playmovie command. Called on
+ * disconnect, session replacement and client shutdown. Session pause and
+ * deferred actions remain owned by cl_main.c, not by this renderer. */
+void CL_MovieCancel(void) {
+    CL_ModelCinematicClose();
+#ifdef BZ_FFMPEG
+    if (cl_movie.active) CL_MovieClose();
+#else
+    memset(&cl_movie, 0, sizeof(cl_movie));
+#endif
+}
+
+void CL_MovieShutdown(void) {
+    Cmd_RemoveCommand("playmovie");
+    CL_MovieCancel();
+}
+
+bool CL_PlayMovie(cstring_t path) {
+#ifndef BZ_FFMPEG
+    CON_printf("Skipping movie %s: playback is disabled in this build (rebuild with FFMPEG=1).", path ? path : "");
+    return false;
+#else
+    AVCodec const *video_decoder;
+    int video_stream;
+    int audio_stream;
+
+    if (!path || !*path) return false;
+    if (cl_movie.active) CL_MovieClose();
+    memset(&cl_movie, 0, sizeof(cl_movie));
+    snprintf(cl_movie.source_path, sizeof(cl_movie.source_path), "%s", path);
+    cl_movie.video_stream = -1;
+    cl_movie.audio_stream = -1;
+    cl_movie.video_pts_origin = AV_NOPTS_VALUE;
+    if (!CL_MovieResolveDiskPath(path)) {
+        CON_printf("Movie not found: %s", path);
+        CL_MovieClose();
+        return false;
+    }
+
+    av_log_set_level(AV_LOG_ERROR);
+    if (avformat_open_input(&cl_movie.format, cl_movie.disk_path, NULL, NULL) < 0 ||
+        avformat_find_stream_info(cl_movie.format, NULL) < 0) {
+        CON_printf("Unable to open movie: %s", path);
+        CL_MovieClose();
+        return false;
+    }
+    video_stream = av_find_best_stream(cl_movie.format, AVMEDIA_TYPE_VIDEO, -1, -1, &video_decoder, 0);
+    if (video_stream < 0 || !CL_MovieOpenCodec(video_stream, &cl_movie.video_codec)) {
+        CON_printf("Movie has no supported video stream: %s", path);
+        CL_MovieClose();
+        return false;
+    }
+    cl_movie.video_stream = video_stream;
+    audio_stream = av_find_best_stream(cl_movie.format, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (audio_stream >= 0 && CL_MovieOpenCodec(audio_stream, &cl_movie.audio_codec)) {
+        cl_movie.audio_stream = audio_stream;
+    }
+    cl_movie.packet = av_packet_alloc();
+    cl_movie.video_frame = av_frame_alloc();
+    cl_movie.audio_frame = av_frame_alloc();
+    if (!cl_movie.packet || !cl_movie.video_frame || !cl_movie.audio_frame) {
+        CL_MovieClose();
+        return false;
+    }
+    cl_movie.frame_duration_ms = CL_MovieFrameDuration();
+    CL_MusicSuspend();
+    cl_movie.music_suspended = true;
+    S_StopAllSounds();
+    S_StreamStart(S_STREAM_MOVIE);
+    cl_movie.start_ticks = SDL_GetTicks();
+    cl_movie.active = true;
+    if (!CL_MoviePump() || cl_movie.frame_count == 0) {
+        CON_printf("Unable to decode movie: %s", path);
+        CL_MovieClose();
+        return false;
+    }
+    CL_MoviePresentFrames();
+    return true;
+#endif
+}
+
+bool CL_MovieActive(void) {
+    return cl_movie.active || cl_model_cinematic.active;
+}
+
+void CL_MovieUpdate(void) {
+    CL_ModelCinematicUpdate();
+#ifdef BZ_FFMPEG
+    if (!cl_movie.active) return;
+    CL_MoviePresentFrames();
+    if (!CL_MoviePump()) {
+        CON_printf("Movie decode failed: %s", cl_movie.source_path);
+        CL_MovieClose();
+        return;
+    }
+    CL_MoviePresentFrames();
+    if (cl_movie.demux_eof && cl_movie.frame_count == 0 && S_StreamBufferedFrames(S_STREAM_MOVIE) == 0) {
+        CL_MovieClose();
+    }
+#endif
+}
+
+void CL_MovieDraw(void) {
+    rect_t scene;
+    rect_t movie;
+    float scene_aspect;
+    float movie_aspect;
+
+    if (cl_model_cinematic.active) { CL_ModelCinematicDraw(); return; }
+    if (!cl_movie.active) return;
+    scene = re.GetUISceneRect();
+    re.DrawFill(&scene, COLOR32_BLACK);
+    if (!cl_movie.current_valid || !cl_movie.width || !cl_movie.height) return;
+
+    size2_t window = re.GetWindowSize();
+    if (!window.width || !window.height) return;
+    scene_aspect = (float)window.width / window.height;
+    movie_aspect = (float)cl_movie.width / (float)cl_movie.height;
+    movie = scene;
+    if (movie_aspect > scene_aspect) {
+        movie.h = scene.h * scene_aspect / movie_aspect;
+        movie.y = scene.y + (scene.h - movie.h) * 0.5f;
+    } else {
+        movie.w = scene.w * movie_aspect / scene_aspect;
+        movie.x = scene.x + (scene.w - movie.w) * 0.5f;
+    }
+    re.DrawCinematicFrame(&MAKE(drawCinematicFrame_t,
+                                .width = cl_movie.width,
+                                .height = cl_movie.height,
+                                .pixels = cl_movie.current_rgba,
+                                .screen = movie));
+}
+
+bool CL_MovieKeyEvent(keyCode_t key, bool down) {
+    if (cl_model_cinematic.active) {
+        if (down && key == K_ESCAPE) CL_ModelCinematicClose();
+        return true;
+    }
+    if (!cl_movie.active) return false;
+    if (down && key == K_ESCAPE) {
+#ifdef BZ_FFMPEG
+        CL_MovieClose();
+#else
+        cl_movie.active = false;
+#endif
+    }
+    return true;
+}
+
+void CL_Movie_f(void) {
+    char path[MAX_PATHLEN];
+    cstring_t arg;
+
+    if (Cmd_Argc() != 2) {
+        CON_printf("usage: playmovie <name-or-path>");
+        return;
+    }
+    arg = Cmd_Argv(1);
+    if (strchr(arg, '/') || strchr(arg, '\\') || strchr(arg, '.')) {
+        snprintf(path, sizeof(path), "%s", arg);
+    } else {
+        snprintf(path, sizeof(path), "Movies\\%s.mpq", arg);
+    }
+    CL_PlayMovie(path);
+}
+
+#ifdef BZ_TESTS
+#include "shared/test.h"
+static rect_t movie_test_rect;
+static size2_t movie_test_window;
+static rect_t CL_MovieTestScene(void) { return MAKE(rect_t, 0, 0, 0.8f, 0.6f); }
+static size2_t CL_MovieTestWindow(void) { return movie_test_window; }
+static void CL_MovieTestFill(rect_t const *rect, color32_t color) { (void)rect; (void)color; }
+static void CL_MovieTestFrame(drawCinematicFrame_t const *frame) { movie_test_rect = frame->screen; }
+/* Test the MDX scene's time/skip state machine without loading retail art or
+ * creating a graphics device. Keep every renderer callback and model state
+ * restored so this test cannot affect other client tests. */
+static uint32_t cinematic_test_model_releases, cinematic_test_event_releases;
+static bool CL_CinematicTestDuration(model_t const *model, cstring_t anim, uint32_t *duration) {
+    (void)model;
+    if (strcmp(anim, "#1") && strcmp(anim, "#2")) return false;
+    *duration = 100;
+    return true;
+}
+static void CL_CinematicTestReleaseModel(model_t *model) {
+    (void)model;
+    cinematic_test_model_releases++;
+}
+static void CL_CinematicTestReleaseEvents(uintptr_t id) {
+    (void)id;
+    cinematic_test_event_releases++;
+}
+TEST(client_movie, model_camera_index_never_exceeds_available_cameras) {
+    clModelCinematic_t cine = { .sequence = 5, .camera_count = 3 };
+    T_EQ(CL_ModelCinematicCameraIndex(&cine), 2u);
+    cine.sequence = 1;
+    T_EQ(CL_ModelCinematicCameraIndex(&cine), 1u);
+    cine.camera_count = 0;
+    T_EQ(CL_ModelCinematicCameraIndex(&cine), 0u);
+}
+TEST(client_movie, model_sequences_preserve_overshoot_and_stop_after_last) {
+    refExport_t saved_re = re;
+    clModelCinematic_t saved_model = cl_model_cinematic;
+    cinematic_test_model_releases = cinematic_test_event_releases = 0;
+    re.GetModelAnimationDuration = CL_CinematicTestDuration;
+    re.ReleaseModel = CL_CinematicTestReleaseModel;
+    re.ReleaseEntityCameraEvents = CL_CinematicTestReleaseEvents;
+    cl_model_cinematic = (clModelCinematic_t){
+        .model = (model_t *)(uintptr_t)1, .active = true,
+        .count = 3, .duration = 100, .sequence_started = 1000
+    };
+    CL_ModelCinematicUpdateAt(1250);
+    T_ASSERT(cl_model_cinematic.active);
+    T_EQ(cl_model_cinematic.sequence, 2u);
+    T_EQ(cl_model_cinematic.sequence_started, 1200u);
+    CL_ModelCinematicUpdateAt(1310);
+    T_ASSERT(!cl_model_cinematic.active);
+    T_EQ(cinematic_test_model_releases, 1u);
+    T_EQ(cinematic_test_event_releases, 1u);
+    re = saved_re;
+    cl_model_cinematic = saved_model;
+}
+TEST(client_movie, model_escape_releases_scene_once) {
+    refExport_t saved_re = re;
+    clModelCinematic_t saved_model = cl_model_cinematic;
+    cinematic_test_model_releases = cinematic_test_event_releases = 0;
+    re.ReleaseModel = CL_CinematicTestReleaseModel;
+    re.ReleaseEntityCameraEvents = CL_CinematicTestReleaseEvents;
+    cl_model_cinematic = (clModelCinematic_t){
+        .model = (model_t *)(uintptr_t)1, .active = true,
+        .count = 2, .duration = 100, .sequence_started = 1000
+    };
+    T_ASSERT(CL_MovieKeyEvent(K_ESCAPE, true));
+    T_ASSERT(!cl_model_cinematic.active);
+    CL_MovieCancel();
+    T_EQ(cinematic_test_model_releases, 1u);
+    T_EQ(cinematic_test_event_releases, 1u);
+    re = saved_re;
+    cl_model_cinematic = saved_model;
+}
+TEST(client_movie, letterboxing_uses_physical_aspect_on_stretched_canvas) {
+    refExport_t saved_re = re;
+    clMovieState_t saved_movie = cl_movie;
+    size2_t windows[] = { {1024,768}, {1920,1200}, {1920,1080}, {3440,1440} };
+    size2_t movies[] = { {640,480}, {1920,1080}, {640,800} };
+    re.GetUISceneRect = CL_MovieTestScene; re.GetWindowSize = CL_MovieTestWindow;
+    re.DrawFill = CL_MovieTestFill; re.DrawCinematicFrame = CL_MovieTestFrame;
+    cl_movie = (clMovieState_t){ .active = true, .current_valid = true };
+    FOR_LOOP(w, sizeof(windows) / sizeof(windows[0])) {
+        movie_test_window = windows[w];
+        FOR_LOOP(m, sizeof(movies) / sizeof(movies[0])) {
+            cl_movie.width = movies[m].width; cl_movie.height = movies[m].height;
+            CL_MovieDraw();
+            float width = movie_test_rect.w / 0.8f * windows[w].width;
+            float height = movie_test_rect.h / 0.6f * windows[w].height;
+            T_FEQ(width / height, (float)movies[m].width / movies[m].height, 0.0001f);
+            T_FEQ(movie_test_rect.x * 2 + movie_test_rect.w, 0.8f, 0.0001f);
+            T_FEQ(movie_test_rect.y * 2 + movie_test_rect.h, 0.6f, 0.0001f);
+            T_ASSERT(movie_test_rect.w <= 0.80001f && movie_test_rect.h <= 0.60001f);
+        }
+    }
+    re = saved_re; cl_movie = saved_movie;
+}
+#endif

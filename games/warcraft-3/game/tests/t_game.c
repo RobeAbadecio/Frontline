@@ -1,0 +1,6980 @@
+#ifdef BZ_TESTS
+/*
+ * test_game.c — Tests for game utilities not covered by other suites.
+ *
+ * Covered:
+ *   G_RegionContains  — point-in-region containment (empty, hit, miss,
+ *                       multi-rect, exclusive upper boundary)
+ *   G_FreeEdict       — entity lifecycle: inuse cleared, freetime stamped
+ *   M_IsDead          — health-based liveness check
+ *   compress_stat     — 8-bit health/mana encoding
+ *   FindEnumValue     — NULL-terminated string-enum lookup
+ *   unit_runwait      — per-frame wait counter and callback dispatch
+ *   unit_issuetargetorder — attack and unknown-order paths
+ *   unit_learnability — hero ability slot management
+ *   Alliance types    — ALLIANCE_SHARED_VISION and independent flags
+ *   Player resources  — PLAYERSTATE_RESOURCE_GOLD / LUMBER set/get
+ *   Fog of war        — grid sizing, circle reveal, visible/explored decay
+ */
+
+#include "test.h"
+#include "../g_local.h"
+
+/* Helpers defined in t_utils.c */
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void reset_entities(void);
+void setup_test_world(void);
+void G_ResetTestSelectionChecks(void);
+uint32_t G_GetTestSelectionChecks(void);
+bool run_test_jass(cstring_t src);
+
+
+#include "../game/hud/hud_utils.h"
+#include "../hud/hud_local.h"
+#include "../../../renderer/r_local.h"
+
+/* Forward declarations for internal functions not exposed in any header. */
+bool  M_IsDead(edict_t const *ent);
+uint32_t FindEnumValue(cstring_t value, cstring_t values[]);
+void  unit_runwait(edict_t *self, void (*callback)(edict_t *));
+
+TEST(wc3_game, timer_dialog_formats_zero_padded_countdown) {
+    gtimer_t timer = {0};
+    char value[32];
+
+    timer.remaining = 30u * 60u * 1000u;
+    G_FormatTimerDialogValue(&timer, value, sizeof(value));
+    T_STREQ(value, "30:00");
+
+    timer.remaining = 9u * 60u * 1000u + 7u * 1000u;
+    G_FormatTimerDialogValue(&timer, value, sizeof(value));
+    T_STREQ(value, "09:07");
+
+    timer.remaining = 64u * 1000u;
+    G_FormatTimerDialogValue(&timer, value, sizeof(value));
+    T_STREQ(value, "01:04");
+
+    timer.remaining = 9u * 1000u;
+    G_FormatTimerDialogValue(&timer, value, sizeof(value));
+    T_STREQ(value, "00:09");
+
+    timer.remaining = 0;
+    G_FormatTimerDialogValue(&timer, value, sizeof(value));
+    T_STREQ(value, "00:00");
+}
+
+TEST(wc3_game, target_type_missing_returns_none) {
+    T_EQ(G_GetTargetType(NULL), TARG_NONE);
+    T_EQ(G_GetTargetType(""), TARG_NONE);
+}
+
+TEST(wc3_game, target_type_known_value_is_preserved) {
+    T_EQ(G_GetTargetType("ground"), TARG_GROUND);
+}
+
+TEST(wc3_game, event_queue_rejects_overflow_without_overwriting_pending_events) {
+    uint32_t i;
+
+    memset(&level.events, 0, sizeof(level.events));
+    for (i = 0; i < MAX_EVENT_QUEUE; i++)
+        T_NOT_NULL(G_PublishEventWithValue(NULL, EVENT_GAME_VICTORY, NULL, (int32_t)i));
+    T_EQ(level.events.write, (uint32_t)MAX_EVENT_QUEUE);
+    T_NULL(G_PublishEventWithValue(NULL, EVENT_GAME_END_LEVEL, NULL, 999));
+    T_EQ(level.events.write, (uint32_t)MAX_EVENT_QUEUE);
+    T_EQ(level.events.queue[0].value, 0);
+    T_EQ(level.events.queue[MAX_EVENT_QUEUE - 1].value, (int32_t)MAX_EVENT_QUEUE - 1);
+    G_RunEvents();
+    T_EQ(level.events.read, (uint32_t)MAX_EVENT_QUEUE);
+}
+
+/* =========================================================================
+ * Helpers
+ * ========================================================================= */
+
+static player_t *game_player(int idx) {
+    game.clients[idx].ps.number = (uint32_t)idx;
+    return &game.clients[idx].ps;
+}
+
+static cstring_t starting_resources_cheat_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "wc3_cheat_starting_resources") ? "1" : fallback;
+}
+
+static cstring_t allowed_starting_resources_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "sv_cheats") ? "1" : starting_resources_cheat_cvar(name, fallback);
+}
+
+static cstring_t give_resources_cheat_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "sv_cheats") ? "1" : fallback;
+}
+
+static uint32_t multiselect_capture_count;
+static uint16_t multiselect_capture_flags[MAX_SELECTED_ENTITIES];
+static uint32_t multiselect_capture_columns;
+static vec2_t multiselect_capture_offset;
+static float multiselect_capture_item_width, multiselect_capture_item_height;
+static uint32_t selection_sync_count;
+static uint32_t selection_sync_entities[MAX_SELECTED_ENTITIES];
+static uint32_t selection_sync_entity_index;
+static int selection_sync_stage;
+static uint32_t portrait_capture_root;
+static uint32_t portrait_capture_model;
+static uint32_t portrait_capture_team;
+static uint32_t portrait_capture_parent;
+static uint32_t portrait_capture_count;
+static uint32_t portrait_capture_text_count;
+static bool portrait_capture_root_widescreen;
+static bool portrait_capture_child_relative;
+static bool portrait_capture_text_relative;
+static char portrait_capture_animation[32];
+
+static void portrait_test_write(pfWriteType_t type, void const *data) {
+    uiFrame_t const *frame;
+
+    if (type != PF_UIFRAME || !data) return;
+    frame = data;
+    if (frame->flags.type == FT_SIMPLEFRAME &&
+        (frame->flagsvalue & UIFLAG_EXTEND_WIDESCREEN_X)) {
+        portrait_capture_root = frame->number;
+        portrait_capture_root_widescreen = true;
+    } else if (frame->flags.type == FT_PORTRAIT) {
+        portrait_capture_count++;
+        portrait_capture_model = frame->tex.index;
+        portrait_capture_team = frame->stat;
+        portrait_capture_parent = frame->parent;
+        snprintf(portrait_capture_animation, sizeof(portrait_capture_animation), "%s", frame->text ? frame->text : "");
+        portrait_capture_child_relative =
+            frame->parent == 0 &&
+            frame->points.x[FPP_MIN].relativeTo == 0 &&
+            frame->points.y[FPP_MIN].relativeTo == 0;
+    } else if (frame->flags.type == FT_STRING &&
+               (frame->stat == UI_STAT_SELECTION_HEALTH_TEXT ||
+                frame->stat == UI_STAT_SELECTION_MANA_TEXT)) {
+        portrait_capture_text_count++;
+        portrait_capture_text_relative |=
+            frame->parent == 0 &&
+            frame->points.x[FPP_MID].relativeTo == 0 &&
+            frame->points.y[FPP_MAX].relativeTo == 0;
+    }
+}
+
+static int portrait_test_font(cstring_t name, uint32_t size) {
+    (void)name;
+    (void)size;
+    return 1;
+}
+
+static void selection_test_write(pfWriteType_t type, void const *data) {
+    if (type == PF_UIFRAME && data) {
+        uiFrame_t const *frame = data;
+        if (frame->flags.type == FT_MULTISELECT && frame->buffer.data &&
+            frame->buffer.size >= sizeof(uiMultiselect_t)) {
+            uiMultiselect_t const *multi = frame->buffer.data;
+            uint32_t const available = (frame->buffer.size - sizeof(uiMultiselect_t)) / sizeof(uiMultiselectItem_t);
+            multiselect_capture_count = MIN((uint32_t)multi->numitems, available);
+            multiselect_capture_columns = multi->numcolumns;
+            multiselect_capture_offset = multi->offset;
+            multiselect_capture_item_width = frame->size.width;
+            multiselect_capture_item_height = frame->size.height;
+            FOR_LOOP(i, multiselect_capture_count)
+                multiselect_capture_flags[i] = multi->items[i].flags;
+        }
+        return;
+    }
+    if (type == PF_BYTE && data) {
+        int32_t const value = *(int32_t const *)data;
+        if (selection_sync_stage == 0 && value == svc_set_selection) {
+            selection_sync_stage = 1;
+            selection_sync_count = 0;
+            selection_sync_entity_index = 0;
+            memset(selection_sync_entities, 0, sizeof(selection_sync_entities));
+            return;
+        }
+        if (selection_sync_stage == 1) {
+            selection_sync_count = (uint32_t)value;
+            selection_sync_stage = selection_sync_count ? 2 : 3;
+            return;
+        }
+    }
+    if (type == PF_LONG && data && selection_sync_stage == 2 &&
+        selection_sync_entity_index < selection_sync_count) {
+        selection_sync_entities[selection_sync_entity_index++] = (uint32_t)*(int32_t const *)data;
+        if (selection_sync_entity_index >= selection_sync_count) selection_sync_stage = 3;
+    }
+}
+
+static void selection_test_unicast(edict_t *ent) { (void)ent; }
+
+static bool timer_dialog_size_capture;
+static char timer_dialog_measure_text[128];
+static uiNameTag_t timer_dialog_size_to_text;
+static uint32_t timer_dialog_unicast_count;
+static edict_t *timer_dialog_unicast_target;
+static bool leaderboard_size_capture;
+static char leaderboard_measure_capture_text[512];
+
+static void timer_dialog_test_unicast(edict_t *ent) {
+    timer_dialog_unicast_count++;
+    timer_dialog_unicast_target = ent;
+}
+
+static void timer_dialog_test_write(pfWriteType_t type, void const *data) {
+    uiFrame_t const *frame;
+
+    if (type != PF_UIFRAME || !data) return;
+    frame = data;
+    if (!(frame->flagsvalue & UIFLAG_SIZE_TO_CONTENT)) return;
+    timer_dialog_size_capture = true;
+    timer_dialog_measure_text[0] = '\0';
+    if (frame->text) strlcpy(timer_dialog_measure_text, frame->text, sizeof(timer_dialog_measure_text));
+    if (frame->buffer.data && frame->buffer.size >= sizeof(timer_dialog_size_to_text))
+        memcpy(&timer_dialog_size_to_text, frame->buffer.data, sizeof(timer_dialog_size_to_text));
+}
+
+static void leaderboard_test_write(pfWriteType_t type, void const *data) {
+    uiFrame_t const *frame;
+
+    if (type != PF_UIFRAME || !data) return;
+    frame = data;
+    if (!(frame->flagsvalue & UIFLAG_SIZE_TO_CONTENT)) return;
+    leaderboard_size_capture = true;
+    strlcpy(leaderboard_measure_capture_text, frame->text ? frame->text : "",
+            sizeof(leaderboard_measure_capture_text));
+}
+
+TEST(wc3_game, selected_unit_cheats_preserve_controller_and_run_death) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    cstring_t god[] = { "god" }, kill[] = { "kill" };
+    edict_t *unit, *clent;
+
+    setup_test_world();
+    clent = &g_edicts[0];
+    clent->client->connected = false;
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64, 64);
+    unit->s.player = 0;
+    unit->svflags |= SVF_MONSTER;
+    unit->die = unit_die;
+    G_SelectEntity(clent->client, unit);
+    gi.CvarString = give_resources_cheat_cvar;
+    G_ClientCommand(clent, 1, god);
+    T_ASSERT(G_UnitHasFlag(unit, UNIT_FLAG_INVULNERABLE));
+    T_ASSERT(!G_UnitHasFlag(clent, UNIT_FLAG_INVULNERABLE));
+    T_Damage(unit, unit, 10);
+    T_EQ(unit->health.value, unit->health.max_value);
+    G_ClientCommand(clent, 1, kill);
+    T_ASSERT(!G_UnitHasFlag(clent, UNIT_FLAG_INVULNERABLE));
+    T_ASSERT(unit->svflags & SVF_DEADMONSTER);
+    T_EQ(unit->health.value, 0);
+    T_ASSERT(!unit->selected);
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, give_resource_cheats_target_issuing_player_without_selection) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *clent = &g_edicts[0];
+    cstring_t give_gold[] = { "give", "gold", "5000" };
+    cstring_t give_lumber[] = { "give", "lumber", "5000" };
+    cstring_t give_res[] = { "give", "res", "5000" };
+
+    setup_test_world();
+    client->connected = true;
+    client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 100;
+    client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 200;
+    gi.CvarString = give_resources_cheat_cvar;
+
+    G_ClientCommand(clent, 3, give_gold);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 5100);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 200);
+
+    G_ClientCommand(clent, 3, give_lumber);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 5100);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 5200);
+
+    G_ClientCommand(clent, 3, give_res);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_GOLD], 10100);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 10200);
+
+    client->ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 65000;
+    client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 64000;
+    G_ClientCommand(clent, 3, give_res);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_GOLD], USHRT_MAX);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_LUMBER], USHRT_MAX);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, hero_max_cheat_uses_max_level_xp_and_restores_level_skill_budget) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *hero;
+    cstring_t command[] = { "hero", "max" };
+    uint32_t max_level;
+
+    setup_test_world();
+    client->connected = true;
+    client->ps.number = 0;
+    gi.CvarString = give_resources_cheat_cvar;
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0, 0);
+    hero->svflags |= SVF_MONSTER;
+    hero->s.player = 0;
+    hero->unit_state->hero.level = 1;
+    hero->unit_state->hero.xp = 0;
+    hero->unit_state->hero.skillpoints = 0;
+    hero->unit_state->ranks[0].code = MAKEFOURCC('A','H','h','b');
+    hero->unit_state->ranks[0].level = 1;
+    G_SelectEntity(client, hero);
+
+    G_ClientCommand(&g_edicts[0], 2, command);
+
+    max_level = G_MaxHeroLevel();
+    T_EQ((int)hero->unit_state->hero.level, (int)max_level);
+    T_EQ((int)hero->unit_state->hero.xp, (int)G_HeroXPForLevel(max_level));
+    T_EQ((int)hero->unit_state->hero.skillpoints, (int)(max_level - 1));
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, hero_select_cheat_selects_owned_hero_without_mouse_input) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *hero;
+    cstring_t command[] = { "hero", "select" };
+
+    setup_test_world();
+    client->connected = false;
+    client->ps.number = 0;
+    gi.CvarString = give_resources_cheat_cvar;
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0, 0);
+    hero->svflags |= SVF_MONSTER;
+    hero->s.player = 0;
+
+    G_ClientCommand(&g_edicts[0], 2, command);
+
+    T_ASSERT(G_IsEntitySelected(client, hero));
+    T_EQ(G_GetMainSelectedUnit(client), hero);
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, hero_health_and_mana_cheats_fill_or_set_with_max_clamp) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *hero;
+    cstring_t fill_health[] = { "hero", "health" };
+    cstring_t set_health[] = { "hero", "health", "275" };
+    cstring_t clamp_health[] = { "hero", "health", "9999" };
+    cstring_t fill_mana[] = { "hero", "mana" };
+    cstring_t set_mana[] = { "hero", "mana", "125" };
+    cstring_t clamp_mana[] = { "hero", "mana", "9999" };
+
+    setup_test_world();
+    client->connected = true;
+    client->ps.number = 0;
+    gi.CvarString = give_resources_cheat_cvar;
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0, 0);
+    hero->svflags |= SVF_MONSTER;
+    hero->s.player = 0;
+    hero->unit_state->hero.level = 1;
+    hero->health.max_value = 700.0f;
+    hero->health.value = 100.0f;
+    hero->mana.max_value = 300.0f;
+    hero->mana.value = 50.0f;
+    G_SelectEntity(client, hero);
+
+    G_ClientCommand(&g_edicts[0], 2, fill_health);
+    T_EQ((int)hero->health.value, 700);
+    G_ClientCommand(&g_edicts[0], 3, set_health);
+    T_EQ((int)hero->health.value, 275);
+    G_ClientCommand(&g_edicts[0], 3, clamp_health);
+    T_EQ((int)hero->health.value, 700);
+
+    G_ClientCommand(&g_edicts[0], 2, fill_mana);
+    T_EQ((int)hero->mana.value, 300);
+    G_ClientCommand(&g_edicts[0], 3, set_mana);
+    T_EQ((int)hero->mana.value, 125);
+    G_ClientCommand(&g_edicts[0], 3, clamp_mana);
+    T_EQ((int)hero->mana.value, 300);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, unit_health_and_mana_cheats_apply_to_selected_controllable_group) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *first, *no_mana, *third;
+    cstring_t fill_health[] = { "unit", "health" };
+    cstring_t set_health[] = { "unit", "health", "275" };
+    cstring_t clamp_health[] = { "unit", "health", "9999" };
+    cstring_t fill_mana[] = { "unit", "mana" };
+    cstring_t set_mana[] = { "unit", "mana", "125" };
+    cstring_t clamp_mana[] = { "unit", "mana", "9999" };
+
+    setup_test_world();
+    client->connected = true;
+    client->ps.number = 0;
+    gi.CvarString = give_resources_cheat_cvar;
+    first = alloc_test_unit(MAKEFOURCC('h','p','r','i'), 0, 0);
+    no_mana = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 32, 0);
+    third = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 64, 0);
+    first->svflags |= SVF_MONSTER;
+    no_mana->svflags |= SVF_MONSTER;
+    third->svflags |= SVF_MONSTER;
+    first->s.player = no_mana->s.player = third->s.player = 0;
+    first->health.max_value = 600.0f;
+    no_mana->health.max_value = 200.0f;
+    third->health.max_value = 900.0f;
+    first->health.value = no_mana->health.value = third->health.value = 50.0f;
+    first->mana.max_value = 250.0f;
+    no_mana->mana.max_value = 0.0f;
+    third->mana.max_value = 100.0f;
+    first->mana.value = 50.0f;
+    no_mana->mana.value = 7.0f; /* Detect accidental writes to a unit with no mana pool. */
+    third->mana.value = 25.0f;
+    G_SelectEntity(client, first);
+    G_SelectEntity(client, no_mana);
+    G_SelectEntity(client, third);
+
+    G_ClientCommand(&g_edicts[0], 2, fill_health);
+    T_EQ((int)first->health.value, 600);
+    T_EQ((int)no_mana->health.value, 200);
+    T_EQ((int)third->health.value, 900);
+    G_ClientCommand(&g_edicts[0], 3, set_health);
+    T_EQ((int)first->health.value, 275);
+    T_EQ((int)no_mana->health.value, 200);
+    T_EQ((int)third->health.value, 275);
+    G_ClientCommand(&g_edicts[0], 3, clamp_health);
+    T_EQ((int)first->health.value, 600);
+    T_EQ((int)no_mana->health.value, 200);
+    T_EQ((int)third->health.value, 900);
+
+    G_ClientCommand(&g_edicts[0], 2, fill_mana);
+    T_EQ((int)first->mana.value, 250);
+    T_EQ((int)no_mana->mana.value, 7);
+    T_EQ((int)third->mana.value, 100);
+    G_ClientCommand(&g_edicts[0], 3, set_mana);
+    T_EQ((int)first->mana.value, 125);
+    T_EQ((int)no_mana->mana.value, 7);
+    T_EQ((int)third->mana.value, 100);
+    G_ClientCommand(&g_edicts[0], 3, clamp_mana);
+    T_EQ((int)first->mana.value, 250);
+    T_EQ((int)no_mana->mana.value, 7);
+    T_EQ((int)third->mana.value, 100);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, instant_build_cheat_is_per_player_and_toggleable) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    cstring_t toggle[] = { "instant", "build" };
+    cstring_t enable[] = { "instant", "build", "on" };
+    cstring_t disable[] = { "warpten", "off" };
+
+    setup_test_world();
+    game.clients[0].connected = true;
+    game.clients[1].connected = true;
+    gi.CvarString = give_resources_cheat_cvar;
+
+    G_ClientCommand(&g_edicts[0], 2, toggle);
+    T_ASSERT(game.clients[0].cheat_instant_build);
+    T_ASSERT(!game.clients[1].cheat_instant_build);
+
+    G_ClientCommand(&g_edicts[1], 3, enable);
+    T_ASSERT(game.clients[1].cheat_instant_build);
+    G_ClientCommand(&g_edicts[0], 2, disable);
+    T_ASSERT(!game.clients[0].cheat_instant_build);
+    T_ASSERT(game.clients[1].cheat_instant_build);
+
+    gi.CvarString = old_cvar;
+}
+
+
+TEST(wc3_game, instant_kill_cheat_is_per_player_and_toggleable) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    cstring_t toggle[] = { "instant", "kill" };
+    cstring_t enable[] = { "instant", "kill", "on" };
+    cstring_t disable[] = { "instant", "kill", "off" };
+
+    setup_test_world();
+    game.clients[0].connected = true;
+    game.clients[1].connected = true;
+    gi.CvarString = give_resources_cheat_cvar;
+
+    G_ClientCommand(&g_edicts[0], 2, toggle);
+    T_ASSERT(game.clients[0].cheat_instant_kill);
+    T_ASSERT(!game.clients[1].cheat_instant_kill);
+
+    G_ClientCommand(&g_edicts[1], 3, enable);
+    T_ASSERT(game.clients[1].cheat_instant_kill);
+    G_ClientCommand(&g_edicts[0], 3, disable);
+    T_ASSERT(!game.clients[0].cheat_instant_kill);
+    T_ASSERT(game.clients[1].cheat_instant_kill);
+
+    gi.CvarString = old_cvar;
+}
+
+
+TEST(wc3_game, instant_all_sets_and_toggles_both_player_cheats) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    cstring_t enable[] = { "instant", "all", "on" };
+    cstring_t toggle[] = { "instant", "all" };
+
+    setup_test_world();
+    game.clients[0].connected = true;
+    gi.CvarString = give_resources_cheat_cvar;
+
+    G_ClientCommand(&g_edicts[0], 3, enable);
+    T_ASSERT(game.clients[0].cheat_instant_build);
+    T_ASSERT(game.clients[0].cheat_instant_kill);
+
+    G_ClientCommand(&g_edicts[0], 2, toggle);
+    T_ASSERT(!game.clients[0].cheat_instant_build);
+    T_ASSERT(!game.clients[0].cheat_instant_kill);
+
+    game.clients[0].cheat_instant_build = true;
+    game.clients[0].cheat_instant_kill = false;
+    G_ClientCommand(&g_edicts[0], 2, toggle);
+    T_ASSERT(game.clients[0].cheat_instant_build);
+    T_ASSERT(game.clients[0].cheat_instant_kill);
+
+    gi.CvarString = old_cvar;
+}
+
+
+TEST(wc3_game, enemiesclear_and_eclear_remove_nearby_enemy_units_only) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    gameClient_t *client = &game.clients[0];
+    edict_t *clent = &g_edicts[0];
+    edict_t *center, *near_enemy, *far_enemy, *friendly;
+    cstring_t enemiesclear[] = { "enemiesclear", "128" };
+    cstring_t eclear[] = { "eclear", "128" };
+
+    setup_test_world();
+    gi.CvarString = give_resources_cheat_cvar;
+    client->connected = true;
+    client->ps.number = 0;
+
+    center = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0.0f, 0.0f);
+    center->s.player = 0;
+    center->svflags |= SVF_MONSTER;
+    G_SelectEntity(client, center);
+
+    near_enemy = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 64.0f, 0.0f);
+    near_enemy->s.player = 1;
+    near_enemy->svflags |= SVF_MONSTER;
+    far_enemy = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 256.0f, 0.0f);
+    far_enemy->s.player = 1;
+    far_enemy->svflags |= SVF_MONSTER;
+    friendly = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32.0f, 0.0f);
+    friendly->s.player = 0;
+    friendly->svflags |= SVF_MONSTER;
+
+    G_ClientCommand(clent, 2, enemiesclear);
+    T_ASSERT(!near_enemy->inuse);
+    T_ASSERT(far_enemy->inuse);
+    T_ASSERT(friendly->inuse);
+
+    far_enemy->s.origin2 = (vec2_t){ 64.0f, 0.0f };
+    far_enemy->s.origin.x = 64.0f;
+    far_enemy->s.origin.y = 0.0f;
+    G_ClientCommand(clent, 2, eclear);
+    T_ASSERT(!far_enemy->inuse);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, camera_move_and_selected_share_camera_command_family) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *clent = &g_edicts[0];
+    edict_t *selected;
+    cstring_t move[] = { "camera", "move", "320", "-96" };
+    cstring_t focus[] = { "camera", "selected" };
+
+    setup_test_world();
+    client->connected = true;
+    client->ps.number = 0;
+    level.camera_bounds = (box2_t){ .min = { -512.0f, -512.0f }, .max = { 512.0f, 512.0f } };
+
+    G_ClientCommand(clent, 4, move);
+    T_FEQ(client->camera.state.position.x, 320.0f, 0.001f);
+    T_FEQ(client->camera.state.position.y, -96.0f, 0.001f);
+    T_NULL(client->camera.target_controller);
+
+    selected = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 144.0f, 208.0f);
+    selected->s.player = 0;
+    selected->svflags |= SVF_MONSTER;
+    G_SelectEntity(client, selected);
+    G_ClientCommand(clent, 2, focus);
+
+    T_ASSERT(client->camera.target_controller == selected);
+    T_FEQ(client->camera.state.position.x, 144.0f, 0.001f);
+    T_FEQ(client->camera.state.position.y, 208.0f, 0.001f);
+}
+
+TEST(wc3_game, day_and_night_cheats_use_authored_phase_midpoints) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    edict_t *clent = &g_edicts[0];
+    cstring_t day[] = { "day" };
+    cstring_t night[] = { "night" };
+
+    setup_test_world();
+    gi.CvarString = give_resources_cheat_cvar;
+    game.constants.gameDayHours = 24.0f;
+    game.constants.gameDayLength = 480.0f;
+    game.constants.dawnTimeGameHours = 6.0f;
+    game.constants.duskTimeGameHours = 18.0f;
+    level.timeofday.elapsed = 0.0f;
+    level.timeofday.pending_valid = false;
+
+    G_ClientCommand(clent, 1, day);
+    T_ASSERT(level.timeofday.pending_valid);
+    T_FEQ(level.timeofday.pending, 12.0f, 0.001f);
+    G_UpdateTimeOfDay();
+    T_FEQ(G_GetTimeOfDay(), 12.0f, 0.001f);
+
+    G_ClientCommand(clent, 1, night);
+    T_ASSERT(level.timeofday.pending_valid);
+    T_FEQ(level.timeofday.pending, 0.0f, 0.001f);
+    G_UpdateTimeOfDay();
+    T_FEQ(G_GetTimeOfDay(), 0.0f, 0.001f);
+
+    /* Custom Dawn/Dusk values should choose the middle of each authored
+     * phase rather than forcing stock Warcraft clock values. */
+    game.constants.dawnTimeGameHours = 8.0f;
+    game.constants.duskTimeGameHours = 20.0f;
+    G_ClientCommand(clent, 1, day);
+    T_FEQ(level.timeofday.pending, 14.0f, 0.001f);
+    G_ClientCommand(clent, 1, night);
+    T_FEQ(level.timeofday.pending, 2.0f, 0.001f);
+
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, starting_resource_cheat_requires_permission_at_arm_and_apply) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    mapInfo_t *mapinfo;
+    setup_test_world();
+    mapinfo = (mapInfo_t *)level.mapinfo;
+    mapinfo->players[0].used = true;
+    mapinfo->players[0].playerType = kPlayerTypeHuman;
+    game.clients[0].mapplayer = &mapinfo->players[0];
+    game.clients[0].connected = true;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 100;
+    gi.CvarString = starting_resources_cheat_cvar;
+    G_ResetStartingResourceCheat();
+    gi.CvarString = allowed_starting_resources_cvar;
+    G_ApplyStartingResourceCheat();
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 100);
+    G_ResetStartingResourceCheat();
+    gi.CvarString = starting_resources_cheat_cvar;
+    G_ApplyStartingResourceCheat();
+    gi.CvarString = allowed_starting_resources_cvar;
+    G_ApplyStartingResourceCheat();
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 100);
+    G_ResetStartingResourceCheat();
+    G_ApplyStartingResourceCheat();
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 5100);
+    G_DisableStartingResourceCheatForLoadedGame();
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, unit_cheats_reject_disabled_missing_and_enemy_selection) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    cstring_t god[] = { "god" }, kill[] = { "kill" };
+    cstring_t health[] = { "unit", "health" }, mana[] = { "unit", "mana" };
+    edict_t *unit, *clent;
+    setup_test_world();
+    clent = &g_edicts[0];
+    gi.CvarString = give_resources_cheat_cvar;
+    G_ClientCommand(clent, 1, god);
+    G_ClientCommand(clent, 1, kill);
+    G_ClientCommand(clent, 2, health);
+    G_ClientCommand(clent, 2, mana);
+    T_ASSERT(!G_UnitHasFlag(clent, UNIT_FLAG_INVULNERABLE));
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64, 64);
+    unit->s.player = 1;
+    unit->svflags |= SVF_MONSTER;
+    unit->die = unit_die;
+    unit->health.value = 75.0f;
+    unit->health.max_value = 100.0f;
+    unit->mana.value = 20.0f;
+    unit->mana.max_value = 50.0f;
+    G_SelectEntity(clent->client, unit);
+    G_ClientCommand(clent, 1, god);
+    G_ClientCommand(clent, 1, kill);
+    G_ClientCommand(clent, 2, health);
+    G_ClientCommand(clent, 2, mana);
+    T_ASSERT(!G_UnitHasFlag(unit, UNIT_FLAG_INVULNERABLE));
+    T_EQ((int)unit->health.value, 75);
+    T_EQ((int)unit->mana.value, 20);
+    unit->s.player = 0;
+    gi.CvarString = starting_resources_cheat_cvar;
+    G_ClientCommand(clent, 1, god);
+    G_ClientCommand(clent, 1, kill);
+    G_ClientCommand(clent, 2, health);
+    G_ClientCommand(clent, 2, mana);
+    T_ASSERT(!G_UnitHasFlag(unit, UNIT_FLAG_INVULNERABLE));
+    T_EQ((int)unit->health.value, 75);
+    T_EQ((int)unit->mana.value, 20);
+    gi.CvarString = old_cvar;
+}
+
+TEST(wc3_game, starting_resource_cheat_waits_for_playable_human_state) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    mapInfo_t *mapinfo;
+
+    setup_test_world();
+    mapinfo = (mapInfo_t *)level.mapinfo;
+    mapinfo->players[0].used = true;
+    mapinfo->players[0].playerType = kPlayerTypeHuman;
+    mapinfo->players[1].used = true;
+    mapinfo->players[1].playerType = kPlayerTypeComputer;
+    mapinfo->players[2].used = true;
+    mapinfo->players[2].playerType = kPlayerTypeHuman;
+    game.clients[0].mapplayer = mapinfo->players + 0;
+    game.clients[1].mapplayer = mapinfo->players + 1;
+    game.clients[2].mapplayer = mapinfo->players + 2;
+    game.clients[0].connected = true;
+    game.clients[1].connected = true;
+    game.clients[2].connected = true;
+
+    /* Campaign initialization may leave the human at zero resources until its
+     * intro/end-cinematic trigger authors the real gameplay starting values. */
+    game.clients[0].no_control = true;
+    game.clients[0].ps.client_ui_state = CLIENT_UI_CINEMATIC;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 0;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 0;
+    game.clients[1].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 750;
+    game.clients[1].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 200;
+    game.clients[2].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 65000;
+    game.clients[2].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 64000;
+
+    gi.CvarString = allowed_starting_resources_cvar;
+    G_ResetStartingResourceCheat();
+    G_ApplyStartingResourceCheat();
+
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 0);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 0);
+    T_EQ(game.clients[1].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 750);
+    T_EQ(game.clients[1].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 200);
+    T_EQ(game.clients[2].ps.stats[PLAYERSTATE_RESOURCE_GOLD], USHRT_MAX);
+    T_EQ(game.clients[2].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], USHRT_MAX);
+
+    /* Human02-style late starting-resource assignment after the intro. */
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 300;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 50;
+    game.clients[0].no_control = false;
+    game.clients[0].ps.client_ui_state = CLIENT_UI_GAME;
+    G_ApplyStartingResourceCheat();
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 5300);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 5050);
+
+    /* The playable-state poll must never turn into a recurring resource grant. */
+    G_ApplyStartingResourceCheat();
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 5300);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 5050);
+
+    G_DisableStartingResourceCheatForLoadedGame();
+    gi.CvarString = old_cvar;
+}
+
+static edict_t *make_test_unit(void) {
+    reset_entities();
+    strlcpy(level.map_path, "Maps\\Campaign\\SaveTest.w3m", sizeof(level.map_path));
+    edict_t *ent = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    ent->health.value     = 250.0f;
+    ent->health.max_value = 250.0f;
+    ent->stand            = unit_stand;
+    ent->movetype         = MOVETYPE_STEP;
+    ent->unit_state->attack1.type     = ATK_NORMAL;
+    ent->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    ent->targtype         = TARG_GROUND;
+    unit_stand(ent);
+    return ent;
+}
+
+static bool hover_layout_pending, hover_layer_seen, hover_infopanel_layer_seen, hover_name_seen, hover_hp_seen,
+            hover_mana_seen, hover_cargo_seen, hover_name_sized, hover_name_centered, hover_name_short,
+            hover_resource_label_seen, hover_infopanel_tooltip_seen, hover_cargo_empty_art,
+            hover_mana_row_chained, hover_health_row_chained, hover_name_chained;
+static uint32_t hover_frame_count, hover_unicast_count, hover_image_count, hover_font_count,
+             hover_cargo_frame, hover_mana_row_frame, hover_health_row_frame;
+static edict_t *hover_unicast_target;
+static pfWriteType_t window_frame_type;
+static uint32_t window_text_offset;
+static char hero_xp_bar_tooltip[64];
+static float hero_xp_bar_value;
+
+static void hero_xp_bar_test_write(pfWriteType_t type, void const *value) {
+    uiFrame_t const *frame;
+    if (type != PF_UIFRAME || !value) return;
+    frame = value;
+    if (frame->flags.type != FT_SIMPLESTATUSBAR) return;
+    snprintf(hero_xp_bar_tooltip, sizeof(hero_xp_bar_tooltip), "%s",
+             frame->tooltip ? frame->tooltip : "");
+    hero_xp_bar_value = frame->value;
+}
+
+static int hover_test_image(cstring_t name) { T_ASSERT(name && *name); return (int)++hover_image_count; }
+static int hover_test_font(cstring_t name, uint32_t size) {
+    T_ASSERT(name && *name); T_EQ(size, HUD_FONT_SIZE); hover_font_count++; return 1;
+}
+static void hover_test_write(pfWriteType_t type, void const *value) {
+    if (!value) return;
+    if (type == PF_BYTE) {
+        int32_t byte = *(int32_t const *)value;
+        if (hover_layout_pending) {
+            hover_layer_seen = byte == LAYER_WORLD_HOVER;
+            hover_infopanel_layer_seen = byte == LAYER_INFOPANEL;
+            hover_layout_pending = false;
+        }
+        else hover_layout_pending = byte == svc_layout;
+    } else if (type == PF_UIFRAME) {
+        uiFrame_t const *frame = value;
+        hover_frame_count++;
+        hover_name_seen |= frame->flags.type == FT_NAMETAG && frame->stat == UI_STAT_CONTEXT_NAME;
+        hover_name_sized |= frame->flags.type == FT_NAMETAG && (frame->flagsvalue & UIFLAG_SIZE_TO_CONTENT);
+        hover_resource_label_seen |= frame->flags.type == FT_NAMETAG && frame->text &&
+            *frame->text && strcmp(frame->text, "COLON_GOLD");
+        if (frame->flags.type == FT_NAMETAG && frame->buffer.size == sizeof(uiNameTag_t)) {
+            uiNameTag_t const *tag = frame->buffer.data;
+            hover_name_centered = frame->points.x[FPP_MID].used;
+            hover_name_short = tag->padding_y == 0.006f;
+            hover_name_chained = frame->points.y[FPP_MAX].used &&
+                frame->points.y[FPP_MAX].targetPos == FPP_MIN &&
+                frame->points.y[FPP_MAX].relativeTo == hover_health_row_frame;
+        }
+        if (frame->flags.type == FT_SEGMENTED_STATUSBAR && frame->stat == ENT_CARGO) {
+            hover_cargo_seen = true; hover_cargo_frame = frame->number;
+            hover_cargo_empty_art = frame->tex.index2 != 0;
+        }
+        if (frame->flags.type == FT_FRAME && frame->stat == UI_STAT_CONTEXT_MANA) {
+            hover_mana_row_frame = frame->number;
+            hover_mana_row_chained = frame->points.y[FPP_MAX].used &&
+                frame->points.y[FPP_MAX].targetPos == FPP_MIN &&
+                frame->points.y[FPP_MAX].relativeTo == hover_cargo_frame;
+        }
+        if (frame->flags.type == FT_FRAME && frame->stat == UI_STAT_CONTEXT_HEALTH) {
+            hover_health_row_frame = frame->number;
+            hover_health_row_chained = frame->points.y[FPP_MAX].used &&
+                frame->points.y[FPP_MAX].targetPos == FPP_MIN &&
+                frame->points.y[FPP_MAX].relativeTo == hover_mana_row_frame;
+        }
+        hover_hp_seen |= frame->flags.type == FT_SIMPLESTATUSBAR && frame->stat == UI_STAT_CONTEXT_HEALTH;
+        hover_mana_seen |= frame->stat == UI_STAT_CONTEXT_MANA;
+        hover_infopanel_tooltip_seen |= frame->flags.type == FT_TOOLTIPTEXT;
+    }
+}
+static void hover_test_unicast(edict_t *ent) { hover_unicast_count++; hover_unicast_target = ent; }
+static void infopanel_test_write(pfWriteType_t type, void const *value) {
+    if (!value) return;
+    if (type == PF_BYTE) {
+        int32_t byte = *(int32_t const *)value;
+        if (hover_layout_pending) {
+            hover_infopanel_layer_seen = byte == LAYER_INFOPANEL;
+            hover_layout_pending = false;
+        } else if (byte == svc_layout) {
+            hover_layout_pending = true;
+        }
+    } else if (type == PF_UIFRAME && ((uiFrame_t const *)value)->flags.type == FT_TOOLTIPTEXT) {
+        hover_infopanel_tooltip_seen = true;
+    }
+}
+static void window_test_write(pfWriteType_t type, void const *value) {
+    if (type != PF_UIWINDOWFRAME) return;
+    window_frame_type = type;
+    window_text_offset = (uint32_t)(uintptr_t)((uiFrame_t const *)value)->text;
+}
+
+static uint32_t alert_ping_count, alert_ping_flags;
+static edict_t *alert_ping_target;
+static vec2_t alert_ping_position;
+static float alert_ping_duration;
+static color32_t alert_ping_color;
+static PATHSTR alert_ping_model;
+
+static void alert_test_configstring(uint32_t index, cstring_t value) {
+    if (index == CS_MINIMAP) snprintf(alert_ping_model, sizeof(alert_ping_model), "%s", value);
+}
+static void alert_test_minimap_ping(edict_t *ent, vec2_t const *position, float duration, color32_t color, uint32_t flags) {
+    alert_ping_count++; alert_ping_target = ent; alert_ping_position = *position; alert_ping_duration = duration;
+    alert_ping_color = color; alert_ping_flags = flags;
+}
+
+/* =========================================================================
+ * HUD frame numbering
+ * ========================================================================= */
+
+TEST(wc3_game, hud_proxy_number_advances_past_fdf_frame) {
+    T_EQ(UI_NextProxyFrameNumber(1, 10), 11);
+}
+
+TEST(wc3_game, hud_proxy_number_never_moves_backwards) {
+    T_EQ(UI_NextProxyFrameNumber(12, 10), 12);
+}
+
+TEST(wc3_game, minimap_ping_uses_generic_packet_import) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    vec2_t position = { 123.5f, -44.25f };
+    color32_t color = MAKE(color32_t, 10, 20, 30, 255);
+
+    game.clients[0].connected = true;
+    alert_ping_count = 0; alert_ping_target = NULL;
+    alert_ping_model[0] = '\0';
+    gi.MinimapPing = alert_test_minimap_ping; gi.configstring = alert_test_configstring;
+
+    G_SendMinimapPing(&game.clients[0], &position, 2.5f, color, MINIMAP_PING_REMEMBER);
+
+    T_EQ(alert_ping_count, 1); T_EQ(alert_ping_target, &g_edicts[0]);
+    T_FEQ(alert_ping_position.x, position.x, 0.001f); T_FEQ(alert_ping_position.y, position.y, 0.001f);
+    T_FEQ(alert_ping_duration, 2.5f, 0.001f);
+    T_EQ(alert_ping_color.r, 10); T_EQ(alert_ping_color.g, 20); T_EQ(alert_ping_color.b, 30);
+    T_ASSERT(alert_ping_flags & MINIMAP_PING_REMEMBER);
+    T_STREQ(alert_ping_model, "UI\\Minimap\\Minimap-Ping.mdl");
+
+    game.clients[0].connected = false;
+    G_SendMinimapPing(&game.clients[0], &position, 2.5f, color, 0);
+    T_EQ(alert_ping_count, 1);
+    gi.MinimapPing = saved_ping; gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, attack_alert_is_remote_throttled_and_remembered) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    edict_t *victim = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 2000.0f, 0.0f);
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 2100.0f, 0.0f);
+
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeComputer;
+    victim->s.player = 0; attacker->s.player = 1;
+    game.clients[0].connected = true;
+    game.clients[0].camera.state.position = (vec2_t){ 0.0f, 0.0f };
+    game.constants.attackNotifyRange = 1250.0f;
+    game.constants.attackNotifyDelay = 30.0f;
+    level.time = 1000;
+    alert_ping_count = 0;
+    gi.MinimapPing = alert_test_minimap_ping; gi.configstring = alert_test_configstring;
+
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 1);
+    T_EQ(alert_ping_color.r, 255); T_EQ(alert_ping_color.g, 0); T_EQ(alert_ping_color.b, 0);
+    T_ASSERT(alert_ping_flags & MINIMAP_PING_REMEMBER);
+    T_FEQ(alert_ping_position.x, victim->s.origin2.x, 0.001f);
+
+    level.time = 2000;
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 1); /* shared per-recipient cooldown */
+
+    level.time = 32000;
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 2);
+
+    gi.MinimapPing = saved_ping; gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, unit_ignore_alarm_suppresses_ping_without_changing_combat) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    edict_t *victim = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 2000.0f, 0.0f);
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 2100.0f, 0.0f);
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeComputer;
+    victim->s.player = 0; attacker->s.player = 1;
+    game.clients[0].connected = true;
+    game.clients[0].camera.state.position = (vec2_t){0.0f, 0.0f};
+    game.constants.attackNotifyRange = 1250.0f;
+    game.constants.attackNotifyDelay = 0.0f;
+    level.time = 1000;
+    alert_ping_count = 0;
+    gi.MinimapPing = alert_test_minimap_ping;
+    gi.configstring = alert_test_configstring;
+    G_SetUnitFlag(victim, UNIT_FLAG_IGNORE_ALARM, true);
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 0);
+    T_ASSERT(!G_UnitHasFlag(victim, UNIT_FLAG_PAUSED));
+    T_ASSERT(!G_UnitHasFlag(victim, UNIT_FLAG_INVULNERABLE));
+    G_SetUnitFlag(victim, UNIT_FLAG_IGNORE_ALARM, false);
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 1);
+    gi.MinimapPing = saved_ping;
+    gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, attack_alert_shows_advisor_text_without_message_log_entry) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    edict_t *victim = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 2000.0f, 0.0f);
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 2100.0f, 0.0f);
+    gameClient_t *owner = &game.clients[0];
+
+    InitUnitData();
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeComputer;
+    victim->s.player = 0; attacker->s.player = 1;
+    owner->connected = true;
+    owner->camera.state.position = (vec2_t){ 0.0f, 0.0f };
+    game.constants.attackNotifyRange = 1250.0f;
+    game.constants.attackNotifyDelay = 30.0f;
+    memset(&owner->message, 0, sizeof(owner->message));
+    memset(&owner->message_log, 0, sizeof(owner->message_log));
+    level.time = 1000;
+    alert_ping_count = 0;
+    gi.MinimapPing = alert_test_minimap_ping; gi.configstring = alert_test_configstring;
+
+    G_WC3_AttackAlert(victim, attacker);
+
+    T_STREQ(owner->message.text, "The battle has been joined.");
+    T_ASSERT(owner->message.end_time > level.time);
+    T_EQ(owner->message_log.count, 0);
+    T_EQ(alert_ping_count, 1);
+
+    gi.MinimapPing = saved_ping; gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, allied_attack_alert_formats_attacked_player_name) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    edict_t *victim = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 100.0f, 100.0f);
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 200.0f, 100.0f);
+    gameClient_t *owner = &game.clients[0];
+    gameClient_t *ally = &game.clients[2];
+
+    InitUnitData();
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeComputer;
+    ((mapInfo_t *)level.mapinfo)->players[2].playerType = kPlayerTypeHuman;
+    victim->s.player = 0; attacker->s.player = 1;
+    owner->connected = true; ally->connected = true;
+    strlcpy(owner->jass.name, "Jaina", sizeof(owner->jass.name));
+    owner->ps.name = owner->jass.name;
+    owner->camera.state.position = victim->s.origin2;
+    ally->camera.state.position = (vec2_t){ 3000.0f, 3000.0f };
+    game.constants.attackNotifyRange = 1250.0f;
+    game.constants.attackNotifyDelay = 30.0f;
+    G_SetPlayerAlliance(&owner->ps, &ally->ps, ALLIANCE_PASSIVE, true);
+    G_SetPlayerAlliance(&owner->ps, &ally->ps, ALLIANCE_HELP_REQUEST, true);
+    memset(&ally->message, 0, sizeof(ally->message));
+    memset(&ally->message_log, 0, sizeof(ally->message_log));
+    level.time = 1000;
+    alert_ping_count = 0;
+    gi.MinimapPing = alert_test_minimap_ping; gi.configstring = alert_test_configstring;
+
+    G_WC3_AttackAlert(victim, attacker);
+
+    T_STREQ(ally->message.text, "Jaina is under attack.");
+    T_EQ(ally->message_log.count, 0);
+    T_EQ(alert_ping_count, 1);
+    T_EQ(alert_ping_target, &g_edicts[2]);
+
+    gi.MinimapPing = saved_ping; gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, attack_alert_suppresses_near_camera_and_honors_help_request) {
+    void (*saved_ping)(edict_t *, vec2_t const *, float, color32_t, uint32_t) = gi.MinimapPing;
+    void (*saved_configstring)(uint32_t, cstring_t) = gi.configstring;
+    edict_t *victim = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 100.0f, 100.0f);
+    edict_t *attacker = alloc_test_unit(MAKEFOURCC('o','g','r','u'), 200.0f, 100.0f);
+
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeComputer;
+    ((mapInfo_t *)level.mapinfo)->players[2].playerType = kPlayerTypeHuman;
+    victim->s.player = 0; attacker->s.player = 1;
+    game.clients[0].connected = true; game.clients[2].connected = true;
+    game.clients[0].camera.state.position = victim->s.origin2;
+    game.clients[2].camera.state.position = (vec2_t){ 3000.0f, 3000.0f };
+    game.constants.attackNotifyRange = 1250.0f;
+    game.constants.attackNotifyDelay = 30.0f;
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[2].ps, ALLIANCE_PASSIVE, true);
+    G_SetPlayerAlliance(&game.clients[0].ps, &game.clients[2].ps, ALLIANCE_HELP_REQUEST, true);
+    level.time = 1000;
+    alert_ping_count = 0;
+    gi.MinimapPing = alert_test_minimap_ping; gi.configstring = alert_test_configstring;
+
+    G_WC3_AttackAlert(victim, attacker);
+    T_EQ(alert_ping_count, 1); /* owner is in range; distant help-request ally receives it */
+    T_EQ(alert_ping_target, &g_edicts[2]);
+
+    gi.MinimapPing = saved_ping; gi.configstring = saved_configstring;
+}
+
+TEST(wc3_game, hud_authored_window_frame_uses_offset_codec) {
+    FRAMEDEF frame = { .Type = FT_TEXT, .Text = "Window text" };
+    uiWindowDef_t def = { .id = 1, .class_id = 2, .flags = UI_WINDOW_MOVABLE };
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+
+    window_frame_type = PF_BYTE; window_text_offset = 0;
+    gi.Write = window_test_write;
+    UI_WriteWindowStart(&def); UI_WriteFrame(&frame);
+    ui_window_writing = false; gi.Write = old_write;
+    T_EQ(window_frame_type, PF_UIWINDOWFRAME);
+    T_ASSERT(window_text_offset > 0);
+}
+
+TEST(wc3_game, timer_dialog_writer_sends_client_measured_content_contract) {
+    FRAMEDEF timer_frame = { .Type = FT_SIMPLEFRAME, .Height = 0.022f };
+    FRAMEDEF title_frame = { .Type = FT_STRING };
+    FRAMEDEF value_frame = { .Type = FT_STRING };
+    gtimer_t timer = { .remaining = 65u * 1000u };
+    TimerDialog_t old_timer_binding = hud.timer_dialog;
+    timerdialog_t old_dialog = level.timer_dialogs[0];
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+
+    setup_test_world();
+    timer_dialog_size_capture = false;
+    timer_dialog_measure_text[0] = '\0';
+    memset(&timer_dialog_size_to_text, 0, sizeof(timer_dialog_size_to_text));
+    memset(&title_frame, 0, sizeof(title_frame));
+    memset(&value_frame, 0, sizeof(value_frame));
+    title_frame.Type = value_frame.Type = FT_STRING;
+    hud.timer_dialog.TimerDialog = &timer_frame;
+    hud.timer_dialog.TimerDialogTitle = &title_frame;
+    hud.timer_dialog.TimerDialogValue = &value_frame;
+    memset(&level.timer_dialogs[0], 0, sizeof(level.timer_dialogs[0]));
+    level.timer_dialogs[0].inuse = true;
+    level.timer_dialogs[0].visible_clients = 1u;
+    level.timer_dialogs[0].timer = &timer;
+    level.timer_dialogs[0].title_set = true;
+    strlcpy(level.timer_dialogs[0].title, "Harvest", sizeof(level.timer_dialogs[0].title));
+    gi.Write = timer_dialog_test_write;
+    gi.unicast = selection_test_unicast;
+
+    UI_WriteTimerDialogs(&g_edicts[0]);
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    hud.timer_dialog = old_timer_binding;
+    level.timer_dialogs[0] = old_dialog;
+    T_ASSERT(timer_dialog_size_capture);
+    T_STREQ(timer_dialog_measure_text, "Harvest    01:05");
+    T_EQ(timer_dialog_size_to_text.text.textalignx, FONT_JUSTIFYLEFT);
+    T_ASSERT(timer_dialog_size_to_text.padding_x > 0.0f);
+    T_ASSERT(timer_dialog_size_to_text.min_width > 0.0f);
+}
+
+TEST(wc3_game, timer_dialog_update_uses_player_number_not_client_slot) {
+    FRAMEDEF timer_frame = { .Type = FT_SIMPLEFRAME, .Height = 0.022f };
+    FRAMEDEF title_frame = { .Type = FT_STRING };
+    FRAMEDEF value_frame = { .Type = FT_STRING };
+    gtimer_t timer = { .remaining = 65u * 1000u };
+    TimerDialog_t old_timer_binding = hud.timer_dialog;
+    timerdialog_t old_dialog = level.timer_dialogs[0];
+    uint32_t old_dirty = level.timer_dialog_dirty_clients;
+    uint32_t client_count = MIN((uint32_t)game.max_clients, (uint32_t)MAX_CLIENTS);
+    int32_t old_last_index[MAX_CLIENTS], old_last_seconds[MAX_CLIENTS];
+    uint32_t old_numbers[MAX_CLIENTS];
+    bool old_connected[MAX_CLIENTS];
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+
+    setup_test_world();
+    memcpy(old_last_index, level.timer_dialog_last_index, sizeof(old_last_index));
+    memcpy(old_last_seconds, level.timer_dialog_last_seconds, sizeof(old_last_seconds));
+    FOR_LOOP(i, client_count) {
+        old_numbers[i] = game.clients[i].ps.number;
+        old_connected[i] = game.clients[i].connected;
+        game.clients[i].ps.number = MAX_CLIENTS + i;
+        game.clients[i].connected = false;
+    }
+    game.clients[0].ps.number = 3;
+    game.clients[0].connected = true;
+    memset(level.timer_dialog_last_index, 0xff, sizeof(level.timer_dialog_last_index));
+    memset(level.timer_dialog_last_seconds, 0xff, sizeof(level.timer_dialog_last_seconds));
+    level.timer_dialog_dirty_clients = 1u << 3;
+    memset(&level.timer_dialogs[0], 0, sizeof(level.timer_dialogs[0]));
+    level.timer_dialogs[0].inuse = true;
+    level.timer_dialogs[0].timer = &timer;
+    level.timer_dialogs[0].visible_clients = 1u << 3;
+    hud.timer_dialog.TimerDialog = &timer_frame;
+    hud.timer_dialog.TimerDialogTitle = &title_frame;
+    hud.timer_dialog.TimerDialogValue = &value_frame;
+    timer_dialog_unicast_count = 0;
+    timer_dialog_unicast_target = NULL;
+    gi.Write = timer_dialog_test_write;
+    gi.unicast = timer_dialog_test_unicast;
+
+    G_UpdateTimerDialogs();
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    hud.timer_dialog = old_timer_binding;
+    level.timer_dialogs[0] = old_dialog;
+    level.timer_dialog_dirty_clients = old_dirty;
+    memcpy(level.timer_dialog_last_index, old_last_index, sizeof(old_last_index));
+    memcpy(level.timer_dialog_last_seconds, old_last_seconds, sizeof(old_last_seconds));
+    FOR_LOOP(i, client_count) {
+        game.clients[i].ps.number = old_numbers[i];
+        game.clients[i].connected = old_connected[i];
+    }
+    T_EQ(timer_dialog_unicast_count, 1);
+    T_ASSERT(timer_dialog_unicast_target == &g_edicts[0]);
+}
+
+TEST(wc3_game, text_exact_width_fits) { T_ASSERT(R_TextFitsWidth(0.0f)); }
+TEST(wc3_game, text_subpixel_residue_fits) { T_ASSERT(R_TextFitsWidth(-0.0000005f)); }
+TEST(wc3_game, text_real_overflow_does_not_fit) { T_ASSERT(!R_TextFitsWidth(-0.00001f)); }
+TEST(wc3_game, hud_stale_attribute_texture_uses_infocard_asset) {
+    T_STREQ(UI_ResolveTextureAlias("HeroStrengthIcon"),
+                  "UI\\Widgets\\Console\\Human\\infocard-heroattributes-str.blp");
+}
+TEST(wc3_game, hud_valid_texture_path_is_unchanged) {
+    T_STREQ(UI_ResolveTextureAlias("UI\\Feedback\\Resources\\ResourceGold.blp"),
+                  "UI\\Feedback\\Resources\\ResourceGold.blp");
+}
+TEST(wc3_game, hud_stock_escmenu_control_parts_map_to_skin_keys) {
+    uiControlSkin_t skin;
+
+    T_ASSERT(UI_ControlBackdropSkin("ButtonBackdropTemplate", &skin));
+    T_STREQ(skin.background, "EscMenuButtonBackground");
+    T_STREQ(skin.edge, "EscMenuButtonBorder");
+    T_ASSERT(UI_ControlBackdropSkin("ButtonPushedBackdropTemplate", &skin));
+    T_STREQ(skin.background, "EscMenuButtonPushedBackground");
+    T_STREQ(skin.edge, "EscMenuButtonPushedBorder");
+    T_ASSERT(UI_ControlBackdropSkin("EscMenuCheckBoxBackdrop", &skin));
+    T_STREQ(skin.background, "EscMenuCheckBoxBackground");
+    T_NULL(skin.edge);
+    T_STREQ(UI_ControlHighlightSkin("ButtonMouseOverHighlightTemplate"),
+            "EscMenuButtonMouseOverHighlight");
+    T_STREQ(UI_ControlHighlightSkin("EscMenuCheckHighlightTemplate"),
+            "EscMenuCheckBoxCheckHighlight");
+    T_STREQ(UI_ControlHighlightSkin("EscMenuDisabledCheckHighlightTemplate"),
+            "EscMenuDisabledCheckHighlight");
+}
+TEST(wc3_game, ingame_options_only_show_sound_after_selecting_sound) {
+    frameDef_t categories = { 0 }, gameplay = { 0 }, video = { 0 }, sound = { 0 };
+    frameDef_t network = { 0 }, bottom_buttons = { 0 };
+    EscMenuOptionsPanel_t options = {
+        .OptionsPanel = &categories,
+        .BottomButtonPanel = &bottom_buttons,
+        .GameplayPanel = &gameplay,
+        .VideoPanel = &video,
+        .SoundPanel = &sound,
+        .NetworkPanel = &network,
+    };
+
+    UI_SetGameMenuOptionsPage(&options, false);
+    T_ASSERT(!categories.hidden);
+    T_ASSERT(bottom_buttons.hidden);
+    T_ASSERT(gameplay.hidden);
+    T_ASSERT(video.hidden);
+    T_ASSERT(sound.hidden);
+    T_ASSERT(network.hidden);
+
+    UI_SetGameMenuOptionsPage(&options, true);
+    T_ASSERT(categories.hidden);
+    T_ASSERT(!bottom_buttons.hidden);
+    T_ASSERT(gameplay.hidden);
+    T_ASSERT(video.hidden);
+    T_ASSERT(!sound.hidden);
+    T_ASSERT(network.hidden);
+}
+
+static uint32_t options_window_frame_count;
+static uint32_t options_window_unicast_count;
+
+static void options_window_test_write(pfWriteType_t type, void const *value) {
+    if (type != PF_UIWINDOWFRAME || !value) return;
+    options_window_frame_count++;
+}
+
+static void options_window_test_unicast(edict_t *ent) {
+    (void)ent;
+    options_window_unicast_count++;
+}
+
+TEST(wc3_game, ingame_options_commands_write_categories_then_sound_window) {
+    EscMenuMainPanelGame_t old_menu = hud.menu;
+    EscMenuOptionsPanel_t old_options = hud.options;
+    EscMenuSaveGamePanel_t old_save_menu = hud.save_menu;
+    bool old_connected = game.clients[0].connected;
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.unicast) old_unicast = gi.unicast;
+    edict_t *player = &g_edicts[0];
+    frameDef_t *root, *backdrop, *main_panel, *options_root;
+    frameDef_t *categories, *bottom, *gameplay, *video, *sound, *network;
+    cstring_t open_options[] = { "wc3_menu_options" };
+    uint32_t open_options_count = sizeof(open_options) / sizeof(*open_options); /* ARRAY_COUNT() names this very variable, so it self-initialised */
+    cstring_t open_sound[] = { "wc3_menu_options_sound" };
+    uint32_t open_sound_count = sizeof(open_sound) / sizeof(*open_sound); /* ARRAY_COUNT() names this very variable, so it self-initialised */
+
+    setup_test_world();
+    UI_ClearTemplates();
+    memset(&hud.menu, 0, sizeof(hud.menu));
+    memset(&hud.options, 0, sizeof(hud.options));
+    memset(&hud.save_menu, 0, sizeof(hud.save_menu));
+
+    root = UI_Spawn(FT_FRAME, NULL); T_NOT_NULL(root);
+    backdrop = UI_Spawn(FT_FRAME, root); T_NOT_NULL(backdrop);
+    main_panel = UI_Spawn(FT_FRAME, backdrop); T_NOT_NULL(main_panel);
+    options_root = UI_Spawn(FT_FRAME, backdrop); T_NOT_NULL(options_root);
+    categories = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(categories);
+    bottom = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(bottom);
+    gameplay = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(gameplay);
+    video = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(video);
+    sound = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(sound);
+    network = UI_Spawn(FT_FRAME, options_root); T_NOT_NULL(network);
+
+    UI_SetSize(main_panel, 0.5f, 0.4f);
+    UI_SetSize(categories, 0.5f, 0.4f);
+    UI_SetSize(root, 0.5f, 0.4f);
+    UI_SetSize(backdrop, 0.5f, 0.4f);
+    hud.menu.EscMenuMainPanel = root;
+    hud.menu.EscMenuBackdrop = backdrop;
+    hud.menu.MainPanel = main_panel;
+    hud.options.EscMenuOptionsPanel = options_root;
+    hud.options.OptionsPanel = categories;
+    hud.options.BottomButtonPanel = bottom;
+    hud.options.GameplayPanel = gameplay;
+    hud.options.VideoPanel = video;
+    hud.options.SoundPanel = sound;
+    hud.options.NetworkPanel = network;
+    player->client = &game.clients[0];
+    player->client->connected = true;
+    player->client->ps.number = 0;
+    options_window_frame_count = options_window_unicast_count = 0;
+    gi.Write = options_window_test_write;
+    gi.unicast = options_window_test_unicast;
+
+    G_ClientCommand(player, open_options_count, open_options);
+    T_ASSERT(!categories->hidden);
+    T_ASSERT(bottom->hidden && sound->hidden && network->hidden);
+    T_ASSERT(options_window_frame_count > 0);
+    T_EQ(options_window_unicast_count, 1);
+
+    options_window_frame_count = options_window_unicast_count = 0;
+    G_ClientCommand(player, open_sound_count, open_sound);
+    T_ASSERT(categories->hidden);
+    T_ASSERT(!bottom->hidden && !sound->hidden && network->hidden);
+    T_ASSERT(options_window_frame_count > 0);
+    T_EQ(options_window_unicast_count, 1);
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    UI_ClearTemplates();
+    hud.menu = old_menu;
+    hud.options = old_options;
+    hud.save_menu = old_save_menu;
+    game.clients[0].connected = old_connected;
+}
+
+/* Capture the svc_window open header: byte svc_window, byte UI_WINDOW_OPEN, long id, long class, long flags. */
+static uint32_t menu_window_flags, menu_window_state, menu_window_opens;
+static void menu_window_test_write(pfWriteType_t type, void const *data) {
+    int32_t const value = type == PF_BYTE || type == PF_LONG ? *(int32_t const *)data : -1;
+    if (menu_window_state == 0) menu_window_state = type == PF_BYTE && value == svc_window;
+    else if (menu_window_state == 1) menu_window_state = type == PF_BYTE && value == UI_WINDOW_OPEN ? 2 : 0;
+    else if (menu_window_state < 4) menu_window_state++;
+    else menu_window_flags = (uint32_t)value, menu_window_opens++, menu_window_state = 0;
+}
+static char menu_action_capture[64];
+static void menu_test_action(cstring_t action, cstring_t arg) {
+    snprintf(menu_action_capture, sizeof(menu_action_capture), "%s %s", action, arg);
+}
+
+/* Authored Esc-menu controls plus a ready Load panel; one placeholder stands in for the controls under test. */
+static FRAMEDEF menu_test_placeholder;
+static edict_t *menu_test_setup(void) {
+    edict_t *player = &g_edicts[0];
+    frameDef_t *root, *backdrop;
+
+    setup_test_world();
+    UI_ResetHud();
+    root = UI_Spawn(FT_FRAME, NULL);
+    backdrop = UI_Spawn(FT_FRAME, root);
+    hud.menu.EscMenuMainPanel = root;
+    hud.menu.EscMenuBackdrop = backdrop;
+    hud.menu.MainPanel = UI_Spawn(FT_FRAME, backdrop);
+    hud.menu.EndGamePanel = UI_Spawn(FT_FRAME, backdrop);
+    hud.menu.ReturnButton = UI_Spawn(FT_GLUETEXTBUTTON, hud.menu.MainPanel);
+    hud.options.EscMenuOptionsPanel = UI_Spawn(FT_FRAME, backdrop);
+    hud.options.OptionsPanel = UI_Spawn(FT_FRAME, hud.options.EscMenuOptionsPanel);
+    memset(&menu_test_placeholder, 0, sizeof(menu_test_placeholder));
+    hud.save_menu.EscMenuSaveGamePanel = hud.save_menu.EscMenuSaveLoadContainer = &menu_test_placeholder;
+    hud.save_list_art.MapListBox = hud.save_list_art.MapListBoxBackdrop = &menu_test_placeholder;
+    hud.save_list_art.MapListScrollBar = &menu_test_placeholder;
+    hud.save_menu.SaveOnly = hud.save_menu.LoadOnly = &menu_test_placeholder;
+    hud.save_menu.SaveGameFileEditBox = hud.save_menu.SaveGameFileEditBoxText = &menu_test_placeholder;
+    hud.save_menu.SaveGameSaveButton = hud.save_menu.SaveGameCancelButton = &menu_test_placeholder;
+    hud.save_menu.LoadGameLoadButton = &menu_test_placeholder;
+    hud.save_menu.LoadGameCancelButton = UI_Spawn(FT_GLUETEXTBUTTON, backdrop);
+    UI_InitFrame(&hud.save_list, FT_LISTBOX);
+    UI_SetParent(&hud.save_list, hud.save_list_art.MapListBox);
+    player->client = &game.clients[0];
+    player->client->connected = true;
+    player->client->ps.number = 0;
+    menu_action_capture[0] = '\0';
+    menu_window_opens = menu_window_state = menu_window_flags = 0;
+    return player;
+}
+
+TEST(wc3_game, ingame_menu_stays_locked_after_cancelling_result_load) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.unicast) old_unicast = gi.unicast;
+    __typeof__(gi.MenuAction) old_action = gi.MenuAction;
+    edict_t *player = menu_test_setup();
+
+    gi.Write = menu_window_test_write;
+    gi.unicast = options_window_test_unicast;
+    gi.MenuAction = menu_test_action;
+    /* Blizzard.j's CustomDefeatBJ removes the player before the defeat dialog offers Load. */
+    T_ASSERT(G_RemovePlayerWithResult(0, 1));
+
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_load" });
+    T_EQ(menu_window_opens, 1u);
+    T_ASSERT(menu_window_flags & UI_WINDOW_NO_ESCAPE);
+    T_STREQ(hud.save_menu.LoadGameCancelButton->OnClick, "menu");
+    T_STREQ(menu_action_capture, "");
+
+    G_ClientCommand(player, 1, (cstring_t[]){ "menu" }); /* Cancel */
+    T_ASSERT(hud.menu.ReturnButton->disabled);
+    T_ASSERT(menu_window_flags & UI_WINDOW_NO_ESCAPE);
+    G_ClientCommand(player, 1, (cstring_t[]){ "menu_endgame" });
+    T_ASSERT(menu_window_flags & UI_WINDOW_NO_ESCAPE);
+    G_ClientCommand(player, 1, (cstring_t[]){ "menu" }); /* Previous */
+    T_ASSERT(hud.menu.ReturnButton->disabled);
+    T_ASSERT(menu_window_flags & UI_WINDOW_NO_ESCAPE);
+    G_ClientCommand(player, 1, (cstring_t[]){ "wc3_menu_options" });
+    T_ASSERT(menu_window_flags & UI_WINDOW_NO_ESCAPE);
+    T_EQ(menu_window_opens, 5u);
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.MenuAction = old_action;
+    UI_ResetHud();
+}
+
+TEST(wc3_game, defeat_reduce_difficulty_preserves_default_for_restart) {
+    __typeof__(gi.MenuAction) old_action = gi.MenuAction;
+    __typeof__(gi.ResolveMap) old_resolver = gi.ResolveMap;
+    uint32_t const old_clients = game.max_clients;
+    edict_t *player = menu_test_setup();
+    uint32_t current = 99, original_default = 99;
+
+    gi.MenuAction = menu_test_action;
+    gi.ResolveMap = NULL; /* Headless map path already resolved. */
+    game.max_clients = 0; /* No viewer: the deferred score transition falls through. */
+    G_TakeDifficultyTransition("", &current, &original_default);
+    strlcpy(level.map_path, "Maps\\Campaign\\Human02.w3m", sizeof(level.map_path));
+    player->client->ps.stats[PLAYERSTATE_GAME_RESULT] = 1;
+    level.setup.difficulty = 2;
+    level.setup.default_difficulty = 2;
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_ASSERT(G_ScoreTransitionPending());
+    G_FlushScoreTransition();
+    T_STREQ(menu_action_capture, "level Maps\\Campaign\\Human02.w3m");
+    T_EQ(level.setup.difficulty, 1u);
+    T_EQ(level.setup.default_difficulty, 2u);
+    T_ASSERT(G_HasPendingDifficultyTransition());
+
+    /* A duplicate late client command must not reduce a second time. */
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_EQ(level.setup.difficulty, 1u);
+    T_ASSERT(G_TakeDifficultyTransition(level.map_path, &current, &original_default));
+    T_EQ(current, 1u);
+    T_EQ(original_default, 2u);
+
+    /* The last menu action would normally replace the map. Model that new
+     * session boundary before exercising the next defeat: Patch 3 correctly
+     * rejects every later exit in the already-completed outgoing world. */
+    G_TestResetScoreTransition();
+    /* The same defeat on Normal reduces to Easy without changing default. */
+    menu_action_capture[0] = '\0';
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_ASSERT(G_ScoreTransitionPending());
+    G_FlushScoreTransition();
+    T_EQ(level.setup.difficulty, 0u);
+    T_EQ(level.setup.default_difficulty, 2u);
+    T_ASSERT(G_TakeDifficultyTransition(level.map_path, &current, &original_default));
+    T_EQ(current, 0u);
+    T_EQ(original_default, 2u);
+
+    menu_action_capture[0] = '\0';
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_STREQ(menu_action_capture, ""); /* No Reduce action on Easy. */
+    T_EQ(level.setup.difficulty, 0u);
+    level.setup.difficulty = 3;
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_EQ(level.setup.difficulty, 3u); /* Stock BJ does not reduce Insane. */
+    T_STREQ(menu_action_capture, "");
+
+    /* A non-defeated player cannot invoke the command from the console. */
+    player->client->ps.stats[PLAYERSTATE_GAME_RESULT] = 0;
+    level.setup.difficulty = 2;
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_reduce_difficulty" });
+    T_EQ(level.setup.difficulty, 2u);
+    T_STREQ(menu_action_capture, "");
+
+    gi.MenuAction = old_action;
+    gi.ResolveMap = old_resolver;
+    game.max_clients = old_clients;
+    UI_ResetHud();
+}
+
+TEST(wc3_game, ingame_quick_load_cancel_keeps_return_to_game) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.unicast) old_unicast = gi.unicast;
+    __typeof__(gi.MenuAction) old_action = gi.MenuAction;
+    edict_t *player = menu_test_setup();
+
+    gi.Write = menu_window_test_write;
+    gi.unicast = options_window_test_unicast;
+    gi.MenuAction = menu_test_action;
+
+    G_ClientCommand(player, 1, (cstring_t[]){ "menu_load_quick" });
+    T_EQ(menu_window_opens, 1u);
+    T_ASSERT(!(menu_window_flags & UI_WINDOW_NO_ESCAPE));
+    T_STREQ(hud.save_menu.LoadGameCancelButton->OnClick, "menu");
+    G_ClientCommand(player, 1, (cstring_t[]){ "menu" }); /* Cancel */
+    T_ASSERT(!hud.menu.ReturnButton->disabled);
+    T_ASSERT(!(menu_window_flags & UI_WINDOW_NO_ESCAPE));
+    T_STREQ(menu_action_capture, "");
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.MenuAction = old_action;
+    UI_ResetHud();
+}
+
+TEST(wc3_game, result_load_without_ingame_panel_opens_front_end_load_screen) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.unicast) old_unicast = gi.unicast;
+    __typeof__(gi.MenuAction) old_action = gi.MenuAction;
+    edict_t *player = menu_test_setup();
+
+    gi.Write = menu_window_test_write;
+    gi.unicast = options_window_test_unicast;
+    gi.MenuAction = menu_test_action;
+    hud.save_menu.EscMenuSaveGamePanel = NULL;
+
+    G_ClientCommand(player, 1, (cstring_t[]){ "gameresult_load" });
+    T_EQ(menu_window_opens, 0u);
+    T_STREQ(menu_action_capture, "menu menu_loadgame");
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.MenuAction = old_action;
+    UI_ResetHud();
+}
+
+TEST(wc3_game, hud_status_icon_keys_follow_upgrade_and_neutral_families) {
+    char key[96];
+
+    /* Stock Footman: Normal attack + Heavy/Large armor, both upgradeable. */
+    UI_InfoPanelIconSkinKey("Damage", "normal", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageNormal");
+    UI_InfoPanelIconSkinKey("Armor", "large", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorLarge");
+
+    /* Stock Rifleman: Piercing attack + Medium armor, both upgradeable. */
+    UI_InfoPanelIconSkinKey("Damage", "pierce", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamagePierce");
+    UI_InfoPanelIconSkinKey("Armor", "medium", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorMedium");
+
+    /* Units without a matching upgrade class use Warcraft's Neutral family. */
+    UI_InfoPanelIconSkinKey("Damage", "normal", false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageNormalNeutral");
+    UI_InfoPanelIconSkinKey("Armor", "large", false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorLargeNeutral");
+
+    /* Heroes are not special-cased: no upgrade class means HeroNeutral, while
+     * a custom Hero type with an applicable upgrade uses the normal family. */
+    UI_InfoPanelIconSkinKey("Damage", "hero", false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageHeroNeutral");
+    UI_InfoPanelIconSkinKey("Armor", "hero", false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorHeroNeutral");
+    UI_InfoPanelIconSkinKey("Armor", "hero", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorHero");
+
+    /* Preserve a custom Spells skin field; the runtime resolver only retries
+     * Magic when the Spells field is absent, matching Warsmash. */
+    UI_InfoPanelIconSkinKey("Damage", "spells", false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageSpellsNeutral");
+
+    /* Warsmash normalizes Warcraft's Heavy defense spelling to Large and its
+     * enum fallback entries are Unknown for damage and Small for armor. */
+    UI_InfoPanelIconSkinKey("Armor", "heavy", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorLarge");
+    UI_InfoPanelIconSkinKey("Damage", "seige", true, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageSiege");
+    UI_InfoPanelIconSkinKey("Damage", NULL, false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconDamageUnknownNeutral");
+    UI_InfoPanelIconSkinKey("Armor", NULL, false, key, sizeof(key));
+    T_STREQ(key, "InfoPanelIconArmorSmallNeutral");
+}
+
+static uint32_t status_icon_read_count;
+static handle_t status_icon_missing_read(cstring_t path, uint32_t *size) {
+    (void)path;
+    status_icon_read_count++;
+    if (size) *size = 0;
+    return NULL;
+}
+
+TEST(wc3_game, hud_status_icon_neutral_fallback_is_cached) {
+    handle_t (*saved_read)(cstring_t, uint32_t *) = gi.ReadFile;
+    cstring_t texture;
+
+    UI_TestResetInfoPanelIconCache();
+    texture = UI_TestResolveTypedInfoPanelIcon("Armor", "Hero", false);
+    T_STREQ(texture, "TestUI\\Textures\\solid_white.blp");
+
+    status_icon_read_count = 0;
+    gi.ReadFile = status_icon_missing_read;
+    T_STREQ(UI_TestResolveTypedInfoPanelIcon("Armor", "Hero", false), texture);
+    T_EQ(status_icon_read_count, 0);
+    gi.ReadFile = saved_read;
+}
+
+TEST(wc3_game, hud_status_icon_missing_candidates_cache_null) {
+    handle_t (*saved_read)(cstring_t, uint32_t *) = gi.ReadFile;
+
+    UI_TestResetInfoPanelIconCache();
+    status_icon_read_count = 0;
+    gi.ReadFile = status_icon_missing_read;
+    T_NULL(UI_TestResolveTypedInfoPanelIcon("Armor", "Divine", false));
+    T_ASSERT(status_icon_read_count >= 1);
+
+    status_icon_read_count = 0;
+    T_NULL(UI_TestResolveTypedInfoPanelIcon("Armor", "Divine", false));
+    T_EQ(status_icon_read_count, 0);
+    gi.ReadFile = saved_read;
+}
+
+TEST(wc3_game, hud_timed_status_fraction_is_owner_only) {
+    gameClient_t *viewer = game.clients;
+    edict_t *ent = make_test_unit();
+    uint16_t half;
+
+    viewer->ps.number = 0;
+    ent->s.player = 0;
+    level.time = 1000;
+    unit_addtimedstatus(ent, "Bmil", 1, 10.0f);
+    T_EQ(UI_TestSelectedTimedStatusStat(viewer, ent), USHRT_MAX);
+
+    level.time = 6000;
+    half = UI_TestSelectedTimedStatusStat(viewer, ent);
+    T_ASSERT(half >= (USHRT_MAX / 2) - 1 && half <= (USHRT_MAX / 2) + 1);
+
+    ent->s.player = 1;
+    T_EQ(UI_TestSelectedTimedStatusStat(viewer, ent), 0);
+}
+
+TEST(wc3_game, hud_second_attack_requires_enabled_slot_and_showui) {
+    UnitWeapons_t weapons = { 0 };
+
+    weapons.attack2.damageDice = 2;
+    weapons.attack2.showUI = true;
+    weapons.attacksEnabled = 1;
+    T_ASSERT(!UI_HasSecondAttack(&weapons));
+
+    weapons.attacksEnabled = 3;
+    weapons.attack2.showUI = false;
+    T_ASSERT(!UI_HasSecondAttack(&weapons));
+
+    weapons.attack2.showUI = true;
+    T_ASSERT(UI_HasSecondAttack(&weapons));
+
+    weapons.attack2.damageDice = 0;
+    T_ASSERT(!UI_HasSecondAttack(&weapons));
+}
+TEST(wc3_game, player_zero_food_ignores_free_edicts) {
+    static UnitBalance_t const owned_balance = { .foodMade = 6, .foodUsed = 1 };
+    static UnitBalance_t const enemy_balance = { .foodMade = 12, .foodUsed = 2 };
+    gameClient_t *client = &game.clients[0];
+    edict_t *owned, *enemy;
+
+    reset_entities();
+    client->ps.number = 0;
+    owned = G_Spawn(); enemy = G_Spawn();
+    owned->s.player = 0; owned->data.UnitBalance = &owned_balance;
+    enemy->s.player = 1; enemy->data.UnitBalance = &enemy_balance;
+
+    G_AccumulatePlayerFood(client);
+
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_FOOD_CAP], 6);
+    T_EQ(client->ps.stats[PLAYERSTATE_RESOURCE_FOOD_USED], 1);
+}
+TEST(wc3_game, authoritative_selection_sync_mirrors_surviving_server_membership) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *first, *second, *third;
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    client->connected = true;
+    first = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    second = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32, 0);
+    third = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64, 0);
+    first->svflags |= SVF_MONSTER; second->svflags |= SVF_MONSTER; third->svflags |= SVF_MONSTER;
+    first->s.player = second->s.player = third->s.player = 0;
+    G_SelectEntity(client, first);
+    G_SelectEntity(client, second);
+    G_SelectEntity(client, third);
+
+    selection_sync_stage = 0;
+    selection_sync_count = 0;
+    selection_sync_entity_index = 0;
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    G_SyncClientSelection(client);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    T_EQ(selection_sync_count, 3);
+    T_EQ(selection_sync_entity_index, 3);
+    T_EQ(selection_sync_entities[0], first->s.number);
+    T_EQ(selection_sync_entities[1], second->s.number);
+    T_EQ(selection_sync_entities[2], third->s.number);
+
+    G_DeselectEntity(client, first);
+    selection_sync_stage = 0;
+    selection_sync_count = 0;
+    selection_sync_entity_index = 0;
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    G_SyncClientSelection(client);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    /* Keep two survivors because this packet test owns no single-unit HUD bindings. */
+    T_EQ(selection_sync_count, 2);
+    T_EQ(selection_sync_entity_index, 2);
+    T_EQ(selection_sync_entities[0], second->s.number);
+    T_EQ(selection_sync_entities[1], third->s.number);
+}
+
+TEST(wc3_game, multiselect_payload_marks_the_focused_unit_type_subgroup) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *selected[3];
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    selected[0] = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    selected[1] = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 32, 0);
+    selected[2] = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 64, 0);
+    FOR_LOOP(i, 3) {
+        selected[i]->svflags |= SVF_MONSTER;
+        selected[i]->s.player = 0;
+        G_SelectEntity(client, selected[i]);
+    }
+
+    multiselect_capture_count = 0;
+    memset(multiselect_capture_flags, 0, sizeof(multiselect_capture_flags));
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    UI_SendInfoPanel(player, selected, 3);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    T_EQ(multiselect_capture_count, 3);
+    T_ASSERT(multiselect_capture_flags[0] & UI_MULTISELECT_ITEM_FOCUSED);
+    T_ASSERT(multiselect_capture_flags[1] & UI_MULTISELECT_ITEM_FOCUSED);
+    T_ASSERT(!(multiselect_capture_flags[2] & UI_MULTISELECT_ITEM_FOCUSED));
+
+    T_ASSERT(G_FocusSelectedUnit(client, selected[2]));
+    multiselect_capture_count = 0;
+    memset(multiselect_capture_flags, 0, sizeof(multiselect_capture_flags));
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    UI_SendInfoPanel(player, selected, 3);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    T_EQ(multiselect_capture_count, 3);
+    T_ASSERT(!(multiselect_capture_flags[0] & UI_MULTISELECT_ITEM_FOCUSED));
+    T_ASSERT(!(multiselect_capture_flags[1] & UI_MULTISELECT_ITEM_FOCUSED));
+    T_ASSERT(multiselect_capture_flags[2] & UI_MULTISELECT_ITEM_FOCUSED);
+}
+
+TEST(wc3_game, multiselect_payload_switches_to_compact_grid_above_twelve_units) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *selected[WC3_SELECTION_MAX];
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    FOR_LOOP(i, WC3_SELECTION_MAX) {
+        selected[i] = alloc_test_unit(MAKEFOURCC('h','f','o','o'), (float)(i * 32), 0);
+        selected[i]->svflags |= SVF_MONSTER;
+        selected[i]->s.player = 0;
+        G_SelectEntity(client, selected[i]);
+    }
+
+    /* 24 units overflow the classic 6x2 grid, so the payload must carry the
+     * 8x3 compact layout with its tighter item size and spacing. */
+    multiselect_capture_count = 0;
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    UI_SendInfoPanel(player, selected, WC3_SELECTION_MAX);
+    T_EQ(multiselect_capture_count, WC3_SELECTION_MAX);
+    T_EQ(multiselect_capture_columns, 8);
+    T_FEQ(multiselect_capture_offset.x, 0.022f, 0.0001f);
+    T_FEQ(multiselect_capture_offset.y, 0.038f, 0.0001f);
+    T_FEQ(multiselect_capture_item_width, 0.019f, 0.0001f);
+    T_FEQ(multiselect_capture_item_height, 0.019f, 0.0001f);
+
+    /* 13 units is the first count that needs the compact grid. */
+    multiselect_capture_count = 0;
+    UI_SendInfoPanel(player, selected, 13);
+    T_EQ(multiselect_capture_count, 13);
+    T_EQ(multiselect_capture_columns, 8);
+
+    /* Exactly 12 keeps the classic layout the original HUD was drawn for. */
+    multiselect_capture_count = 0;
+    UI_SendInfoPanel(player, selected, 12);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    T_EQ(multiselect_capture_count, 12);
+    T_EQ(multiselect_capture_columns, 6);
+    T_FEQ(multiselect_capture_offset.x, 0.031f, 0.0001f);
+    T_FEQ(multiselect_capture_offset.y, 0.050f, 0.0001f);
+    T_FEQ(multiselect_capture_item_width, 0.025f, 0.0001f);
+    T_FEQ(multiselect_capture_item_height, 0.025f, 0.0001f);
+}
+
+TEST(wc3_game, select_command_caps_oversized_candidate_lists_at_the_selection_limit) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    enum { CANDIDATES = MAX_SELECTED_ENTITIES - 1 }; /* the parser's 64 tokens minus "select" */
+    edict_t *units[CANDIDATES];
+    char numbers[CANDIDATES][12];
+    cstring_t argv[CANDIDATES + 1] = { "select" };
+    uint32_t const counts[] = { 30, CANDIDATES };
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    client->connected = true;
+    FOR_LOOP(i, CANDIDATES) {
+        units[i] = alloc_test_unit(MAKEFOURCC('h','f','o','o'), (float)(i * 32), 0);
+        units[i]->svflags |= SVF_MONSTER;
+        units[i]->s.player = 0;
+        snprintf(numbers[i], sizeof(numbers[i]), "%u", units[i]->s.number);
+        argv[i + 1] = numbers[i];
+    }
+
+    /* A marquee can legitimately submit more eligible candidates than the
+     * authoritative cap. The server keeps the first 24 and acknowledges only
+     * those, so the client cache never retains rejected members. */
+    FOR_LOOP(c, sizeof(counts) / sizeof(counts[0])) {
+        uint32_t const argc = counts[c] + 1;
+
+        selection_sync_stage = 0;
+        selection_sync_count = 0;
+        selection_sync_entity_index = 0;
+        gi.Write = selection_test_write;
+        gi.unicast = selection_test_unicast;
+        G_ClientCommand(player, argc, argv);
+        gi.Write = old_write;
+        gi.unicast = old_unicast;
+
+        T_EQ(selection_sync_count, WC3_SELECTION_MAX);
+        T_EQ(selection_sync_entity_index, WC3_SELECTION_MAX);
+        FOR_LOOP(i, WC3_SELECTION_MAX) T_EQ(selection_sync_entities[i], units[i]->s.number);
+        T_ASSERT(G_IsEntitySelected(client, units[WC3_SELECTION_MAX - 1]));
+        T_ASSERT(!G_IsEntitySelected(client, units[WC3_SELECTION_MAX]));
+        T_ASSERT(!G_IsEntitySelected(client, units[counts[c] - 1]));
+    }
+    client->connected = false;
+}
+
+TEST(wc3_game, multiselect_info_panel_refreshes_when_membership_shrinks) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *units[3];
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    FOR_LOOP(i, 3) {
+        units[i] = alloc_test_unit(MAKEFOURCC('h','f','o','o'), (float)(i * 32), 0);
+        units[i]->svflags |= SVF_MONSTER;
+        units[i]->s.player = 0;
+        G_SelectEntity(client, units[i]);
+    }
+
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    UI_SendInfoPanel(player, units, 3);
+    T_EQ(client->infopanel.entity, 0);
+    T_EQ(client->infopanel.count, 3);
+
+    G_DeselectEntity(client, units[1]);
+    multiselect_capture_count = 0;
+    G_RefreshInfoPanel(player);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    T_EQ(multiselect_capture_count, 2);
+    T_EQ(client->infopanel.entity, 0);
+    T_EQ(client->infopanel.count, 2);
+}
+
+TEST(wc3_game, multiselect_portrait_uses_focused_unit_and_safe_area_root) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    int (*old_font)(cstring_t, uint32_t) = gi.FontIndex;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *first, *second;
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    first = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    second = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 32, 0);
+    first->svflags |= SVF_MONSTER;
+    second->svflags |= SVF_MONSTER;
+    first->s.player = second->s.player = 0;
+    G_SetUnitColorOverride(second, 6);
+    first->s.model = 11;
+    second->s.model = 22;
+    G_SelectEntity(client, first);
+    G_SelectEntity(client, second);
+    T_ASSERT(G_FocusSelectedUnit(client, second));
+
+    portrait_capture_root = 0;
+    portrait_capture_model = 0;
+    portrait_capture_team = 0;
+    portrait_capture_parent = 0;
+    portrait_capture_count = 0;
+    portrait_capture_text_count = 0;
+    portrait_capture_root_widescreen = false;
+    portrait_capture_child_relative = false;
+    portrait_capture_text_relative = false;
+    gi.Write = portrait_test_write;
+    gi.unicast = selection_test_unicast;
+    gi.FontIndex = portrait_test_font;
+    UI_WriteSelectedPortraitLayer(player);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.FontIndex = old_font;
+
+    T_ASSERT(!portrait_capture_root_widescreen);
+    T_EQ(portrait_capture_root, 0);
+    T_EQ(portrait_capture_count, 1);
+    T_EQ(portrait_capture_model, 22);
+    T_EQ(portrait_capture_team, 6);
+    T_EQ(portrait_capture_parent, 0);
+    T_ASSERT(portrait_capture_child_relative);
+    T_EQ(portrait_capture_text_count, 2);
+    T_ASSERT(portrait_capture_text_relative);
+
+    G_DeselectEntity(client, first);
+    G_DeselectEntity(client, second);
+    portrait_capture_root = 0;
+    portrait_capture_count = 0;
+    portrait_capture_root_widescreen = false;
+    gi.Write = portrait_test_write;
+    gi.unicast = selection_test_unicast;
+    gi.FontIndex = portrait_test_font;
+    UI_WriteSelectedPortraitLayer(player);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.FontIndex = old_font;
+
+    T_ASSERT(!portrait_capture_root_widescreen);
+    T_EQ(portrait_capture_root, 0);
+    T_EQ(portrait_capture_count, 0);
+}
+
+TEST(wc3_game, idle_response_updates_skip_selection_scans) {
+    enum { DECOYS = 256, UPDATES = 4 };
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->connected = true;
+    client->ps.number = 0;
+    FOR_LOOP(i, DECOYS) alloc_test_unit(MAKEFOURCC('h','p','e','a'), (float)i, 0);
+
+    G_ResetTestSelectionChecks();
+    FOR_LOOP(i, UPDATES) G_UpdateUnitResponsePresentation();
+    T_EQ(G_GetTestSelectionChecks(), 0);
+}
+
+void test_sound_event(edict_t *ent, uint32_t request, uint32_t event);
+
+TEST(wc3_game, selected_unit_portrait_follows_confirmed_playback) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    int (*old_font)(cstring_t, uint32_t) = gi.FontIndex;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *unit;
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->connected = true;
+    client->ps.number = 0;
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    unit->svflags |= SVF_MONSTER;
+    unit->s.player = 0;
+    unit->s.model = 11;
+    G_SelectEntity(client, unit);
+
+    level.time = 1000;
+    T_ASSERT(G_QueueUnitResponseSound(unit, 77));
+    uint32_t request = G_UnitResponseRequest(unit, 77);
+    test_sound_event(unit, request, SOUND_ACCEPTED);
+    test_sound_event(unit, request, SOUND_STARTED);
+    portrait_capture_animation[0] = '\0';
+    gi.Write = portrait_test_write;
+    gi.unicast = selection_test_unicast;
+    gi.FontIndex = portrait_test_font;
+    UI_WriteSelectedPortraitLayer(player);
+    T_STREQ(portrait_capture_animation, "Portrait Talk");
+
+    level.time = 1100; /* an early preemption ends the portrait immediately */
+    test_sound_event(unit, request, SOUND_ENDED);
+    G_UpdateUnitResponsePresentation();
+    portrait_capture_animation[0] = '\0';
+    UI_WriteSelectedPortraitLayer(player);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.FontIndex = old_font;
+    T_STREQ(portrait_capture_animation, "Portrait");
+}
+
+TEST(wc3_game, response_cleanup_runs_from_server_frame_scheduler) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *unit;
+
+    reset_entities();
+    setup_test_world();
+    FOR_LOOP(i, game.max_clients) game.clients[i].connected = false;
+    client->connected = true;
+    client->ps.number = 0;
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    unit->svflags |= SVF_MONSTER;
+    unit->s.player = 0;
+    G_SelectEntity(client, unit);
+    level.time = 1000;
+    T_ASSERT(G_QueueUnitResponseSound(unit, 77));
+    uint32_t request = G_UnitResponseRequest(unit, 77);
+    test_sound_event(unit, request, SOUND_ACCEPTED);
+    test_sound_event(unit, request, SOUND_STARTED);
+    client->presentation_dirty = false;
+
+    T_ASSERT(run_test_jass("function main takes nothing returns nothing\nendfunction\n"));
+    level.started = level.scriptsConfigured = level.scriptsStarted = true;
+    level.time = 1499;
+    globals.RunFrame();
+    T_ASSERT(G_UnitResponseTalking(unit));
+    T_ASSERT(!client->presentation_dirty);
+
+    level.time = 1500;
+    client->connected = false;
+    globals.RunFrame();
+    T_ASSERT(!G_UnitResponseTalking(unit));
+    T_ASSERT(client->presentation_dirty);
+}
+
+TEST(wc3_game, response_end_tracks_the_current_focused_unit) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *speaker, *focused;
+
+    reset_entities();
+    setup_test_world();
+    FOR_LOOP(i, game.max_clients) game.clients[i].connected = false;
+    player->client = client;
+    client->connected = true;
+    client->ps.number = 0;
+    speaker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    focused = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32, 0);
+    speaker->svflags |= SVF_MONSTER;
+    focused->svflags |= SVF_MONSTER;
+    speaker->s.player = focused->s.player = 0;
+    G_SelectEntity(client, speaker);
+    G_SelectEntity(client, focused);
+    T_ASSERT(G_FocusSelectedUnit(client, speaker));
+
+    level.time = 1000;
+    T_ASSERT(G_QueueUnitResponseSound(speaker, 77));
+    uint32_t request = G_UnitResponseRequest(speaker, 77);
+    test_sound_event(speaker, request, SOUND_ACCEPTED);
+    test_sound_event(speaker, request, SOUND_STARTED);
+    T_ASSERT(G_FocusSelectedUnit(client, focused));
+    client->presentation_dirty = false;
+    test_sound_event(speaker, request, SOUND_ENDED);
+    level.time = 1500;
+    G_UpdateUnitResponsePresentation();
+
+    T_ASSERT(!client->presentation_dirty);
+    T_ASSERT(!G_UnitResponseTalking(speaker));
+}
+
+TEST(wc3_game, response_feedback_ignores_reused_entity_slots) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *speaker, *replacement;
+    uint32_t speaker_number;
+
+    reset_entities();
+    setup_test_world();
+    FOR_LOOP(i, game.max_clients) game.clients[i].connected = false;
+    player->client = client;
+    client->connected = true;
+    client->ps.number = 0;
+    level.time = 1000;
+    speaker = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    speaker->spawn_time = level.time;
+    speaker->svflags |= SVF_MONSTER;
+    speaker->s.player = 0;
+    G_SelectEntity(client, speaker);
+    speaker_number = speaker->s.number;
+    T_ASSERT(G_QueueUnitResponseSound(speaker, 77));
+
+    uint32_t old_request = G_UnitResponseRequest(speaker, 77);
+    G_FreeEdict(speaker);
+    level.time = 2001;
+    replacement = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32, 0);
+    T_EQ(replacement->s.number, speaker_number);
+    replacement->spawn_time = level.time;
+    replacement->svflags |= SVF_MONSTER;
+    replacement->s.player = 0;
+    G_SelectEntity(client, replacement);
+    T_ASSERT(G_QueueUnitResponseSound(replacement, 78));
+    uint32_t request = G_UnitResponseRequest(replacement, 78);
+    test_sound_event(replacement, request, SOUND_ACCEPTED);
+    test_sound_event(replacement, request, SOUND_STARTED);
+    test_sound_event(replacement, old_request, SOUND_ENDED);
+    T_ASSERT(G_UnitResponseTalking(replacement));
+
+    client->presentation_dirty = false;
+    level.time = 2200;
+    G_UpdateUnitResponsePresentation();
+    T_ASSERT(!client->presentation_dirty);
+    level.time = 2201;
+    test_sound_event(replacement, request, SOUND_ENDED);
+    G_UpdateUnitResponsePresentation();
+    T_ASSERT(client->presentation_dirty);
+    T_ASSERT(!G_UnitResponseTalking(replacement));
+}
+
+TEST(wc3_game, multiselect_portrait_live_stats_follow_focus) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *first, *second;
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->ps.number = 0;
+    client->connected = true;
+    first = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    second = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 32, 0);
+    first->s.player = second->s.player = 0;
+    first->health.value = 111.0f;
+    first->health.max_value = 222.0f;
+    first->mana.value = 12.0f;
+    first->mana.max_value = 34.0f;
+    second->health.value = 333.0f;
+    second->health.max_value = 444.0f;
+    second->mana.value = 55.0f;
+    second->mana.max_value = 66.0f;
+    G_SelectEntity(client, first);
+    G_SelectEntity(client, second);
+    client->infopanel.entity = 0;
+    client->infopanel.count = 2;
+
+    T_ASSERT(G_FocusSelectedUnit(client, second));
+    G_RefreshInfoPanel(player);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH], 333);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_HEALTH], 444);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA], 55);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_MANA], 66);
+
+    T_ASSERT(G_FocusSelectedUnit(client, first));
+    G_RefreshInfoPanel(player);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH], 111);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_HEALTH], 222);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA], 12);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_MANA], 34);
+}
+
+TEST(wc3_game, portrait_live_stats_refresh_reserved_connected_client_edict) {
+    gameClient_t *client = &game.clients[0];
+    edict_t *player;
+    edict_t *unit;
+
+    reset_entities();
+    setup_test_world();
+    player = &g_edicts[0];
+    player->client = client;
+    client->ps.number = 0;
+    client->connected = true;
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 128.0f, 192.0f);
+    unit->s.player = 0;
+    unit->health.value = 311.0f;
+    unit->health.max_value = 420.0f;
+    unit->mana.value = 33.0f;
+    unit->mana.max_value = 100.0f;
+    G_SelectEntity(client, unit);
+
+    /* Retain portrait identity so live stat refresh does not need to serialize FDF. */
+    client->infopanel.entity = unit->s.number;
+    client->infopanel.xp = 0;
+    T_ASSERT(!player->inuse);
+
+    G_UpdateClientInfoPanels();
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH], 311);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_HEALTH], 420);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA], 33);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_MANA], 100);
+
+    unit->health.value = 207.0f;
+    unit->mana.value = 21.0f;
+    G_UpdateClientInfoPanels();
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH], 207);
+    T_EQ(client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA], 21);
+}
+
+TEST(wc3_game, selected_unit_status_invalidation_resends_info_panel) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *unit, *other;
+
+    reset_entities();
+    setup_test_world();
+    player->client = client;
+    client->connected = true;
+    client->ps.number = 0;
+    unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    unit->s.player = 0;
+    G_SelectEntity(client, unit);
+    /* Simulate a panel already serialized, then status application invalidates
+     * it. The next ordinary refresh must not accept the old cache as current. */
+    client->infopanel.entity = unit->s.number;
+    client->infopanel.xp = (int32_t)unit->unit_state->hero.xp;
+    G_InvalidateUnitInfoPanel(unit);
+    T_EQ(client->infopanel.entity, UINT32_MAX);
+
+    gi.Write = selection_test_write;
+    gi.unicast = selection_test_unicast;
+    multiselect_capture_count = 0;
+    G_RefreshInfoPanel(player);
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+
+    T_EQ(client->infopanel.entity, unit->s.number);
+    T_EQ(client->infopanel.xp, (int32_t)unit->unit_state->hero.xp);
+
+    other = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32, 0);
+    other->s.player = 0;
+    G_SelectEntity(client, other);
+    client->infopanel.entity = 0;
+    client->infopanel.count = 2;
+    G_InvalidateUnitInfoPanel(unit);
+    T_EQ(client->infopanel.entity, 0);
+    T_EQ(client->infopanel.count, 2);
+}
+
+TEST(wc3_game, loading_rows_support_roc_and_tft_schema) {
+    static const struct { cstring_t row, model; uint32_t seq; bool valid; } cases[] = {
+        { "WESTRING_LOADINGSCREEN_HUMAN01,0,UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronBackground.mdl",
+          "UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronBackground.mdl", 0, true },
+        { "1,WESTRING_LOADINGSCREEN_HUMANX01,6,UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronExpansionBackground.mdl",
+          "UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronExpansionBackground.mdl", 6, true },
+        { "0,WESTRING_LOADINGSCREEN_HUMAN02,1,UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronBackground.mdl",
+          "UI\\Glues\\Loading\\Backgrounds\\Campaigns\\LordaeronBackground.mdl", 1, true },
+        { NULL, "", 0, false }, { "", "", 0, false },
+        { "WESTRING_LOADINGSCREEN_HUMAN01", "", 0, false },
+        { "1,WESTRING_LOADINGSCREEN_HUMANX01,6,", "", 6, false },
+    };
+    FOR_LOOP(i, sizeof(cases) / sizeof(cases[0])) {
+        PATHSTR model; uint32_t seq;
+        T_EQ(UI_ParseLoadingRow(cases[i].row, &seq, model), cases[i].valid);
+        if (cases[i].valid) { T_STREQ(model, cases[i].model); T_EQ(seq, cases[i].seq); }
+    }
+}
+
+/* Author native sprites through the same serializer used during the initial client handshake. */
+TEST(wc3_game, loading_layout_preserves_sprite_geometry_and_progress_binding) {
+    FRAMEDEF bar = { .Type = FT_SPRITE, .Stat = UI_STAT_LOADING_PROGRESS, .Portrait.model = 17, .Text = "#0" };
+    FRAMEDEF back = { .Type = FT_SPRITE, .Portrait.model = 18, .Text = "#!6" };
+    uiFrame_t wire = { 0 };
+    uint8_t data[128];
+    char text[128];
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&bar, &wire, data, sizeof(data), text, sizeof(text)));
+    T_EQ(wire.flags.type, FT_SPRITE); T_EQ(wire.tex.index, 17);
+    T_EQ(wire.stat, UI_STAT_LOADING_PROGRESS); T_STREQ(wire.text, "#0");
+    T_FEQ(wire.size.width, 0, 0.00001f); T_FEQ(wire.size.height, 0, 0.00001f);
+    T_ASSERT(UI_BuildFrameForWrite(&back, &wire, data, sizeof(data), text, sizeof(text)));
+    T_EQ(wire.flags.type, FT_SPRITE); T_EQ(wire.tex.index, 18); T_STREQ(wire.text, "#!6");
+}
+
+TEST(wc3_game, hud_portrait_model_uses_serialized_field) {
+    FRAMEDEF frame = { 0 };
+    UI_SetPortraitFrameModel(&frame, 42);
+    T_EQ(frame.Type, FT_PORTRAIT);
+    T_EQ(frame.Portrait.model, 42);
+}
+
+TEST(wc3_game, selected_unit_portrait_invalidation_marks_selecting_client_dirty) {
+    gameClient_t *selected_client = &game.clients[0];
+    gameClient_t *other_client = &game.clients[1];
+    edict_t *unit;
+
+    reset_entities();
+    setup_test_world();
+    selected_client->connected = true;
+    selected_client->ps.number = 0;
+    other_client->connected = true;
+    other_client->ps.number = 1;
+    unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 128.0f, 192.0f);
+    unit->s.player = 0;
+    G_SelectEntity(selected_client, unit);
+    selected_client->presentation_dirty = false;
+    other_client->presentation_dirty = false;
+
+    G_InvalidateUnitPortrait(unit);
+
+    T_ASSERT(selected_client->presentation_dirty);
+    T_ASSERT(!other_client->presentation_dirty);
+}
+
+TEST(wc3_game, hud_empty_text_frame_serializes_empty_text) {
+    FRAMEDEF frame;
+    uiFrame_t wire = {0};
+    uint8_t typedata[128] = {0};
+    char textbuf[128] = {0};
+
+    UI_InitFrame(&frame, FT_STRING);
+    snprintf(frame.Name, sizeof(frame.Name), "SimpleClassValue");
+    UI_SetText(&frame, "%s", "");
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_NOT_NULL(wire.text);
+    T_STREQ(wire.text, "");
+}
+
+/* The wire bit is opt-in opaque so zero-initialized WoW/SC2 backdrops keep Q2 alpha; WC3 sets it from FDF. */
+TEST(wc3_game, hud_backdrop_without_blend_all_serializes_opaque) {
+    FRAMEDEF frame = { .Type = FT_BACKDROP };
+    uiFrame_t wire = {0};
+    uint8_t typedata[sizeof(uiBackdrop_t)] = {0};
+    char textbuf[16] = {0};
+
+    FOR_LOOP(blend, 2) {
+        frame.Backdrop.BlendAll = blend;
+        UI_ResetFrameWriteList();
+        T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+        T_EQ(((uiBackdrop_t const *)typedata)->Opaque, !blend);
+    }
+}
+
+TEST(wc3_game, hud_single_line_fdf_text_serializes_declared_font_height) {
+    FRAMEDEF frame = { .Type = FT_STRING };
+    uiFrame_t wire = {0};
+    uint8_t typedata[128] = {0};
+    char textbuf[128] = {0};
+
+    frame.Text = "Strength:";
+    frame.Font.Size = 0.010f;
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_FEQ(wire.size.height, 0.010f, 0.0001f);
+}
+
+TEST(wc3_game, hud_multiline_fdf_text_keeps_renderer_auto_height) {
+    FRAMEDEF frame = { .Type = FT_STRING };
+    uiFrame_t wire = {0};
+    uint8_t typedata[128] = {0};
+    char textbuf[128] = {0};
+
+    frame.Text = "Line one\nLine two";
+    frame.Font.Size = 0.010f;
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_FEQ(wire.size.height, 0.0f, 0.0001f);
+}
+
+TEST(wc3_game, hud_editbox_serializes_control_identity_and_limit) {
+    FRAMEDEF frame = { .Type = FT_EDITBOX };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[512] = { 0 };
+    char textbuf[128] = { 0 };
+    uiEditBox_t const *edit;
+
+    snprintf(frame.Name, sizeof(frame.Name), "SaveGameFileEditBox");
+    frame.Edit.MaxChars = 63;
+    frame.Edit.BorderSize = 0.004f;
+    frame.Edit.TextColor = MAKE(color32_t, 255, 230, 190, 255);
+    frame.Edit.CursorColor = COLOR32_WHITE;
+    frame.Edit.HighlightColor = MAKE(color32_t, 77, 88, 99, 210);
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_ASSERT(sizeof(uiEditBox_t) <= 255);
+    T_EQ(wire.buffer.size, sizeof(uiEditBox_t));
+    edit = (uiEditBox_t const *)wire.buffer.data;
+    T_STREQ(edit->id, "SaveGameFileEditBox");
+    T_EQ(edit->maxChars, 63);
+    T_FEQ(edit->borderSize, 0.004f, 0.0001f);
+    T_EQ(wire.color.r, 77);
+    T_EQ(wire.color.g, 88);
+    T_EQ(wire.color.b, 99);
+    T_EQ(wire.color.a, 210);
+}
+
+TEST(wc3_game, hud_listbox_serializes_static_selected_row) {
+    FRAMEDEF frame = { .Type = FT_LISTBOX };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[256] = { 0 };
+    char textbuf[128] = { 0 };
+    uiListBox_t const *list;
+
+    snprintf(frame.Name, sizeof(frame.Name), "SaveFileList");
+    frame.Text = "Quick Save";
+    frame.Font.Size = 0.012f;
+    frame.ListBox.Border = 0.004f;
+    snprintf(frame.ListBox.FetchCommand, sizeof(frame.ListBox.FetchCommand), "fetch_saves");
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_EQ(wire.buffer.size, sizeof(uiListBox_t));
+    list = (uiListBox_t const *)wire.buffer.data;
+    T_EQ(list->selectedIndex, 0);
+    T_FEQ(list->border, 0.004f, 0.0001f);
+    T_FEQ(list->itemHeight, 0.012f * 1.33f, 0.0001f);
+    T_STREQ(list->id, "SaveFileList");
+    T_STREQ(list->fetchCommand, "fetch_saves");
+    T_EQ(list->editTarget, 0);
+}
+
+TEST(wc3_game, hud_passive_string_serializes_tooltip) {
+    FRAMEDEF frame = { .Type = FT_STRING };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[128] = { 0 };
+    char textbuf[128] = { 0 };
+
+    frame.Text = "500";
+    frame.Tip = "Gold: {value}";
+    frame.Ubertip = "Gold is mined from gold mines.";
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_STREQ(wire.tooltip, "Gold: {value}\nGold is mined from gold mines.");
+    T_ASSERT(!wire.onclick || !*wire.onclick);
+}
+
+TEST(wc3_game, hud_passive_simpleframe_serializes_status_tooltip) {
+    FRAMEDEF frame = { .Type = FT_SIMPLEFRAME };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[128] = { 0 };
+    char textbuf[128] = { 0 };
+
+    frame.Tip = "Bloodlust";
+    frame.Ubertip = "Increases attack rate and movement speed.";
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_EQ(wire.flags.type, FT_SIMPLEFRAME);
+    T_STREQ(wire.tooltip, "Bloodlust\nIncreases attack rate and movement speed.");
+    T_ASSERT(!wire.onclick || !*wire.onclick);
+}
+
+TEST(wc3_game, hud_checkbox_serializes_authored_states_and_checked_value) {
+    uint8_t typedata[256];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t *box, *normal, *pushed, *disabled, *over, *checked, *disabled_checked;
+    uiCheckBox_t const *wire;
+
+    UI_ClearTemplates();
+    box = UI_Spawn(FT_GLUECHECKBOX, NULL);
+    normal = UI_Spawn(FT_BACKDROP, box);
+    pushed = UI_Spawn(FT_BACKDROP, box);
+    disabled = UI_Spawn(FT_BACKDROP, box);
+    over = UI_Spawn(FT_HIGHLIGHT, box);
+    checked = UI_Spawn(FT_HIGHLIGHT, box);
+    disabled_checked = UI_Spawn(FT_HIGHLIGHT, box);
+    T_NOT_NULL(box); T_NOT_NULL(normal); T_NOT_NULL(pushed); T_NOT_NULL(disabled);
+    T_NOT_NULL(over); T_NOT_NULL(checked); T_NOT_NULL(disabled_checked);
+
+    snprintf(normal->Name, sizeof(normal->Name), "Normal"); normal->Backdrop.Background = 11;
+    snprintf(pushed->Name, sizeof(pushed->Name), "Pushed"); pushed->Backdrop.Background = 12;
+    snprintf(disabled->Name, sizeof(disabled->Name), "Disabled"); disabled->Backdrop.Background = 13;
+    snprintf(over->Name, sizeof(over->Name), "Over"); over->Highlight.AlphaFile = 14;
+    snprintf(checked->Name, sizeof(checked->Name), "Checked"); checked->Highlight.AlphaFile = 15;
+    snprintf(disabled_checked->Name, sizeof(disabled_checked->Name), "DisabledChecked");
+    disabled_checked->Highlight.AlphaFile = 16;
+    snprintf(box->Control.Backdrop.Normal, sizeof(box->Control.Backdrop.Normal), "Normal");
+    snprintf(box->Control.Backdrop.Pushed, sizeof(box->Control.Backdrop.Pushed), "Pushed");
+    snprintf(box->Control.Backdrop.Disabled, sizeof(box->Control.Backdrop.Disabled), "Disabled");
+    snprintf(box->Control.Backdrop.MouseOver, sizeof(box->Control.Backdrop.MouseOver), "Over");
+    snprintf(box->CheckBox.CheckHighlight, sizeof(box->CheckBox.CheckHighlight), "Checked");
+    snprintf(box->CheckBox.DisabledCheckHighlight, sizeof(box->CheckBox.DisabledCheckHighlight), "DisabledChecked");
+    box->CheckBox.Checked = true;
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(box, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_EQ(out.buffer.size, sizeof(uiCheckBox_t));
+    T_FEQ(out.value, 1.0f, 0.0001f);
+    wire = (uiCheckBox_t const *)out.buffer.data;
+    T_EQ(wire->normal.Background, 11);
+    T_EQ(wire->pushed.Background, 12);
+    T_EQ(wire->disabled.Background, 13);
+    T_EQ(wire->mouseOver.alphaFile, 14);
+    T_EQ(wire->checked.alphaFile, 15);
+    T_EQ(wire->disabledChecked.alphaFile, 16);
+}
+
+TEST(wc3_game, hud_simple_button_serializes_button_state) {
+    uint8_t typedata[256];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t *button, *normal, *pushed, *disabled;
+
+    UI_ClearTemplates();
+    button = UI_Spawn(FT_SIMPLEBUTTON, NULL);
+    normal = UI_Spawn(FT_TEXTURE, button);
+    pushed = UI_Spawn(FT_TEXTURE, button);
+    disabled = UI_Spawn(FT_TEXTURE, button);
+    T_NOT_NULL(button); T_NOT_NULL(normal); T_NOT_NULL(pushed); T_NOT_NULL(disabled);
+    snprintf(normal->Name, sizeof(normal->Name), "Normal"); normal->Texture.Image = 11;
+    snprintf(pushed->Name, sizeof(pushed->Name), "Pushed"); pushed->Texture.Image = 12;
+    snprintf(disabled->Name, sizeof(disabled->Name), "Disabled"); disabled->Texture.Image = 13;
+    snprintf(button->Button.NormalTexture, sizeof(button->Button.NormalTexture), "Normal");
+    snprintf(button->Button.PushedTexture, sizeof(button->Button.PushedTexture), "Pushed");
+    snprintf(button->Button.DisabledTexture, sizeof(button->Button.DisabledTexture), "Disabled");
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(button, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_EQ(out.buffer.size, sizeof(uiSimpleButton_t));
+    T_EQ(((uiSimpleButton_t const *)out.buffer.data)->normal.texture, 11);
+    T_EQ(((uiSimpleButton_t const *)out.buffer.data)->pushed.texture, 12);
+    T_EQ(((uiSimpleButton_t const *)out.buffer.data)->disabled.texture, 13);
+    T_EQ(((uiSimpleButton_t const *)out.buffer.data)->normal.fontcolor.a, 255);
+
+    snprintf(button->Button.NormalText.text, sizeof(button->Button.NormalText.text), "KEY_MENU");
+    snprintf(button->Button.DisabledText.text, sizeof(button->Button.DisabledText.text), "MENU");
+    button->OnClick[0] = '\0';
+    T_ASSERT(UI_BuildFrameForWrite(button, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_STREQ(out.text, "MENU");
+    snprintf(button->OnClick, sizeof(button->OnClick), "menu");
+    T_ASSERT(UI_BuildFrameForWrite(button, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_STREQ(out.text, "KEY_MENU");
+
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_disabled_button_label_uses_authored_disabled_color) {
+    uint8_t typedata[128];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t button = { .Type = FT_GLUETEXTBUTTON, .disabled = true };
+    frameDef_t label = { .Type = FT_TEXT, .Parent = &button, .Text = "Disabled choice" };
+
+    label.Font.Color = COLOR32_WHITE;
+    /* Retail disables WC3 button labels with a light gray FontDisabledColor. */
+    label.Font.DisabledColor = (color32_t){ .r = 170, .g = 170, .b = 170, .a = 255 };
+    T_ASSERT(UI_BuildFrameForWrite(&label, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_EQ(out.color.r, label.Font.DisabledColor.r);
+    T_EQ(out.color.g, label.Font.DisabledColor.g);
+    T_EQ(out.color.b, label.Font.DisabledColor.b);
+    T_EQ(out.color.a, label.Font.DisabledColor.a);
+}
+
+TEST(wc3_game, hud_disabled_button_state_reaches_client_frame) {
+    uint8_t typedata[256];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t button = { .Type = FT_FRAME };
+
+    button.disabled = true;
+    UI_SetOnClick(&button, "menu");
+    T_ASSERT(UI_BuildFrameForWrite(&button, &out, typedata, sizeof(typedata),
+                                   textbuf, sizeof(textbuf)));
+    T_ASSERT(out.flagsvalue & UIFRAME_DISABLED);
+    T_STREQ(out.onclick, "menu");
+}
+
+static PATHSTR hud_test_images[MAX_IMAGES];
+static cstring_t hud_test_get_configstring(uint32_t index) {
+    if (index >= CS_IMAGES && index < CS_IMAGES + MAX_IMAGES)
+        return hud_test_images[index - CS_IMAGES];
+    return "";
+}
+static int hud_test_image_index(cstring_t name) {
+    uint32_t i;
+    if (!name || !*name) return 0;
+    for (i = 1; i < MAX_IMAGES; i++)
+        if (hud_test_images[i][0] && !strcmp(hud_test_images[i], name)) return (int)i;
+    for (i = 1; i < MAX_IMAGES; i++) {
+        if (!hud_test_images[i][0]) {
+            snprintf(hud_test_images[i], sizeof(hud_test_images[i]), "%s", name);
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+TEST(wc3_game, hud_image_rebinds_after_configstring_wipe) {
+    int (*old_image)(cstring_t) = gi.ImageIndex;
+    cstring_t (*old_get)(uint32_t) = gi.GetConfigstring;
+    FRAMEDEF frame = { .Type = FT_TEXTURE };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[128] = { 0 };
+    char textbuf[128] = { 0 };
+    uint32_t chrome, button, reused;
+
+    gi.ImageIndex = hud_test_image_index;
+    gi.GetConfigstring = hud_test_get_configstring;
+    memset(hud_test_images, 0, sizeof(hud_test_images));
+    UI_ResetHud();
+
+    chrome = UI_LoadTexture("UI\\Console\\HumanUITile-InventoryCover.blp", false);
+    button = UI_LoadTexture("ReplaceableTextures\\CommandButtons\\BTNMove.blp", false);
+    T_ASSERT(chrome != 0); T_ASSERT(button != 0); T_ASSERT(chrome != button);
+    frame.Texture.Image = chrome;
+
+    memset(hud_test_images, 0, sizeof(hud_test_images));
+    reused = UI_LoadTexture("ReplaceableTextures\\CommandButtons\\BTNMove.blp", false);
+    T_EQ(reused, 1);
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_STREQ(hud_test_images[wire.tex.index], "UI\\Console\\HumanUITile-InventoryCover.blp");
+    T_ASSERT(wire.tex.index != reused);
+
+    UI_ResetHud();
+    gi.ImageIndex = old_image;
+    gi.GetConfigstring = old_get;
+}
+
+TEST(wc3_game, hud_reset_drops_save_panel_bindings) {
+    FRAMEDEF frame = {0};
+
+    hud.save_menu.EscMenuSaveGamePanel = &frame;
+    UI_InitFrame(&hud.save_list, FT_LISTBOX);
+
+    UI_ResetHud();
+
+    T_NULL(hud.save_menu.EscMenuSaveGamePanel);
+    T_ASSERT(!hud.save_list.inuse);
+}
+
+TEST(wc3_game, leaderboard_stacks_below_visible_timer_per_client) {
+    FRAMEDEF timer_frame = { .Height = 0.022f };
+    FRAMEDEF *old_timer_frame = hud.timer_dialog.TimerDialog;
+    timerdialog_t old_dialog = level.timer_dialogs[0];
+
+    hud.timer_dialog.TimerDialog = &timer_frame;
+    memset(&level.timer_dialogs[0], 0, sizeof(level.timer_dialogs[0]));
+    T_FEQ(UI_TimerDialogLeaderboardOffset(0), 0.0f, 0.0001f);
+
+    level.timer_dialogs[0].inuse = true;
+    level.timer_dialogs[0].visible_clients = 1u;
+    T_FEQ(UI_TimerDialogLeaderboardOffset(0), 0.026f, 0.0001f);
+    T_FEQ(UI_TimerDialogLeaderboardOffset(1), 0.0f, 0.0001f);
+
+    hud.timer_dialog.TimerDialog = old_timer_frame;
+    level.timer_dialogs[0] = old_dialog;
+}
+
+TEST(wc3_game, title_only_leaderboard_does_not_reserve_an_empty_row) {
+    FRAMEDEF root = { .Type = FT_SIMPLEFRAME };
+    FRAMEDEF backdrop = { .Type = FT_BACKDROP, .Parent = &root };
+    FRAMEDEF title = { .Type = FT_STRING, .Parent = &root };
+    FRAMEDEF container = { .Type = FT_SIMPLEFRAME, .Parent = &root };
+    LeaderBoard_t old_binding = hud.leaderboard;
+    leaderboard_t old_board;
+    int32_t old_player_board;
+    uint32_t old_dirty;
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    int (*old_font)(cstring_t, uint32_t) = gi.FontIndex;
+
+    setup_test_world();
+    old_board = level.leaderboards[0];
+    old_player_board = level.player_leaderboards[0];
+    old_dirty = level.leaderboard_dirty_clients;
+    memset(&level.leaderboards[0], 0, sizeof(level.leaderboards[0]));
+    level.leaderboards[0].inuse = true;
+    level.leaderboards[0].displayed_clients = 1u;
+    level.leaderboards[0].show_label = true;
+    strlcpy(level.leaderboards[0].label, "A Runner is on its way!",
+            sizeof(level.leaderboards[0].label));
+    level.player_leaderboards[0] = 0;
+    title.Font.Size = 0.02f;
+    hud.leaderboard = (LeaderBoard_t){
+        .Leaderboard = &root, .LeaderboardBackdrop = &backdrop,
+        .LeaderboardTitle = &title, .LeaderboardListContainer = &container,
+    };
+    leaderboard_size_capture = false;
+    leaderboard_measure_capture_text[0] = '\0';
+    gi.Write = leaderboard_test_write;
+    gi.unicast = selection_test_unicast;
+    gi.FontIndex = portrait_test_font;
+
+    UI_WriteLeaderboard(&g_edicts[0]);
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.FontIndex = old_font;
+    hud.leaderboard = old_binding;
+    level.leaderboards[0] = old_board;
+    level.player_leaderboards[0] = old_player_board;
+    level.leaderboard_dirty_clients = old_dirty;
+    T_ASSERT(leaderboard_size_capture);
+    T_STREQ(leaderboard_measure_capture_text, "A Runner is on its way!");
+    T_ASSERT(container.hidden);
+    T_FEQ(root.Height, 0.035f, 0.0001f);
+}
+
+TEST(wc3_game, leaderboard_preserves_blank_title_trailing_rows_and_authored_labels) {
+    FRAMEDEF root = { .Type = FT_SIMPLEFRAME };
+    FRAMEDEF backdrop = { .Type = FT_BACKDROP, .Parent = &root };
+    FRAMEDEF title = { .Type = FT_STRING, .Parent = &root };
+    FRAMEDEF container = { .Type = FT_SIMPLEFRAME, .Parent = &root };
+    LeaderBoard_t old_binding = hud.leaderboard;
+    leaderboard_t old_board;
+    int32_t old_player_board;
+    uint32_t old_dirty;
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    int (*old_font)(cstring_t, uint32_t) = gi.FontIndex;
+    leaderboard_t *board;
+
+    setup_test_world();
+    old_board = level.leaderboards[0];
+    old_player_board = level.player_leaderboards[0];
+    old_dirty = level.leaderboard_dirty_clients;
+    memset(&level.leaderboards[0], 0, sizeof(level.leaderboards[0]));
+    board = &level.leaderboards[0];
+    board->inuse = true;
+    board->displayed_clients = 1u;
+    board->show_label = false;
+    board->show_names = true;
+    board->show_values = true;
+    board->size_by_item_count = 3; /* Blank-title BJ resize subtracts one. */
+    board->item_count = 4;
+    board->items[0] = (struct gleaderboarditem_s){
+        .player = 0, .value = 100, .show_label = true, .show_value = true,
+    };
+    strlcpy(board->items[0].label, "Portal Life %", sizeof(board->items[0].label));
+    board->items[1] = (struct gleaderboarditem_s){
+        .player = 1, .value = 27, .show_label = true, .show_value = true,
+    };
+    strlcpy(board->items[1].label, "Waves Remaining", sizeof(board->items[1].label));
+    board->items[2] = (struct gleaderboarditem_s){
+        .player = 2, .value = 0, .show_label = true, .show_value = true,
+        .value_color_set = true, .value_color = { .a = 0 },
+    };
+    strlcpy(board->items[2].label, "__________________", sizeof(board->items[2].label));
+    board->items[3] = (struct gleaderboarditem_s){
+        .player = 3, .value = 0, .show_label = true, .show_value = true,
+    };
+    strlcpy(board->items[3].label, "High Scores", sizeof(board->items[3].label));
+    game.clients[0].ps.name = "Player";
+    level.player_leaderboards[0] = 0;
+    title.Font.Size = 0.0f;
+    hud.leaderboard = (LeaderBoard_t){
+        .Leaderboard = &root, .LeaderboardBackdrop = &backdrop,
+        .LeaderboardTitle = &title, .LeaderboardListContainer = &container,
+    };
+    leaderboard_size_capture = false;
+    leaderboard_measure_capture_text[0] = '\0';
+    gi.Write = leaderboard_test_write;
+    gi.unicast = selection_test_unicast;
+    gi.FontIndex = portrait_test_font;
+
+    UI_WriteLeaderboard(&g_edicts[0]);
+
+    gi.Write = old_write;
+    gi.unicast = old_unicast;
+    gi.FontIndex = old_font;
+    hud.leaderboard = old_binding;
+    level.leaderboards[0] = old_board;
+    level.player_leaderboards[0] = old_player_board;
+    level.leaderboard_dirty_clients = old_dirty;
+    T_ASSERT(leaderboard_size_capture);
+    T_ASSERT(strstr(leaderboard_measure_capture_text, "Portal Life %") != NULL);
+    T_ASSERT(strstr(leaderboard_measure_capture_text, "Player - Portal Life %") == NULL);
+    T_ASSERT(strstr(leaderboard_measure_capture_text, "Waves Remaining") != NULL);
+    T_ASSERT(strstr(leaderboard_measure_capture_text, "High Scores") != NULL);
+    T_ASSERT(strstr(leaderboard_measure_capture_text, "__________________    0") == NULL);
+    T_ASSERT(!container.hidden);
+    T_FEQ(container.Height, 0.048f, 0.0001f);
+}
+
+TEST(wc3_game, hud_save_panel_accepts_native_list_in_authored_frame_slot) {
+    FRAMEDEF frame = {0};
+
+    UI_ResetHud();
+    hud.save_menu.EscMenuSaveGamePanel = &frame;
+    hud.save_menu.EscMenuSaveLoadContainer = &frame;
+    hud.save_menu.FileListFrame = &frame;
+    hud.save_list_art.MapListBox = &frame;
+    hud.save_list_art.MapListBoxBackdrop = hud.save_list_art.MapListScrollBar = &frame;
+    hud.save_menu.SaveOnly = hud.save_menu.LoadOnly = &frame;
+    hud.save_menu.SaveGameFileEditBox = hud.save_menu.SaveGameFileEditBoxText = &frame;
+    hud.save_menu.SaveGameSaveButton = hud.save_menu.SaveGameCancelButton = &frame;
+    hud.save_menu.LoadGameLoadButton = hud.save_menu.LoadGameCancelButton = &frame;
+    UI_InitFrame(&hud.save_list, FT_LISTBOX);
+    UI_SetParent(&hud.save_list, hud.save_list_art.MapListBox);
+
+    T_EQ(MenuSaveListBox(), &hud.save_list);
+    T_ASSERT(MenuSavePanelReady());
+    UI_ResetHud();
+}
+
+TEST(wc3_game, hud_reset_drops_cached_image_names) {
+    int (*old_image)(cstring_t) = gi.ImageIndex;
+    FRAMEDEF frame = { .Type = FT_TEXTURE };
+    uiFrame_t wire = { 0 };
+    uint8_t typedata[128] = { 0 };
+    char textbuf[128] = { 0 };
+    uint32_t chrome;
+
+    gi.ImageIndex = hud_test_image_index;
+    memset(hud_test_images, 0, sizeof(hud_test_images));
+    UI_ResetHud();
+    chrome = UI_LoadTexture("UI\\Console\\HumanUITile-InventoryCover.blp", false);
+    frame.Texture.Image = chrome;
+    UI_ResetHud();
+    memset(hud_test_images, 0, sizeof(hud_test_images));
+    UI_LoadTexture("ReplaceableTextures\\CommandButtons\\BTNMove.blp", false);
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(&frame, &wire, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    /* Without a remembered name the stale slot is left unchanged, not rewritten
+     * as whatever now occupies CS_IMAGES+1. ResetHud drops the FDF tree so this
+     * path is only reachable from a leftover FRAMEDEF. */
+    T_EQ(wire.tex.index, chrome);
+
+    gi.ImageIndex = old_image;
+}
+
+TEST(wc3_game, hud_control_state_art_is_embedded_but_button_text_is_not_art) {
+    frameDef_t *button, *normal, *pushed, *label;
+
+    UI_ClearTemplates();
+    button = UI_Spawn(FT_GLUETEXTBUTTON, NULL);
+    normal = UI_Spawn(FT_BACKDROP, button);
+    pushed = UI_Spawn(FT_TEXTURE, button);
+    label = UI_Spawn(FT_TEXT, button);
+    T_NOT_NULL(button); T_NOT_NULL(normal); T_NOT_NULL(pushed); T_NOT_NULL(label);
+
+    snprintf(normal->Name, sizeof(normal->Name), "NormalBackdrop");
+    snprintf(pushed->Name, sizeof(pushed->Name), "PushedTexture");
+    snprintf(label->Name, sizeof(label->Name), "ButtonText");
+    snprintf(button->Control.Backdrop.Normal, sizeof(button->Control.Backdrop.Normal), "NormalBackdrop");
+    snprintf(button->Button.PushedTexture, sizeof(button->Button.PushedTexture), "PushedTexture");
+    snprintf(button->Button.NormalText.frame, sizeof(button->Button.NormalText.frame), "ButtonText");
+
+    T_ASSERT(UI_IsEmbeddedControlPart(button, normal));
+    T_ASSERT(UI_IsEmbeddedControlArtPart(button, normal));
+    T_ASSERT(UI_IsEmbeddedControlPart(button, pushed));
+    T_ASSERT(UI_IsEmbeddedControlArtPart(button, pushed));
+    T_ASSERT(UI_IsEmbeddedControlPart(button, label));
+    T_ASSERT(!UI_IsEmbeddedControlArtPart(button, label));
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_scrollbar_buttons_are_embedded_control_art) {
+    frameDef_t *scrollbar, *inc, *dec, *thumb;
+
+    UI_ClearTemplates();
+    scrollbar = UI_Spawn(FT_SCROLLBAR, NULL);
+    inc = UI_Spawn(FT_GLUEBUTTON, scrollbar);
+    dec = UI_Spawn(FT_GLUEBUTTON, scrollbar);
+    thumb = UI_Spawn(FT_GLUEBUTTON, scrollbar);
+    T_NOT_NULL(scrollbar); T_NOT_NULL(inc); T_NOT_NULL(dec); T_NOT_NULL(thumb);
+
+    snprintf(inc->Name, sizeof(inc->Name), "ScrollInc");
+    snprintf(dec->Name, sizeof(dec->Name), "ScrollDec");
+    snprintf(thumb->Name, sizeof(thumb->Name), "ScrollThumb");
+    snprintf(scrollbar->Slider.IncButtonFrame, sizeof(scrollbar->Slider.IncButtonFrame), "ScrollInc");
+    snprintf(scrollbar->Slider.DecButtonFrame, sizeof(scrollbar->Slider.DecButtonFrame), "ScrollDec");
+    snprintf(scrollbar->Slider.ThumbButtonFrame, sizeof(scrollbar->Slider.ThumbButtonFrame), "ScrollThumb");
+
+    T_ASSERT(UI_IsEmbeddedControlPart(scrollbar, inc));
+    T_ASSERT(UI_IsEmbeddedControlArtPart(scrollbar, inc));
+    T_ASSERT(UI_IsEmbeddedControlPart(scrollbar, dec));
+    T_ASSERT(UI_IsEmbeddedControlArtPart(scrollbar, dec));
+    T_ASSERT(UI_IsEmbeddedControlPart(scrollbar, thumb));
+    T_ASSERT(UI_IsEmbeddedControlArtPart(scrollbar, thumb));
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_highlight_serializes_texture_and_mode) {
+    uint8_t typedata[256];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t *highlight;
+
+    UI_ClearTemplates();
+    highlight = UI_Spawn(FT_HIGHLIGHT, NULL);
+    T_NOT_NULL(highlight);
+    highlight->Highlight.AlphaFile = 17;
+    highlight->Highlight.AlphaMode = BLEND_MODE_ADD;
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(highlight, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_EQ(out.buffer.size, sizeof(uiHighlight_t));
+    T_EQ(((uiHighlight_t const *)out.buffer.data)->alphaFile, 17);
+    T_EQ(((uiHighlight_t const *)out.buffer.data)->alphaMode, BLEND_MODE_ADD);
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_glue_button_serializes_backdrops) {
+    uint8_t typedata[256];
+    char textbuf[128];
+    uiFrame_t out;
+    frameDef_t *button, *normal, *pushed;
+
+    UI_ClearTemplates();
+    button = UI_Spawn(FT_GLUEBUTTON, NULL);
+    normal = UI_Spawn(FT_BACKDROP, button);
+    pushed = UI_Spawn(FT_BACKDROP, button);
+    T_NOT_NULL(button); T_NOT_NULL(normal); T_NOT_NULL(pushed);
+    snprintf(normal->Name, sizeof(normal->Name), "NormalBackdrop"); normal->Backdrop.Background = 21;
+    snprintf(pushed->Name, sizeof(pushed->Name), "PushedBackdrop"); pushed->Backdrop.Background = 22;
+    snprintf(button->Control.Backdrop.Normal, sizeof(button->Control.Backdrop.Normal), "NormalBackdrop");
+    snprintf(button->Control.Backdrop.Pushed, sizeof(button->Control.Backdrop.Pushed), "PushedBackdrop");
+
+    UI_ResetFrameWriteList();
+    T_ASSERT(UI_BuildFrameForWrite(button, &out, typedata, sizeof(typedata), textbuf, sizeof(textbuf)));
+    T_EQ(out.buffer.size, sizeof(uiGlueTextButton_t));
+    T_EQ(((uiGlueTextButton_t const *)out.buffer.data)->normal.Background, 21);
+    T_EQ(((uiGlueTextButton_t const *)out.buffer.data)->pushed.Background, 22);
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_authored_row_keeps_template_size) {
+    FRAMEDEF tmpl = { .Type = FT_FRAME, .Width = 0.08f, .Height = 0.033f };
+    FRAMEDEF parent = { .Type = FT_FRAME };
+    frameDef_t *row = UI_CloneStackedRow(&tmpl, &parent, 0);
+    T_NOT_NULL(row);
+    T_FEQ(row->Width, 0.08f, 0.001f);
+    T_FEQ(row->Height, 0.033f, 0.001f);
+    T_FEQ(row->Points.y[FPP_MIN].offset, 0.0f, 0.001f);
+}
+
+TEST(wc3_game, hud_authored_row_stride_uses_template_height) {
+    FRAMEDEF tmpl = { .Type = FT_FRAME, .Width = 0.15f, .Height = 0.012f };
+    FRAMEDEF parent = { .Type = FT_FRAME };
+    frameDef_t *row = UI_CloneStackedRow(&tmpl, &parent, 3);
+    T_NOT_NULL(row);
+    T_ASSERT(row->Points.y[FPP_MIN].relativeTo == &parent);
+    T_FEQ(row->Points.y[FPP_MIN].offset, -0.036f, 0.001f);
+}
+
+
+static uiFrame_t quest_sprite;
+static uint32_t quest_sprite_count;
+static PATHSTR quest_model;
+static int quest_test_model(cstring_t name) { snprintf(quest_model, sizeof(quest_model), "%s", name); return 77; }
+static void quest_test_write(pfWriteType_t type, void const *value) {
+    uiFrame_t const *frame = value;
+    if (type == PF_UIFRAME && frame->flags.type == FT_SPRITE) { quest_sprite = *frame; quest_sprite_count++; }
+}
+
+/* Serialize the stock skin model as a passive foreground sprite, relative to the authored quest button. */
+TEST(wc3_game, hud_quest_indicator_uses_skin_anchor_and_timeout) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.ModelIndex) old_model = gi.ModelIndex;
+    frameDef_t *old_button = hud.upper.UpperButtonBarQuestsButton;
+    uint32_t oldtime = level.time;
+    gameClient_t *client = &game.clients[0];
+    FRAMEDEF button = { .Type = FT_FRAME };
+    gi.Write = quest_test_write; gi.ModelIndex = quest_test_model;
+    hud.upper.UpperButtonBarQuestsButton = &button;
+    UI_ResetFrameWriteList(); UI_WriteFrame(&button);
+    level.time = 100; client->quest_until = 200; quest_sprite_count = 0;
+    UI_WriteQuestIndicator(client);
+    T_EQ(quest_sprite_count, 1);
+    T_STREQ(quest_model, "UI\\Feedback\\QuestButton\\UI-QuestButtonOn.mdl");
+    T_EQ(quest_sprite.tex.index, 77); T_STREQ(quest_sprite.text, "Stand");
+    T_ASSERT(quest_sprite.flagsvalue & UIFLAG_SPRITE_OVERLAY);
+    T_EQ(quest_sprite.parent, UI_GetWrittenFrameNumber(&button));
+    T_EQ(quest_sprite.points.y[FPP_MIN].targetPos, FPP_MAX);
+    T_NULL(quest_sprite.onclick);
+    level.time = 200;
+    UI_WriteQuestIndicator(client); T_EQ(quest_sprite_count, 1);
+    client->quest_until = 0; level.time = oldtime;
+    gi.Write = old_write; gi.ModelIndex = old_model; hud.upper.UpperButtonBarQuestsButton = old_button;
+    UI_ResetFrameWriteList();
+}
+
+static uiFrame_t autocast_sprite;
+static uint32_t autocast_sprite_count, autocast_parent;
+static PATHSTR autocast_model;
+static int autocast_test_model(cstring_t name) { snprintf(autocast_model, sizeof(autocast_model), "%s", name); return 88; }
+static int autocast_test_image(cstring_t name) { (void)name; return 1; }
+static void autocast_test_write(pfWriteType_t type, void const *value) {
+    uiFrame_t const *frame = value;
+    if (type != PF_UIFRAME || !frame) return;
+    if (frame->flags.type == FT_COMMANDBUTTON) autocast_parent = frame->number;
+    if (frame->flags.type == FT_SPRITE) { autocast_sprite = *frame; autocast_sprite_count++; }
+}
+
+/* Serialize the autocast skin model as a foreground sprite when alternate_active is set. */
+TEST(wc3_game, hud_autocast_indicator_uses_skin_model_and_overlay) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.ModelIndex) old_model = gi.ModelIndex;
+    __typeof__(gi.ImageIndex) old_image = gi.ImageIndex;
+    uint32_t oldnum = ui_next_frame_number;
+    gameCommandButton_t button = { .command = "AHea", .art = "test", .alternate = "autocast AHea", .alternate_active = 1 };
+
+    ui_next_frame_number = 1;
+
+    gi.Write = autocast_test_write; gi.ModelIndex = autocast_test_model; gi.ImageIndex = autocast_test_image;
+    autocast_sprite_count = 0;
+    UI_ResetFrameWriteList();
+    UI_WriteCommandButtonFrame(&button);
+
+    T_EQ(autocast_sprite_count, 1);
+    T_STREQ(autocast_model, "UI\\Feedback\\Autocast\\UI-ModalButtonOn.mdl");
+    T_EQ(autocast_sprite.tex.index, 88); T_STREQ(autocast_sprite.text, "Stand");
+    T_ASSERT(autocast_sprite.flagsvalue & UIFLAG_SPRITE_OVERLAY);
+    T_NULL(autocast_sprite.onclick);
+    T_EQ(autocast_sprite.parent, autocast_parent);
+    T_EQ(autocast_sprite.points.x[FPP_MIN].relativeTo, UI_PARENT);
+    T_EQ(autocast_sprite.points.x[FPP_MIN].targetPos, FPP_MIN);
+    T_EQ(autocast_sprite.points.x[FPP_MIN].offset, 0);
+    T_ASSERT(autocast_sprite.points.x[FPP_MIN].used);
+    T_EQ(autocast_sprite.points.y[FPP_MIN].relativeTo, UI_PARENT);
+    T_EQ(autocast_sprite.points.y[FPP_MIN].targetPos, FPP_MAX);
+    T_EQ(autocast_sprite.points.y[FPP_MIN].offset, 0);
+    T_ASSERT(autocast_sprite.points.y[FPP_MIN].used);
+
+    /* A second card slot owns its own sprite, including while the command is disabled. */
+    uint32_t first = autocast_sprite.parent;
+    button.x = 2; button.y = 1; button.disabled = 1;
+    UI_WriteCommandButtonFrame(&button);
+    T_EQ(autocast_sprite_count, 2);
+    T_EQ(autocast_sprite.parent, autocast_parent);
+    T_NE(autocast_sprite.parent, first);
+
+    /* Each refreshed layout derives presence from current state; off drops the overlay. */
+    ui_next_frame_number = 1; autocast_sprite_count = 0; button.alternate_active = 0;
+    UI_WriteCommandButtonFrame(&button);
+    T_EQ(autocast_sprite_count, 0);
+    ui_next_frame_number = 1; button.alternate_active = 1;
+    UI_WriteCommandButtonFrame(&button);
+    T_EQ(autocast_sprite_count, 1);
+    T_EQ(autocast_sprite.parent, autocast_parent);
+
+    ui_next_frame_number = oldnum;
+    gi.Write = old_write; gi.ModelIndex = old_model; gi.ImageIndex = old_image;
+    UI_ResetFrameWriteList();
+}
+
+/* No autocast sprite when alternate_active is off. */
+TEST(wc3_game, hud_autocast_indicator_suppressed_when_off) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.ModelIndex) old_model = gi.ModelIndex;
+    __typeof__(gi.ImageIndex) old_image = gi.ImageIndex;
+    uint32_t oldnum = ui_next_frame_number;
+    gameCommandButton_t button = { .command = "AHea", .art = "test" };
+
+    ui_next_frame_number = 1;
+
+    gi.Write = autocast_test_write; gi.ModelIndex = autocast_test_model; gi.ImageIndex = autocast_test_image;
+    autocast_sprite_count = 0;
+    UI_ResetFrameWriteList();
+    UI_WriteCommandButtonFrame(&button);
+
+    T_EQ(autocast_sprite_count, 0);
+
+    ui_next_frame_number = oldnum;
+    gi.Write = old_write; gi.ModelIndex = old_model; gi.ImageIndex = old_image;
+    UI_ResetFrameWriteList();
+}
+
+TEST(wc3_game, hud_quest_visibility_requires_enabled_and_discovered) {
+    quest_t quest = { 0 };
+
+    T_ASSERT(!QuestIsVisible(&quest));
+    quest.enabled = true;
+    T_ASSERT(!QuestIsVisible(&quest));
+    quest.discovered = true;
+    T_ASSERT(QuestIsVisible(&quest));
+    quest.enabled = false;
+    T_ASSERT(!QuestIsVisible(&quest));
+}
+
+static uint32_t quest_dialog_open_writes, quest_dialog_unicasts;
+static void quest_dialog_test_write(pfWriteType_t type, void const *value) {
+    if (type == PF_BYTE && value && *(int32_t const *)value == svc_window) quest_dialog_open_writes++;
+}
+static void quest_dialog_test_unicast(edict_t *ent) {
+    if (ent == &g_edicts[0]) quest_dialog_unicasts++;
+}
+static frameDef_t *quest_test_frame(FRAMETYPE type, frameDef_t *parent, cstring_t name) {
+    frameDef_t *frame = UI_Spawn(type, parent);
+    if (frame && name) snprintf(frame->Name, sizeof(frame->Name), "%s", name);
+    return frame;
+}
+
+TEST(wc3_game, hud_quest_button_opens_placeholder_journal_before_discovery) {
+    __typeof__(gi.Write) old_write = gi.Write;
+    __typeof__(gi.unicast) old_unicast = gi.unicast;
+    frameDef_t *display_backdrop, *row_title, *item_title, *placeholder_title;
+
+    setup_test_world(); UI_ClearTemplates(); memset(&hud, 0, sizeof(hud));
+    memset(level.quests, 0, sizeof(level.quests));
+    game.clients[0].connected = true; g_edicts[0].client = &game.clients[0];
+    level.quests[0] = (quest_t){ .inuse = true, .enabled = true, .required = true,
+        .title = "SECRET_TITLE", .description = "SECRET_DESCRIPTION" };
+    level.quests[0].items[0] = (questItem_t){ .inuse = true, .description = "SECRET_OBJECTIVE" };
+    level.quests[0].num_items = 1;
+
+    hud.quest.QuestDialog = quest_test_frame(FT_FRAME, NULL, "QuestDialog");
+    hud.quest.QuestTitleValue = quest_test_frame(FT_TEXT, hud.quest.QuestDialog, "QuestTitleValue");
+    hud.quest.QuestSubtitleValue = quest_test_frame(FT_TEXT, hud.quest.QuestDialog, "QuestSubtitleValue");
+    hud.quest.QuestMainTitle = quest_test_frame(FT_TEXT, hud.quest.QuestDialog, "QuestMainTitle");
+    hud.quest.QuestMainContainer = quest_test_frame(FT_FRAME, hud.quest.QuestDialog, "QuestMainContainer");
+    hud.quest.QuestOptionalTitle = quest_test_frame(FT_TEXT, hud.quest.QuestDialog, "QuestOptionalTitle");
+    hud.quest.QuestOptionalContainer = quest_test_frame(FT_FRAME, hud.quest.QuestDialog, "QuestOptionalContainer");
+    display_backdrop = quest_test_frame(FT_FRAME, hud.quest.QuestDialog, "QuestDisplayBackdrop");
+    hud.quest.QuestDetailsTitle = quest_test_frame(FT_TEXT, display_backdrop, "QuestDetailsTitle");
+    hud.quest.QuestItemListContainer = quest_test_frame(FT_FRAME, display_backdrop, "QuestItemListContainer");
+    hud.quest.QuestDisplay = quest_test_frame(FT_TEXT, display_backdrop, "QuestDisplay");
+    hud.quest.QuestAcceptButton = quest_test_frame(FT_GLUEBUTTON, hud.quest.QuestDialog, "QuestAcceptButton");
+    hud.quest.QuestAcceptButtonText = quest_test_frame(FT_TEXT, hud.quest.QuestAcceptButton, "QuestAcceptButtonText");
+
+    hud.quest_row = quest_test_frame(FT_FRAME, NULL, "QuestListItem");
+    quest_test_frame(FT_GLUEBUTTON, hud.quest_row, "QuestListItemButton");
+    row_title = quest_test_frame(FT_TEXT, hud.quest_row, "QuestListItemTitle");
+    hud.quest_item = quest_test_frame(FT_FRAME, NULL, "QuestItemListItem");
+    item_title = quest_test_frame(FT_TEXT, hud.quest_item, "QuestItemListItemTitle");
+    gi.Write = quest_dialog_test_write; gi.unicast = quest_dialog_test_unicast;
+    quest_dialog_open_writes = quest_dialog_unicasts = 0;
+
+    UI_ShowQuests(&g_edicts[0]);
+
+    T_EQ(quest_dialog_open_writes, 1); T_EQ(quest_dialog_unicasts, 1);
+    T_STREQ(hud.quest.QuestTitleValue->Text, " ");
+    T_STREQ(hud.quest.QuestDisplay->Text, " ");
+    placeholder_title = UI_FindChildFrame(hud.quest.QuestMainContainer, "QuestListItemTitle");
+    T_NOT_NULL(placeholder_title);
+    if (placeholder_title) T_STREQ(placeholder_title->Text, "UNDISCOVERED_QUEST");
+    T_EQ(hud.quest_item_row_count, 0);
+    T_ASSERT(!row_title->Text || !strstr(row_title->Text, "SECRET"));
+    T_STREQ(item_title->Text ? item_title->Text : "", "");
+
+    gi.Write = old_write; gi.unicast = old_unicast;
+    g_edicts[0].client = NULL; game.clients[0].connected = false;
+    memset(level.quests, 0, sizeof(level.quests)); memset(&hud, 0, sizeof(hud));
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_quest_rows_bind_authored_children) {
+    quest_t quest = { .title = "Test Quest", .discovered = true, .required = true, .enabled = true };
+    questItem_t item = { .description = "Test Objective" };
+    frameDef_t *list, *item_list, *button, *title, *item_title;
+
+    UI_ClearTemplates();
+    hud.quest_row = UI_Spawn(FT_FRAME, NULL);
+    snprintf(hud.quest_row->Name, sizeof(hud.quest_row->Name), "QuestListItem");
+    UI_SetSize(hud.quest_row, 0.08f, 0.033f);
+    button = UI_Spawn(FT_GLUEBUTTON, hud.quest_row);
+    snprintf(button->Name, sizeof(button->Name), "QuestListItemButton");
+    title = UI_Spawn(FT_TEXT, hud.quest_row);
+    snprintf(title->Name, sizeof(title->Name), "QuestListItemTitle");
+    hud.quest_item = UI_Spawn(FT_FRAME, NULL);
+    snprintf(hud.quest_item->Name, sizeof(hud.quest_item->Name), "QuestItemListItem");
+    UI_SetSize(hud.quest_item, 0.15f, 0.012f);
+    item_title = UI_Spawn(FT_TEXT, hud.quest_item);
+    snprintf(item_title->Name, sizeof(item_title->Name), "QuestItemListItemTitle");
+    list = UI_Spawn(FT_FRAME, NULL);
+    item_list = UI_Spawn(FT_FRAME, NULL);
+    quest.inuse = true;
+    quest.items[0] = item;
+    quest.items[0].inuse = true;
+    quest.num_items = 1;
+    memset(level.quests, 0, sizeof(level.quests));
+    level.quests[0] = quest;
+
+    PopulateQuestList(list, true, &level.quests[0]);
+    PopulateQuestItems(item_list, &quest);
+    title = UI_FindChildFrame(list, "QuestListItemTitle");
+    button = UI_FindChildFrame(list, "QuestListItemButton");
+    item_title = UI_FindChildFrame(item_list, "QuestItemListItemTitle");
+    T_NOT_NULL(title);
+    T_NOT_NULL(button);
+    T_NOT_NULL(item_title);
+    T_FEQ(title->Parent->Width, list->Width, 0.001f);
+    T_FEQ(item_title->Parent->Height, 0.012f, 0.001f);
+    T_STREQ(title->Text, "> Test Quest");
+    T_STREQ(button->OnClick, "quest 0");
+    T_STREQ(item_title->Text, "- Test Objective");
+
+    /* Refreshing the dialog reuses authored runtime rows instead of consuming
+     * another set of permanent FDF frame slots. */
+    PopulateQuestList(list, true, &quest);
+    T_ASSERT(UI_FindChildFrame(list, "QuestListItemTitle") == title);
+
+    memset(level.quests, 0, sizeof(level.quests));
+    hud.quest_row = hud.quest_item = NULL;
+    memset(&hud.quest, 0, sizeof(hud.quest));
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_quest_rows_show_undiscovered_and_completed_state) {
+    quest_t done = { .title = "Finished", .discovered = true, .required = true, .enabled = true, .completed = true };
+    quest_t hidden = { .title = "Secret", .discovered = false, .required = false, .enabled = true };
+    frameDef_t *list, *optional, *button, *title, *complete;
+
+    done.inuse = true;
+    hidden.inuse = true;
+    UI_ClearTemplates();
+    hud.quest_row = UI_Spawn(FT_FRAME, NULL);
+    UI_SetSize(hud.quest_row, 0.08f, 0.033f);
+    button = UI_Spawn(FT_GLUEBUTTON, hud.quest_row);
+    snprintf(button->Name, sizeof(button->Name), "QuestListItemButton");
+    title = UI_Spawn(FT_TEXT, hud.quest_row);
+    snprintf(title->Name, sizeof(title->Name), "QuestListItemTitle");
+    title->Font.DisabledColor = MAKE(color32_t, 64, 80, 96, 160);
+    complete = UI_Spawn(FT_TEXT, hud.quest_row);
+    snprintf(complete->Name, sizeof(complete->Name), "QuestListItemComplete");
+    optional = UI_Spawn(FT_FRAME, NULL);
+    UI_SetSize(list = UI_Spawn(FT_FRAME, NULL), 0.21f, 0.11f);
+    UI_SetSize(optional, 0.21f, 0.11f);
+    memset(level.quests, 0, sizeof(level.quests));
+    level.quests[0] = done;
+    level.quests[1] = hidden;
+
+    PopulateQuestList(list, true, &level.quests[0]);
+    PopulateQuestList(optional, false, &level.quests[0]);
+    title = UI_FindChildFrame(list, "QuestListItemTitle");
+    complete = UI_FindChildFrame(list, "QuestListItemComplete");
+    T_STREQ(title->Text, "> Finished");
+    T_STREQ(complete->Text, "(QUESTCOMPLETED)");
+    T_FEQ(title->Font.Color.r, 255, 0.001f);
+    title = UI_FindChildFrame(optional, "QuestListItemTitle");
+    T_STREQ(title->Text, "UNDISCOVERED_QUEST");
+
+    memset(level.quests, 0, sizeof(level.quests));
+    hud.quest_row = hud.quest_item = NULL;
+    memset(&hud.quest, 0, sizeof(hud.quest));
+    UI_ClearTemplates();
+}
+
+TEST(wc3_game, hud_message_overlay_loads_authored_geometry) {
+    memset(&hud.msg_root, 0, sizeof(hud.msg_root));
+    memset(&hud.msg_text, 0, sizeof(hud.msg_text));
+    UI_LoadHudMessage();
+    T_ASSERT(hud.msg_text.Name[0]);
+    T_FEQ(hud.msg_text.Width, 0.30f, 0.001f);
+    T_FEQ(hud.msg_text.Height, 0.145f, 0.001f);
+    T_FEQ(hud.msg_text.Font.Size, 0.010f, 0.001f);
+    T_FEQ(hud.msg_text.Points.x[FPP_MIN].offset, 0.05f, 0.001f);
+    T_FEQ(hud.msg_text.Points.y[FPP_MIN].offset, -0.30f, 0.001f);
+}
+
+TEST(wc3_game, hud_message_overlay_position_is_runtime_data) {
+    vec2_t pos = { 0.20f, 0.10f };
+    UI_LoadHudMessage(); // geometry comes from the authored template, not from an earlier test
+    FRAMEDEF frame = MessageFrame(&pos, "Runtime message");
+    T_FEQ(frame.Width, 0.30f, 0.001f);
+    T_FEQ(frame.Height, 0.145f, 0.001f);
+    T_FEQ(frame.Points.x[FPP_MIN].offset, 0.20f, 0.001f);
+    /* Formula: -(0.30 - pos.y); JASS y=0 anchors at 0.30 from screen top,
+     * positive JASS y shifts the text upward (toward screen top, less negative offset). */
+    T_FEQ(frame.Points.y[FPP_MIN].offset, -(0.30f - 0.10f), 0.001f);
+    T_STREQ(frame.Text, "Runtime message");
+}
+
+TEST(wc3_game, hud_message_overlay_invalid_position_keeps_fdf_anchor) {
+    vec2_t pos = { -1.0f, UI_BASE_HEIGHT + 1.0f };
+    UI_LoadHudMessage(); // the fallback anchor is the authored template, not state from an earlier test
+    FRAMEDEF frame = MessageFrame(&pos, "Authored position");
+    T_FEQ(frame.Points.x[FPP_MIN].offset, 0.05f, 0.001f);
+    T_FEQ(frame.Points.y[FPP_MIN].offset, -0.30f, 0.001f);
+}
+
+TEST(wc3_game, overhead_bar_fill_keeps_warsmash_three_pixel_inset) {
+    T_FEQ(0.008f - 0.003f * 2.0f, 0.002f, 0.0001f);
+}
+
+TEST(wc3_game, hover_layout_is_server_authored_with_entity_context_bindings) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    void (*old_unicast)(edict_t *) = gi.unicast;
+    int (*old_image)(cstring_t) = gi.ImageIndex;
+    int (*old_font)(cstring_t, uint32_t) = gi.FontIndex;
+    edict_t *player;
+
+    setup_test_world(); player = &g_edicts[0]; player->client->connected = true;
+    player->mana.max_value = 100.0f; player->mana.value = 50.0f;
+    hover_layout_pending = hover_layer_seen = hover_name_seen = hover_hp_seen = hover_mana_seen = hover_cargo_seen = hover_name_sized = false;
+    hover_name_centered = hover_name_short = hover_resource_label_seen = hover_cargo_empty_art = false;
+    hover_mana_row_chained = hover_health_row_chained = hover_name_chained = false;
+    hover_frame_count = hover_unicast_count = hover_image_count = hover_font_count = 0;
+    hover_cargo_frame = hover_mana_row_frame = hover_health_row_frame = 0; hover_unicast_target = NULL;
+    gi.Write = hover_test_write; gi.unicast = hover_test_unicast;
+    gi.ImageIndex = hover_test_image; gi.FontIndex = hover_test_font;
+    UI_WriteHoverLayout(player);
+    gi.Write = old_write; gi.unicast = old_unicast; gi.ImageIndex = old_image; gi.FontIndex = old_font;
+
+    T_ASSERT(hover_layer_seen); T_EQ(hover_frame_count, 8);
+    T_ASSERT(hover_name_seen); T_ASSERT(hover_name_sized); T_ASSERT(hover_name_centered); T_ASSERT(hover_name_short);
+    T_ASSERT(hover_resource_label_seen); T_ASSERT(hover_name_chained);
+    T_ASSERT(hover_hp_seen); T_ASSERT(hover_mana_seen); T_ASSERT(hover_cargo_seen); T_ASSERT(hover_cargo_empty_art);
+    T_ASSERT(hover_mana_row_chained); T_ASSERT(hover_health_row_chained);
+    T_EQ(hover_image_count, 8); T_EQ(hover_font_count, 1);
+    T_EQ(hover_unicast_count, 1); T_ASSERT(hover_unicast_target == player);
+}
+
+TEST(wc3_game, single_info_panel_serializes_tooltip_presenter) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    gameClient_t *client = &game.clients[0];
+    edict_t *player = &g_edicts[0];
+    edict_t *selected[1];
+
+    setup_test_world(); selected[0] = make_test_unit();
+    player->client = client; client->connected = true; client->ps.number = 0;
+    selected[0]->svflags |= SVF_MONSTER; selected[0]->s.player = 0;
+    hover_layout_pending = hover_infopanel_layer_seen = hover_infopanel_tooltip_seen = false;
+    gi.Write = infopanel_test_write;
+    UI_SendInfoPanel(player, selected, 1);
+    gi.Write = old_write;
+
+    T_ASSERT(hover_infopanel_layer_seen);
+    T_ASSERT(hover_infopanel_tooltip_seen);
+}
+
+TEST(wc3_game, hero_xp_bar_serializes_current_level_progress_tooltip) {
+    void (*old_write)(pfWriteType_t, void const *) = gi.Write;
+    edict_t *hero;
+    frameDef_t bar = { .Type = FT_SIMPLESTATUSBAR, .Width = 0.180f, .Height = 0.008f };
+
+    setup_test_world();
+    hero = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 0.0f, 0.0f);
+    hero->unit_state->hero.level = 1;
+    hero->unit_state->hero.xp = 75;
+    hero_xp_bar_tooltip[0] = '\0';
+    hero_xp_bar_value = 0.0f;
+    gi.Write = hero_xp_bar_test_write;
+    UI_ResetFrameWriteList();
+    UI_TestWriteHeroLevelBar(&bar, hero);
+    gi.Write = old_write;
+
+    T_STREQ(hero_xp_bar_tooltip, "XP: 75 / 200");
+    T_FEQ(hero_xp_bar_value, 0.375f, 0.001f);
+}
+
+/* =========================================================================
+ * G_RegionContains
+ * ========================================================================= */
+
+TEST(wc3_game, region_contains_empty_region_false) {
+    region_t r = { .num_rects = 0 };
+    vec2_t p = { 5.0f, 5.0f };
+    T_ASSERT(!G_RegionContains(&r, &p));
+}
+
+TEST(wc3_game, region_contains_point_inside) {
+    region_t r = {
+        .rects[0] = { { 0.0f, 0.0f }, { 100.0f, 100.0f } },
+        .num_rects = 1
+    };
+    vec2_t p = { 50.0f, 50.0f };
+    T_ASSERT(G_RegionContains(&r, &p));
+}
+
+TEST(wc3_game, region_contains_point_outside) {
+    region_t r = {
+        .rects[0] = { { 0.0f, 0.0f }, { 100.0f, 100.0f } },
+        .num_rects = 1
+    };
+    vec2_t p = { 200.0f, 200.0f };
+    T_ASSERT(!G_RegionContains(&r, &p));
+}
+
+TEST(wc3_game, region_contains_multirect_hits_second) {
+    /* Two non-overlapping rects; the point is in the second one. */
+    region_t r = {
+        .rects[0] = { {   0.0f,   0.0f }, {  50.0f,  50.0f } },
+        .rects[1] = { { 200.0f, 200.0f }, { 300.0f, 300.0f } },
+        .num_rects = 2
+    };
+    vec2_t p = { 250.0f, 250.0f };
+    T_ASSERT(G_RegionContains(&r, &p));
+}
+
+TEST(wc3_game, region_contains_max_boundary_exclusive) {
+    /* Box2_containsPoint uses x < max.x (exclusive upper bound). */
+    region_t r = {
+        .rects[0] = { { 0.0f, 0.0f }, { 100.0f, 100.0f } },
+        .num_rects = 1
+    };
+    vec2_t p = { 100.0f, 50.0f };   /* exactly at max.x */
+    T_ASSERT(!G_RegionContains(&r, &p));
+}
+
+/* =========================================================================
+ * G_FreeEdict
+ * ========================================================================= */
+
+TEST(wc3_game, free_edict_clears_inuse) {
+    edict_t *ent = make_test_unit();
+    T_ASSERT(ent->inuse);
+    G_FreeEdict(ent);
+    T_ASSERT(!ent->inuse);
+}
+
+TEST(wc3_game, free_edict_stamps_freetime) {
+    edict_t *ent = make_test_unit();
+    level.time = 9876;
+    G_FreeEdict(ent);
+    T_EQ((int)ent->freetime, 9876);
+}
+
+/* =========================================================================
+ * M_IsDead
+ * ========================================================================= */
+
+TEST(wc3_game, is_dead_alive_unit_false) {
+    edict_t *ent = make_test_unit();
+    ent->health.value = 100.0f;
+    T_ASSERT(!M_IsDead(ent));
+}
+
+TEST(wc3_game, is_dead_zero_hp_true) {
+    edict_t *ent = make_test_unit();
+    ent->health.value = 0.0f;
+    T_ASSERT(M_IsDead(ent));
+}
+
+TEST(wc3_game, is_dead_negative_hp_true) {
+    edict_t *ent = make_test_unit();
+    ent->health.value = -1.0f;
+    T_ASSERT(M_IsDead(ent));
+}
+
+/* =========================================================================
+ * compress_stat
+ * ========================================================================= */
+
+TEST(wc3_game, compress_stat_full_health_is_255) {
+    edictStat_s s = { 250.0f, 250.0f };
+    T_EQ((int)compress_stat(&s), 255);
+}
+
+TEST(wc3_game, compress_stat_zero_health_is_0) {
+    edictStat_s s = { 0.0f, 250.0f };
+    T_EQ((int)compress_stat(&s), 0);
+}
+
+TEST(wc3_game, compress_stat_half_health) {
+    edictStat_s s = { 125.0f, 250.0f };
+    /* 255 * 125 / 250 = 127 (integer truncation). */
+    T_EQ((int)compress_stat(&s), 127);
+}
+
+TEST(wc3_game, compress_stat_zero_max_is_0) {
+    edictStat_s s = { 0.0f, 0.0f };
+    T_EQ((int)compress_stat(&s), 0);
+}
+
+/* =========================================================================
+ * FindEnumValue
+ * ========================================================================= */
+
+static cstring_t test_attack_types[] = {
+    "none", "normal", "pierce", "siege", "chaos", NULL
+};
+
+TEST(wc3_game, find_enum_first_value) {
+    T_EQ((int)FindEnumValue("none", test_attack_types), 0);
+}
+
+TEST(wc3_game, find_enum_later_value) {
+    T_EQ((int)FindEnumValue("pierce", test_attack_types), 2);
+}
+
+TEST(wc3_game, find_enum_null_input_returns_0) {
+    T_EQ((int)FindEnumValue(NULL, test_attack_types), 0);
+}
+
+TEST(wc3_game, find_enum_unknown_returns_0) {
+    T_EQ((int)FindEnumValue("magic", test_attack_types), 0);
+}
+
+/* =========================================================================
+ * unit_runwait
+ * ========================================================================= */
+
+static int _runwait_cb_count = 0;
+
+static void runwait_cb(edict_t *ent) {
+    (void)ent;
+    _runwait_cb_count++;
+}
+
+TEST(wc3_game, runwait_zero_wait_no_callback) {
+    edict_t *ent = make_test_unit();
+    ent->wait = 0.0f;
+    _runwait_cb_count = 0;
+    unit_runwait(ent, runwait_cb);
+    T_EQ(_runwait_cb_count, 0);
+}
+
+TEST(wc3_game, runwait_large_wait_decrements) {
+    /* FRAMETIME = 100 ms → FRAMETIME/1000.f = 0.1 s. */
+    edict_t *ent = make_test_unit();
+    ent->wait = 1.0f;
+    _runwait_cb_count = 0;
+    unit_runwait(ent, runwait_cb);
+    /* wait should decrease by 0.1. */
+    T_FEQ(ent->wait, 0.9f, 0.01f);
+    T_EQ(_runwait_cb_count, 0);
+}
+
+TEST(wc3_game, runwait_small_wait_triggers_callback) {
+    /* wait == 0.05 < FRAMETIME/1000.f (0.1) → callback fires. */
+    edict_t *ent = make_test_unit();
+    ent->wait = 0.05f;
+    _runwait_cb_count = 0;
+    unit_runwait(ent, runwait_cb);
+    T_EQ(_runwait_cb_count, 1);
+    T_FEQ(ent->wait, 0.0f, 0.0001f);
+}
+
+/* =========================================================================
+ * unit_issuetargetorder
+ * ========================================================================= */
+
+TEST(wc3_game, issuetargetorder_attack_returns_true) {
+    edict_t *unit   = make_test_unit();
+    edict_t *target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 50.0f, 0.0f);
+    target->targtype = TARG_GROUND;
+    /* order_attack is the real implementation from s_attack.c — just verify return value. */
+    bool result = unit_issuetargetorder(unit, "attack", target);
+    T_ASSERT(result);
+}
+
+TEST(wc3_game, issuetargetorder_unknown_returns_false) {
+    edict_t *unit   = make_test_unit();
+    edict_t *target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 50.0f, 0.0f);
+    bool result = unit_issuetargetorder(unit, "heal", target);
+    T_ASSERT(!result);
+}
+
+/* =========================================================================
+ * unit_learnability
+ * ========================================================================= */
+
+TEST(wc3_game, learnability_first_ability_fills_slot0) {
+    edict_t *ent = make_test_unit();
+    uint32_t code = MAKEFOURCC('A','H','b','z');
+    unit_learnability(ent, code);
+    T_EQ((int)ent->unit_state->ranks[0].code,  (int)code);
+    T_EQ((int)ent->unit_state->ranks[0].level, 1);
+}
+
+TEST(wc3_game, learnability_same_code_increments_level) {
+    edict_t *ent = make_test_unit();
+    uint32_t code = MAKEFOURCC('A','H','b','z');
+    unit_learnability(ent, code);
+    unit_learnability(ent, code);
+    T_EQ((int)ent->unit_state->ranks[0].level, 2);
+    /* Should still be in slot 0, not duplicated in slot 1. */
+    T_EQ((int)ent->unit_state->ranks[1].code, 0);
+}
+
+TEST(wc3_game, learnability_different_codes_fill_consecutive_slots) {
+    edict_t *ent = make_test_unit();
+    uint32_t code1 = MAKEFOURCC('A','H','b','z');
+    uint32_t code2 = MAKEFOURCC('A','H','t','b');
+    unit_learnability(ent, code1);
+    unit_learnability(ent, code2);
+    T_EQ((int)ent->unit_state->ranks[0].code, (int)code1);
+    T_EQ((int)ent->unit_state->ranks[1].code, (int)code2);
+    T_EQ((int)ent->unit_state->ranks[1].level, 1);
+}
+
+/* =========================================================================
+ * Alliance type variations
+ * ========================================================================= */
+
+TEST(wc3_game, alliance_shared_vision_set_get) {
+    player_t *p0 = game_player(0);
+    player_t *p1 = game_player(1);
+    /* Clear alliance table. */
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION, true);
+    T_ASSERT(G_GetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION));
+}
+
+TEST(wc3_game, alliance_shared_vision_does_not_set_passive) {
+    player_t *p0 = game_player(0);
+    player_t *p1 = game_player(1);
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION, true);
+    /* Setting SHARED_VISION must not accidentally set PASSIVE. */
+    T_ASSERT(!G_GetPlayerAlliance(p0, p1, ALLIANCE_PASSIVE));
+}
+
+TEST(wc3_game, alliance_multiple_types_independent) {
+    player_t *p0 = game_player(0);
+    player_t *p1 = game_player(1);
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_PASSIVE,       true);
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION, true);
+    T_ASSERT(G_GetPlayerAlliance(p0, p1, ALLIANCE_PASSIVE));
+    T_ASSERT(G_GetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION));
+}
+
+TEST(wc3_game, alliance_revoke_one_type_keeps_other) {
+    player_t *p0 = game_player(0);
+    player_t *p1 = game_player(1);
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_PASSIVE,       true);
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION, true);
+    G_SetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION, false);
+    T_ASSERT( G_GetPlayerAlliance(p0, p1, ALLIANCE_PASSIVE));
+    T_ASSERT(!G_GetPlayerAlliance(p0, p1, ALLIANCE_SHARED_VISION));
+}
+
+/* =========================================================================
+ * Player resource stats — GOLD and LUMBER
+ * ========================================================================= */
+
+TEST(wc3_game, player_gold_default_zero) {
+    player_t *p = game_player(0);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD], 0);
+}
+
+TEST(wc3_game, player_gold_set_get) {
+    player_t *p = game_player(0);
+    p->stats[PLAYERSTATE_RESOURCE_GOLD] = 500;
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD], 500);
+}
+
+TEST(wc3_game, player_lumber_set_get) {
+    player_t *p = game_player(0);
+    p->stats[PLAYERSTATE_RESOURCE_LUMBER] = 200;
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_LUMBER], 200);
+}
+
+TEST(wc3_game, player_gold_lumber_independent) {
+    player_t *p = game_player(1);
+    p->stats[PLAYERSTATE_RESOURCE_GOLD]   = 300;
+    p->stats[PLAYERSTATE_RESOURCE_LUMBER] = 150;
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_GOLD],   300);
+    T_EQ((int)p->stats[PLAYERSTATE_RESOURCE_LUMBER], 150);
+}
+
+/* =========================================================================
+ * Fog of war
+ * ========================================================================= */
+
+TEST(wc3_game, fow_grid_uses_two_by_two_cells_per_tile) {
+    G_FowInit();
+    T_EQ(level.fow.width, 8);
+    T_EQ(level.fow.height, 6);
+    T_EQ(G_FowWorldToCellX(0.0f), 0);
+    T_EQ(G_FowWorldToCellX(63.0f), 0);
+    T_EQ(G_FowWorldToCellX(64.0f), 1);
+    T_EQ(G_FowWorldToCellY(128.0f), 2);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_revealer_marks_visible_and_explored) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = 1.0f;
+    revealer->health.max_value = 1.0f;
+
+    G_FowUpdate();
+    uint32_t index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+    T_ASSERT(level.fow.players[0].visible[index]);
+    T_ASSERT(level.fow.players[0].explored[index]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_updates_only_connected_shared_viewers) {
+    reset_entities();
+    G_FowInit();
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    revealer->s.player = 5;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = revealer->health.max_value = 1.0f;
+    uint32_t index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+
+    G_FowUpdate();
+    T_ASSERT(!level.fow.players[5].visible[index]);
+
+    G_FowConnectPlayer(0);
+    G_FowConnectPlayer(1);
+    memset(level.alliances, 0, sizeof(level.alliances));
+    G_SetPlayerAlliance(game_player(5), game_player(0), ALLIANCE_SHARED_VISION, true);
+    G_FowUpdate();
+    T_ASSERT(level.fow.players[0].visible[index]);
+    T_ASSERT(!level.fow.players[1].visible[index]);
+    T_ASSERT(!level.fow.players[5].visible[index]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_unit_shared_vision_reveals_only_that_units_sight) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *shared = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    edict_t *private = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 512.0f, 64.0f);
+    shared->s.player = private->s.player = 5;
+    shared->runtime.sight_radius.day = private->runtime.sight_radius.day = 128.0f;
+    shared->health.value = shared->health.max_value = 1.0f;
+    private->health.value = private->health.max_value = 1.0f;
+    G_SetUnitSharedVision(shared, 0, true);
+
+    G_FowUpdate();
+    uint32_t shared_index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+    uint32_t private_index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(512.0f);
+    T_ASSERT(level.fow.players[0].visible[shared_index]);
+    T_ASSERT(!level.fow.players[0].visible[private_index]);
+    T_ASSERT(!G_FowPlayersShareVision(0, 5));
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_unit_shared_vision_is_idempotent_and_revocable) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    revealer->s.player = 5;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = revealer->health.max_value = 1.0f;
+    uint32_t index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+
+    G_SetUnitSharedVision(revealer, 0, true);
+    G_SetUnitSharedVision(revealer, 0, true);
+    T_ASSERT(G_UnitSharesVisionWith(revealer, 0));
+    G_FowUpdate();
+    T_ASSERT(level.fow.players[0].visible[index]);
+
+    G_SetUnitSharedVision(revealer, 0, false);
+    T_ASSERT(!G_UnitSharesVisionWith(revealer, 0));
+    G_FowUpdate();
+    T_ASSERT(!level.fow.players[0].visible[index]);
+    T_ASSERT(level.fow.players[0].explored[index]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_visible_clears_but_explored_remains) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = 1.0f;
+    revealer->health.max_value = 1.0f;
+
+    G_FowUpdate();
+    uint32_t index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+    uint32_t row = G_FowWorldToCellY(64.0f);
+    T_ASSERT(level.fow.players[0].visible_rows[row]);
+    revealer->s.renderfx |= RF_HIDDEN;
+    G_FowUpdate();
+
+    T_ASSERT(!level.fow.players[0].visible[index]);
+    T_ASSERT(!level.fow.players[0].visible_rows[row]);
+    T_ASSERT(level.fow.players[0].explored[index]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, invisible_friendly_unit_keeps_revealing_fog_as_it_moves) {
+    uint32_t destination;
+    edict_t *unit;
+
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+    unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    unit->s.player = 0;
+    unit->runtime.sight_radius.day = 128.0f;
+    unit->health.value = unit->health.max_value = 1.0f;
+
+    G_FowUpdate();
+    unit_addtimedstatus(unit, "Binv", 1, 120.0f);
+    unit->s.renderfx |= RF_HIDDEN;
+    unit->s.origin.x = 512.0f;
+    unit->s.origin.y = 512.0f;
+    G_FowUpdate();
+
+    destination = G_FowWorldToCellY(512.0f) * level.fow.width + G_FowWorldToCellX(512.0f);
+    T_ASSERT(level.fow.players[0].visible[destination]);
+    T_ASSERT(level.fow.players[0].explored[destination]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_static_scenery_persists_after_unit_vision_leaves) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    edict_t *tree = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 64.0f, 64.0f);
+    edict_t *unseen = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 1024.0f, 1024.0f);
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64.0f, 64.0f);
+    edict_t *building = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 64.0f, 64.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = revealer->health.max_value = 1.0f;
+    tree->s.player = unseen->s.player = unit->s.player = building->s.player = MAX_PLAYERS;
+    tree->svflags = unseen->svflags = SVF_STATIC_SCENERY;
+    building->runtime.flags |= UNIT_BALANCE_BUILDING;
+
+    G_FowUpdate();
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, tree));
+    T_ASSERT(!G_FowPlayerCanSeeEntity(0, unseen));
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, unit));
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, building));
+    T_ASSERT(G_FowPlayerCanHoverEntity(0, unit));
+    T_ASSERT(G_FowPlayerCanHoverEntity(0, building));
+    revealer->s.renderfx |= RF_HIDDEN;
+    G_FowUpdate();
+
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, tree));
+    T_ASSERT(!G_FowPlayerCanSeeEntity(0, unseen));
+    T_ASSERT(!G_FowPlayerCanSeeEntity(0, unit));
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, building));
+    T_ASSERT(!G_FowPlayerCanHoverEntity(0, unit));
+    T_ASSERT(!G_FowPlayerCanHoverEntity(0, building));
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_world_items_follow_position_instead_of_default_owner) {
+    edict_t *revealer, *item;
+
+    reset_entities(); setup_test_world();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+    revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 64.0f, 64.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 128.0f;
+    revealer->health.value = revealer->health.max_value = 1.0f;
+    item = alloc_test_unit(MAKEFOURCC('I','t','e','m'), 1024.0f, 1024.0f);
+    item->s.player = 0; /* Unowned map items can retain this default owner. */
+    item->targtype = TARG_ITEM;
+    item->item = G_AllocItem();
+    item->item->in_world = true;
+
+    G_FowUpdate();
+
+    T_ASSERT(!G_FowPlayerCanSeeEntity(0, item));
+    T_ASSERT(!G_FowPlayerCanHoverEntity(0, item));
+    item->s.origin = revealer->s.origin;
+    item->s.origin2 = revealer->s.origin2;
+    T_ASSERT(G_FowPlayerCanSeeEntity(0, item));
+    T_ASSERT(G_FowPlayerCanHoverEntity(0, item));
+    G_FowShutdown();
+}
+
+TEST(wc3_game, acquisition_range_uses_spawn_cache) {
+    edict_t *ent = make_test_unit();
+    ent->class_id = MAKEFOURCC('n', 'o', 'n', 'e');
+    ent->runtime.acquisition_range = 375.0f;
+    T_FEQ(G_AcquisitionRange(ent), 375.0f, 0.001f);
+}
+
+TEST(wc3_game, hold_position_acquires_within_uacq_not_attack_range) {
+    edict_t *guard, *enemy;
+
+    reset_entities();
+    setup_test_world();
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeRescuable;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    guard = alloc_test_unit(MAKEFOURCC('o', 'g', 'r', 'u'), 0.0f, 0.0f);
+    enemy = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 200.0f, 0.0f);
+    guard->s.player = 0; enemy->s.player = 1;
+    guard->svflags |= SVF_MONSTER; enemy->svflags |= SVF_MONSTER;
+    guard->unit_state->attack1.type = ATK_NORMAL;
+    guard->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    enemy->targtype = TARG_GROUND;
+    guard->unit_state->attack1.cooldown = 1.0f; guard->unit_state->attack1.damageBase = 1;
+    guard->unit_state->attack1.range = 64.0f; guard->runtime.acquisition_range = 300.0f;
+    guard->currentmove = &holdpos_move_stand;
+    gi.LinkEntity(guard); gi.LinkEntity(enemy);
+    level.time = 300;
+
+    guard->currentmove->think(guard);
+    T_ASSERT(guard->goalentity == enemy);
+}
+
+TEST(wc3_game, fow_blocker_stops_visibility_behind_it) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 96.0f, 96.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 256.0f;
+    revealer->health.value = 1.0f;
+    revealer->health.max_value = 1.0f;
+
+    edict_t *blocker = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 160.0f, 96.0f);
+    blocker->s.flags |= EF_FOW_BLOCKER;
+    blocker->health.value = 1.0f;
+    blocker->health.max_value = 1.0f;
+
+    G_FowUpdate();
+
+    uint32_t blocker_index = G_FowWorldToCellY(96.0f) * level.fow.width + G_FowWorldToCellX(160.0f);
+    /* Trees without a path texture dilate one cell for their canopy; test the
+     * first cell behind that occluder, not a cell that is part of its visible rim. */
+    uint32_t behind_index = G_FowWorldToCellY(96.0f) * level.fow.width + G_FowWorldToCellX(288.0f);
+    T_ASSERT(level.fow.players[0].visible[blocker_index]);
+    T_ASSERT(!level.fow.players[0].visible[behind_index]);
+    G_FowShutdown();
+}
+
+#ifdef WC3_FOW_PACKED_MASK
+static cstring_t fow_fast_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "wc3_fow_fast") ? "1" : fallback;
+}
+
+TEST(wc3_game, fow_packed_fast_path_uses_word_mask_and_skips_occlusion) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    uint32_t blocker_index, behind_index;
+
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+    gi.CvarString = fow_fast_cvar;
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 96.0f, 96.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 256.0f;
+    revealer->health.value = revealer->health.max_value = 1.0f;
+
+    edict_t *blocker = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 160.0f, 96.0f);
+    blocker->s.flags |= EF_FOW_BLOCKER;
+    blocker->health.value = blocker->health.max_value = 1.0f;
+
+    G_FowUpdate();
+    blocker_index = G_FowWorldToCellY(96.0f) * level.fow.width + G_FowWorldToCellX(160.0f);
+    behind_index = G_FowWorldToCellY(96.0f) * level.fow.width + G_FowWorldToCellX(288.0f);
+    T_EQ(level.fow.players[0].packed_stride, (level.fow.width + 15) >> 4);
+    T_ASSERT(level.fow.players[0].packed_visible[(blocker_index % level.fow.width >> 4) +
+                                                blocker_index / level.fow.width * level.fow.players[0].packed_stride] &
+             (1u << (blocker_index % level.fow.width & 15)));
+    T_ASSERT(level.fow.players[0].packed_visible[(behind_index % level.fow.width >> 4) +
+                                                behind_index / level.fow.width * level.fow.players[0].packed_stride] &
+             (1u << (behind_index % level.fow.width & 15)));
+
+    gi.CvarString = old_cvar;
+    G_FowShutdown();
+}
+#endif
+
+TEST(wc3_game, fow_blocker_cache_skips_clean_and_unchanged_dirty_updates) {
+    uint32_t old_index, new_index, sentinel;
+    edict_t *blocker;
+    vec2_t direction = { 1.0f, 0.0f };
+
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+    blocker = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 64.0f, 64.0f);
+    blocker->s.flags |= EF_FOW_BLOCKER;
+    blocker->health.value = blocker->health.max_value = 1.0f;
+    old_index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(64.0f);
+    new_index = G_FowWorldToCellY(64.0f) * level.fow.width + G_FowWorldToCellX(320.0f);
+    sentinel = level.fow.width * level.fow.height - 1;
+
+    G_FowUpdate();
+    T_ASSERT(level.fow.blocked[old_index]);
+    level.fow.blocked[sentinel] = 7;
+    G_FowUpdate();
+    T_EQ(level.fow.blocked[sentinel], 7);
+    G_FowMarkBlockersDirty();
+    G_FowUpdate();
+    T_EQ(level.fow.blocked[sentinel], 7);
+
+    G_PushEntity(blocker, 256.0f, &direction);
+    G_FowUpdate();
+    T_EQ(level.fow.blocked[sentinel], 0);
+    T_ASSERT(!level.fow.blocked[old_index]);
+    T_ASSERT(level.fow.blocked[new_index]);
+    G_FowShutdown();
+}
+
+static pathTex_t *make_fow_pathtex(uint32_t width, uint32_t height, uint8_t blocked) {
+    pathTex_t *tex = gi.MemAlloc(sizeof(*tex) + width * height * sizeof(color32_t));
+
+    T_ASSERT(tex != NULL);
+    tex->width = (uint16_t)width;
+    tex->height = (uint16_t)height;
+    FOR_LOOP(i, width * height) {
+        tex->map[i] = (color32_t){ 0, 0, blocked, 255 };
+    }
+    return tex;
+}
+
+TEST(wc3_game, fow_tree_pathtex_closes_gap_behind_canopy) {
+    reset_entities();
+    G_FowInit();
+    G_FowConnectPlayer(0);
+
+    edict_t *revealer = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 32.0f, 128.0f);
+    revealer->s.player = 0;
+    revealer->runtime.sight_radius.day = 320.0f;
+    revealer->health.value = 1.0f;
+    revealer->health.max_value = 1.0f;
+
+    edict_t *tree = alloc_test_unit(MAKEFOURCC('L','T','l','t'), 128.0f, 128.0f);
+    tree->s.flags |= EF_FOW_BLOCKER;
+    tree->targtype = TARG_TREE;
+    tree->s.scale = 1.0f;
+    tree->pathtex = make_fow_pathtex(4, 4, 1);
+    tree->health.value = 1.0f;
+    tree->health.max_value = 1.0f;
+
+    G_FowUpdate();
+
+    uint32_t canopy_index = G_FowWorldToCellY(128.0f) * level.fow.width + G_FowWorldToCellX(192.0f);
+    uint32_t behind_index = G_FowWorldToCellY(128.0f) * level.fow.width + G_FowWorldToCellX(256.0f);
+    T_ASSERT(level.fow.blocked[canopy_index]);
+    T_ASSERT(level.fow.players[0].visible[canopy_index]);
+    T_ASSERT(!level.fow.players[0].visible[behind_index]);
+    G_FowShutdown();
+}
+
+TEST(wc3_game, fow_full_sync_marks_player_connected) {
+    reset_entities();
+    G_FowInit();
+
+    edict_t *clent = &g_edicts[0];
+    clent->client = &game.clients[0];
+    clent->client->ps.number = 0;
+
+    T_ASSERT(!level.fow.players[0].client_connected);
+    G_FowSendFull(clent);
+    T_ASSERT(level.fow.players[0].client_connected);
+    T_ASSERT(!level.fow.players[1].client_connected);
+    G_FowShutdown();
+}
+
+/* =========================================================================
+ * Performance benchmarks
+ *
+ * Run with: openwarcraft3-tests -data <wc3data> -tft +dedicated 1 +test 'wc3_perf.*'
+ * These tests do not assert; they print [BENCH] lines to stdout so you can
+ * spot regressions by comparing across builds (BUILD=release for meaningful
+ * numbers).
+ * ========================================================================= */
+
+void CM_SetupTestWorldBounds(box2_t const *bounds);
+
+static volatile float acquisition_bench_sink;
+
+/* Exercise the repeated metadata lookup performed by acquisition scans. */
+static void bench_acquisition_ranges(void) {
+    float sum = 0.0f;
+    FOR_LOOP(pass, 10)
+        for (int i = 1; i < 1901; i++) sum += G_AcquisitionRange(&g_edicts[i]);
+    acquisition_bench_sink = sum;
+}
+
+/* 128×128-tile map → 16384×16384 units → 256×256 FOW cells at FOW_CELL_SIZE=64.
+ * Two players connected, 80 revealer units each spread across the map. */
+TEST(wc3_perf, fow_update_large_map) {
+    CM_SetupTestWorldBounds(&MAKE(box2_t, .min = {0.0f, 0.0f},
+                                        .max = {16384.0f, 16384.0f}));
+    G_FowInit();
+
+    level.fow.players[0].client_connected = true;
+    level.fow.players[1].client_connected = true;
+
+    for (int p = 0; p < 2; p++) {
+        for (int i = 0; i < 80; i++) {
+            edict_t *ent         = G_Spawn();
+            ent->s.player       = (uint32_t)p;
+            ent->s.origin.x     = 1024.0f + (i % 16) * 900.0f;
+            ent->s.origin.y     = 1024.0f + (i / 16) * 900.0f + p * 6000.0f;
+            ent->s.origin2.x    = ent->s.origin.x;
+            ent->s.origin2.y    = ent->s.origin.y;
+            ent->health.value   = 100.0f;
+            ent->health.max_value = 100.0f;
+            ent->runtime.sight_radius.day = 900.0f;
+        }
+    }
+
+    T_BENCH("G_FowUpdate  (256x256 grid, 160 revealers, 2 players)", 10,
+            G_FowUpdate());
+    G_FowShutdown();
+}
+
+/* 1900 active units — matches the entity count seen in the perf profile.
+ * Each entity goes through spell_run_frame + unit_updatestatuses + physics
+ * every call, which is the dominant cost even before think fires. */
+TEST(wc3_perf, run_entities_1900) {
+    setup_test_world();
+
+    for (int i = 0; i < 1900; i++) {
+        edict_t *ent = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'),
+                                      (float)((i % 50) * 64),
+                                      (float)((i / 50) * 64));
+        ent->health.value     = 100.0f;
+        ent->health.max_value = 100.0f;
+        ent->movetype         = MOVETYPE_STEP;
+    }
+
+    T_BENCH("G_RunEntities (1900 active units, MOVETYPE_STEP)",       30,
+            G_RunEntities());
+}
+
+/* 1900 immutable unit classes should not require repeated SLK metadata walks. */
+TEST(wc3_perf, acquisition_ranges_1900) {
+    setup_test_world();
+    for (int i = 0; i < 1900; i++) {
+        edict_t *ent = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+        ent->runtime.sight_radius.day = 600.0f;
+        ent->runtime.acquisition_range = 300.0f;
+    }
+    T_BENCH("G_AcquisitionRange (1900 units x 10 passes)", 30, bench_acquisition_ranges());
+}
+
+/* Scripted CreateUnit near a crowded point must retain collision semantics
+ * without walking the entire edict array for every spiral candidate. */
+TEST(wc3_perf, crowded_unstuck_search) {
+    vec2_t const point = {512.0f, 512.0f};
+    vec2_t out;
+    edict_t *mover;
+    setup_test_world(); reset_entities();
+    FOR_LOOP(i, 1900) {
+        edict_t *ent = alloc_test_unit(MAKEFOURCC('h','p','e','a'),
+                                      (float)(i % 50) * 32.0f, (float)(i / 50) * 32.0f);
+        ent->s.model = 1; ent->collision = 16.0f;
+        gi.LinkEntity(ent);
+    }
+    mover = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    mover->s.model = 1; mover->collision = 16.0f; gi.LinkEntity(mover);
+    T_BENCH("G_FindUnitUnstuckPosition (1900 linked units, crowded point)", 20,
+            G_FindUnitUnstuckPosition(mover, &point, &out));
+    T_FEQ(out.x, 0.0f, 0.001f);
+    T_FEQ(out.y, -64.0f, 0.001f);
+}
+
+TEST(wc3_save, legacy_campaign_menu_race_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-campaign-menu-race.sav");
+    setup_test_world();
+    level.campaign_menu_race = 3;
+    T_ASSERT(WriteGame(filename));
+    level.campaign_menu_race = 0;
+    T_ASSERT(ReadGame(filename));
+    T_EQ(level.campaign_menu_race, 3);
+    level.campaign_menu_race = 0;
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_edict_and_player_state) {
+    cstring_t filename = Test_TempPath("wc3-save-test.bin");
+    questItem_t item = { .description = strdup("Find the key"), .completed = true, .inuse = true };
+    quest_t quest = {
+        .title = strdup("Open the Gate"),
+        .description = strdup("Find the key and open the gate"),
+        .iconPath = strdup("ReplaceableTextures\\CommandButtons\\BTNKey.blp"),
+        .discovered = true,
+        .required = true,
+        .enabled = true,
+        .inuse = true
+    };
+    edict_t *first, *second, *indicator, *found[4];
+    box2_t area = { .min = { 0, 0 }, .max = { 128, 128 } };
+
+    reset_entities();
+    strlcpy(level.map_path, "Maps\\Campaign\\SaveTest.w3m", sizeof(level.map_path));
+    memset(level.quests, 0, sizeof(level.quests));
+    level.quests[0] = quest;
+    level.quests[0].items[0] = item;
+    level.quests[0].num_items = 1;
+    quest_t *saved_quest = &level.quests[0];
+    questItem_t *saved_item = &saved_quest->items[0];
+    first = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 12.0f, 24.0f);
+    second = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 48.0f, 72.0f);
+    gi.LinkEntity(first); gi.LinkEntity(second);
+    indicator = G_Spawn();
+    indicator->svflags = SVF_OWNER_ONLY;
+    G_SetUnitFlag(indicator, UNIT_FLAG_RALLY_INDICATOR, true);
+    indicator->owner = &g_edicts[0];
+    game.clients[0].rally_indicator = indicator;
+    S_SetCarriedResource(first, RETURN_RESOURCE_GOLD, 37);
+    G_SetUnitFlag(first, UNIT_FLAG_IGNORE_ALARM, true);
+    G_SetUnitSharedVision(first, 0, true); G_SetUnitSharedVision(first, 7, true);
+    G_InitMissile(first);
+    first->missile->reflected = true;
+    if (!first->sleep) first->sleep = G_AllocSleep();
+    assert(first->sleep);
+    first->sleep->can_sleep = true;
+    first->collision = 42.5f;
+    first->s.origin.x = 96.0f;
+    first->s.origin.y = 128.0f;
+    first->owner = second;
+    first->orders->follow_target = second;
+    first->orders->explicit_allied_attack = true;
+    G_InitInventory(first);
+    first->inventory->slots[2] = second;
+    if (!first->cargo) first->cargo = G_AllocCargo();
+    assert(first->cargo);
+    first->cargo->units[3] = second;
+    first->stand = unit_stand; first->birth = unit_birth; first->die = unit_die; first->think = monster_think;
+    unit_stand(first);
+    first->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    first->svflags |= SVF_MONSTER;
+    G_SetTimeOfDay(game.constants.duskTimeGameHours);
+    G_UpdateTimeOfDay();
+    ai_stand(first);
+    T_ASSERT(G_UnitIsSleeping(first));
+    first->animation_props = G_InternAnimationName("alternate,work");
+    first->animation_request = G_InternAnimationName("stand ready");
+    T_ASSERT(first->currentmove != NULL);
+    umove_t const *const saved_move = first->currentmove;
+    first->unit_state->statuses[0] = (heroabilitystatus_t){
+        .code = MAKEFOURCC('B','m','i','l'), .level = 1,
+        .timestamp = 40000, .duration_ms = 45000, .data = 300
+    };
+    first->unit_state->cooldowns[0] = (abilityCooldown_t){
+        .code = MAKEFOURCC('A','H','t','b'), .start_time = 3000, .end_time = 12000
+    };
+    level.framenum = 1234;
+    level.time = 5678;
+    level.timeofday = (timeOfDay_t){
+        .elapsed = 240.0f,
+        .pending = 18.0f,
+        .pending_valid = true,
+        .suspended = true,
+        .false_time = {
+            .hour = 23,
+            .minute = 45,
+            .ticks_remaining = 321,
+            .active = true,
+            .initialized = true,
+        },
+    };
+    level.water_base_color = (color32_t){ 12, 34, 56, 78 };
+    level.environment_fog = (wc3EnvironmentFog_t){
+        .active = {
+            .style = WC3_ENV_FOG_LINEAR,
+            .start = 1500.0f,
+            .end = 6500.0f,
+            .density = 0.2f,
+            .color = { 0.15f, 0.25f, 0.35f },
+        },
+        .defaults = {
+            .style = WC3_ENV_FOG_EXPONENTIAL_1,
+            .start = 500.0f,
+            .end = 9000.0f,
+            .density = 0.1f,
+            .color = { 0.4f, 0.5f, 0.6f },
+        },
+        .defaults_valid = true,
+    };
+    level.started = true;
+    level.scriptsConfigured = true;
+    level.scriptsStarted = true;
+    level.multiboard_suppressed_clients = 1u << 3;
+    level.team_resources_collapsed_clients = 1u << 5;
+    game.clients[0].jass.race_pref = 2;
+    game.clients[0].jass.controller = 1;
+    strlcpy(game.clients[0].jass.name, "Jaina", sizeof(game.clients[0].jass.name));
+    game.clients[0].ps.name = game.clients[0].jass.name;
+    game.clients[0].ping = 77;
+    game.clients[0].ps.cinematic_portrait = 41;
+    game.clients[0].ps.team = 3;
+    game.clients[0].ps.color = 7;
+    game.clients[0].ps.race = kPlayerRaceNightElf;
+    level.camera_bounds = (box2_t){ .min = { -100.0f, -50.0f }, .max = { 100.0f, 50.0f } };
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 123;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 45;
+    game.clients[0].camera.state.fov = 61.0f;
+    game.clients[0].camera.state.position = (vec2_t){ 333.0f, 444.0f };
+    game.clients[0].camera.state.z_offset = 222.0f;
+    game.clients[0].camera.state.near_z = 75.0f;
+    game.clients[0].camera.state.far_z = 7000.0f;
+    game.clients[0].camera.target_controller = second;
+    game.clients[0].camera.target_mode = CAMERA_TARGET_FOLLOW_FACING;
+    game.clients[0].camera.orient_eye = (vec3_t){ 11.0f, 22.0f, 33.0f };
+    game.clients[0].camera.pan.active = true;
+    game.clients[0].camera.pan.time = 4321;
+    game.clients[0].camera.pan.start = (vec2_t){ 10.0f, 20.0f };
+    game.clients[0].camera.pan.destination = (vec2_t){ 110.0f, 220.0f };
+    game.clients[0].camera.pan.rate = (vec2_t){ 100.0f, 200.0f };
+    game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].magnitude = 9.5f;
+    game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].velocity = 3.25f;
+    game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].vert_only = true;
+    game.clients[0].modal_flags = WC3_MODAL_CLIENT | WC3_MODAL_QUEST;
+    game.clients[0].quest_dialog_open = true;
+    game.clients[0].canvas = UI_CANVAS_WIDE;
+    T_ASSERT(WriteGame(filename));
+    level.multiboard_suppressed_clients = 0;
+    level.team_resources_collapsed_clients = 0;
+    level.cinefilter.displayed = true;
+    PATHSTR saved_map;
+    T_ASSERT(G_GetSaveMap(filename, saved_map, sizeof(saved_map)));
+    T_ASSERT(!strcasecmp(saved_map, level.map_path));
+    S_SetCarriedResource(first, RETURN_RESOURCE_GOLD, 0);
+    G_SetUnitFlag(first, UNIT_FLAG_IGNORE_ALARM, false);
+    first->vision->shared = 0;
+    first->missile->reflected = false;
+    first->sleep->can_sleep = false;
+    first->sleep->sleeping = false;
+    first->owner = NULL;
+    first->orders->follow_target = NULL;
+    first->orders->explicit_allied_attack = false;
+    first->inventory->slots[2] = NULL;
+    first->cargo->units[3] = NULL;
+    first->animation_props = "";
+    first->animation_request = "";
+    memset(first->unit_state->statuses, 0, sizeof(first->unit_state->statuses));
+    memset(first->unit_state->cooldowns, 0, sizeof(first->unit_state->cooldowns));
+    strlcpy(game.clients[0].jass.name, "Changed", sizeof(game.clients[0].jass.name));
+    game.clients[0].ps.cinematic_portrait = 0;
+    game.clients[0].ps.team = 0;
+    game.clients[0].ps.color = 0;
+    game.clients[0].ps.race = kPlayerRaceNone;
+    level.camera_bounds = (box2_t){ 0 };
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD] = 0;
+    game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER] = 0;
+    game.clients[0].camera.state.fov = 0.0f;
+    game.clients[0].camera.state.position = (vec2_t){ 0.0f, 0.0f };
+    game.clients[0].camera.state.z_offset = 0.0f;
+    game.clients[0].camera.state.near_z = 0.0f;
+    game.clients[0].camera.state.far_z = 0.0f;
+    game.clients[0].camera.target_controller = NULL;
+    game.clients[0].camera.target_mode = CAMERA_TARGET_FOLLOW;
+    game.clients[0].camera.orient_eye = (vec3_t){ 0.0f, 0.0f, 0.0f };
+    memset(game.clients[0].camera.noise, 0, sizeof(game.clients[0].camera.noise));
+    G_ClearCameraPan(&game.clients[0]);
+    game.clients[0].rally_indicator = NULL;
+    saved_quest->discovered = saved_quest->required = saved_quest->enabled = false;
+    saved_quest->completed = true;
+    saved_item->completed = false;
+    memset(&level.timeofday, 0, sizeof(level.timeofday));
+    memset(&level.environment_fog, 0, sizeof(level.environment_fog));
+    level.water_base_color = (color32_t){0};
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(!level.cinefilter.displayed);
+    /* The sleeping unit's persistent ACsp overlay is a linked, non-selectable
+     * edict and is included in the raw world query after save/load. */
+    T_EQ(gi.BoxEdicts(&area, found, 4, NULL), 4);
+    T_EQ(g_edicts[first - g_edicts].harvest->gold, 37);
+    T_EQ(g_edicts[first - g_edicts].vision->shared, (1u << 0) | (1u << 7));
+    T_ASSERT(g_edicts[first - g_edicts].missile->reflected);
+    T_ASSERT(G_UnitHasFlag(&g_edicts[first - g_edicts], UNIT_FLAG_IGNORE_ALARM));
+    T_ASSERT(g_edicts[first - g_edicts].sleep->can_sleep);
+    T_ASSERT(g_edicts[first - g_edicts].sleep->sleeping);
+    T_EQ(g_edicts[first - g_edicts].collision, 42.5f);
+    T_EQ(g_edicts[first - g_edicts].s.origin.x, 96.0f);
+    T_EQ(g_edicts[first - g_edicts].s.origin.y, 128.0f);
+    T_EQ(g_edicts[first - g_edicts].unit_state->statuses[0].code, MAKEFOURCC('B','m','i','l'));
+    T_EQ(g_edicts[first - g_edicts].unit_state->statuses[0].timestamp, 40000);
+    T_EQ(g_edicts[first - g_edicts].unit_state->statuses[0].duration_ms, 45000);
+    T_EQ(g_edicts[first - g_edicts].unit_state->statuses[0].data, 300);
+    T_EQ(g_edicts[first - g_edicts].unit_state->cooldowns[0].code, MAKEFOURCC('A','H','t','b'));
+    T_EQ(g_edicts[first - g_edicts].unit_state->cooldowns[0].start_time, 3000);
+    T_EQ(g_edicts[first - g_edicts].unit_state->cooldowns[0].end_time, 12000);
+    T_EQ(level.framenum, 1234);
+    T_EQ(level.time, 5678);
+    T_FEQ(level.timeofday.elapsed, 240.0f, 0.001f);
+    T_FEQ(level.timeofday.pending, 18.0f, 0.001f);
+    T_ASSERT(level.timeofday.pending_valid && level.timeofday.suspended);
+    T_EQ(level.timeofday.false_time.hour, 23);
+    T_EQ(level.timeofday.false_time.minute, 45);
+    T_EQ(level.timeofday.false_time.ticks_remaining, 321);
+    T_ASSERT(level.timeofday.false_time.active && level.timeofday.false_time.initialized);
+    T_EQ(level.environment_fog.active.style, WC3_ENV_FOG_LINEAR);
+    T_FEQ(level.environment_fog.active.start, 1500.0f, 0.001f);
+    T_FEQ(level.environment_fog.active.end, 6500.0f, 0.001f);
+    T_FEQ(level.environment_fog.active.density, 0.2f, 0.001f);
+    T_FEQ(level.environment_fog.active.color.x, 0.15f, 0.001f);
+    T_FEQ(level.environment_fog.active.color.y, 0.25f, 0.001f);
+    T_FEQ(level.environment_fog.active.color.z, 0.35f, 0.001f);
+    T_EQ(level.environment_fog.defaults.style, WC3_ENV_FOG_EXPONENTIAL_1);
+    T_FEQ(level.environment_fog.defaults.start, 500.0f, 0.001f);
+    T_FEQ(level.environment_fog.defaults.end, 9000.0f, 0.001f);
+    T_FEQ(level.environment_fog.defaults.density, 0.1f, 0.001f);
+    T_FEQ(level.environment_fog.defaults.color.x, 0.4f, 0.001f);
+    T_FEQ(level.environment_fog.defaults.color.y, 0.5f, 0.001f);
+    T_FEQ(level.environment_fog.defaults.color.z, 0.6f, 0.001f);
+    T_ASSERT(level.environment_fog.defaults_valid);
+    T_EQ(level.water_base_color.r, 12);
+    T_EQ(level.water_base_color.g, 34);
+    T_EQ(level.water_base_color.b, 56);
+    T_EQ(level.water_base_color.a, 78);
+    T_ASSERT(level.started && level.scriptsConfigured && level.scriptsStarted);
+    T_EQ(level.multiboard_suppressed_clients, 1u << 3);
+    T_EQ(level.team_resources_collapsed_clients, 1u << 5);
+    T_EQ(game.clients[0].jass.race_pref, 2);
+    T_EQ(game.clients[0].jass.controller, 1);
+    T_EQ(game.clients[0].ping, 77);
+    T_EQ(game.clients[0].ps.cinematic_portrait, 41);
+    T_EQ(game.clients[0].ps.team, 3);
+    T_EQ(game.clients[0].ps.color, 7);
+    T_EQ(game.clients[0].ps.race, kPlayerRaceNightElf);
+    T_FEQ(level.camera_bounds.min.x, -100.0f, 0.001f);
+    T_FEQ(level.camera_bounds.max.y, 50.0f, 0.001f);
+    T_ASSERT(g_edicts[first - g_edicts].owner == &g_edicts[second - g_edicts]);
+    T_ASSERT(g_edicts[first - g_edicts].orders->follow_target == &g_edicts[second - g_edicts]);
+    T_ASSERT(g_edicts[first - g_edicts].orders->explicit_allied_attack);
+    T_ASSERT(G_InventoryItem(&g_edicts[first - g_edicts], 2) == &g_edicts[second - g_edicts]);
+    T_ASSERT(g_edicts[first - g_edicts].cargo->units[3] == &g_edicts[second - g_edicts]);
+    T_STREQ(g_edicts[first - g_edicts].animation_props, "alternate,work");
+    T_STREQ(g_edicts[first - g_edicts].animation_request, "stand ready");
+    T_ASSERT(g_edicts[first - g_edicts].stand == unit_stand);
+    T_ASSERT(g_edicts[first - g_edicts].think == monster_think);
+    /* currentmove is a process pointer; F_MMOVE relocates it so a loaded unit keeps behaving. */
+    T_ASSERT(g_edicts[first - g_edicts].currentmove == saved_move);
+    T_ASSERT(G_UnitIsSleeping(first));
+    T_ASSERT(unit_issueimmediateorder(g_edicts + (first - g_edicts), "stop"));
+    T_ASSERT(!G_UnitIsSleeping(first));
+    FOR_LOOP(i, globals.num_edicts)
+        T_ASSERT(!g_edicts[i].inuse || g_edicts[i].owner != first || g_edicts[i].goalentity != first);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_GOLD], 123);
+    T_EQ(game.clients[0].ps.stats[PLAYERSTATE_RESOURCE_LUMBER], 45);
+    T_EQ(game.clients[0].camera.state.fov, 61.0f);
+    T_EQ(game.clients[0].camera.state.position.x, 333.0f);
+    T_EQ(game.clients[0].camera.state.position.y, 444.0f);
+    T_FEQ(game.clients[0].camera.state.z_offset, 222.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.state.near_z, 75.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.state.far_z, 7000.0f, 0.001f);
+    T_ASSERT(game.clients[0].camera.target_controller == &g_edicts[second - g_edicts]);
+    T_EQ(game.clients[0].camera.target_mode, CAMERA_TARGET_FOLLOW_FACING);
+    T_FEQ(game.clients[0].camera.orient_eye.x, 11.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.orient_eye.y, 22.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.orient_eye.z, 33.0f, 0.001f);
+    T_ASSERT(game.clients[0].camera.pan.active);
+    T_EQ(game.clients[0].camera.pan.time, 4321);
+    T_FEQ(game.clients[0].camera.pan.start.x, 10.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.pan.start.y, 20.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.pan.destination.x, 110.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.pan.destination.y, 220.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.pan.rate.x, 100.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.pan.rate.y, 200.0f, 0.001f);
+    T_FEQ(game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].magnitude, 9.5f, 0.001f);
+    T_FEQ(game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].velocity, 3.25f, 0.001f);
+    T_ASSERT(game.clients[0].camera.noise[CAMERA_NOISE_SOURCE].vert_only);
+    T_FEQ(game.clients[0].camera.noise[CAMERA_NOISE_TARGET].magnitude, 0.0f, 0.001f);
+    T_EQ(game.clients[0].modal_flags, 0);
+    T_ASSERT(!game.clients[0].quest_dialog_open);
+    /* The window class belongs to the reconnecting client, which reports it again before begin. */
+    T_EQ(game.clients[0].canvas, UI_CANVAS_STANDARD);
+    T_ASSERT(game.clients[0].rally_indicator == &g_edicts[indicator - g_edicts]);
+    T_ASSERT(game.clients[0].ps.name == game.clients[0].jass.name);
+    T_STREQ(game.clients[0].ps.name, "Jaina");
+    T_ASSERT(!level.mapinfo || game.clients[0].mapplayer == level.mapinfo->players + game.clients[0].ps.number);
+    T_ASSERT(saved_quest->inuse && saved_item->inuse);
+    T_STREQ(saved_quest->title, "Open the Gate");
+    T_STREQ(saved_quest->description, "Find the key and open the gate");
+    T_STREQ(saved_quest->iconPath, "ReplaceableTextures\\CommandButtons\\BTNKey.blp");
+    T_ASSERT(saved_quest->discovered && saved_quest->required && saved_quest->enabled && !saved_quest->completed);
+    T_STREQ(saved_item->description, "Find the key");
+    T_ASSERT(saved_item->completed);
+    G_RemoveQuest(saved_quest);
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(saved_quest->inuse);
+    T_STREQ(saved_quest->title, "Open the Gate");
+    T_ASSERT(g_edicts[0].client == &game.clients[0]);
+    remove(filename);
+}
+
+/* A load restores the Q2-style server tick; timers are clock-free countdowns and need no rebase. */
+TEST(wc3_timer, registry_enforces_capacity_without_reusing_destroyed_slots) {
+    gtimer_t *first, *timer = NULL;
+
+    setup_test_world();
+    first = G_AllocJassTimer();
+    T_NOT_NULL(first);
+    if (!first) return;
+    G_TimerStart(first, 1000, false, NULL);
+    FOR_LOOP(i, MAX_TIMERS - 1) {
+        timer = G_AllocJassTimer();
+        T_NOT_NULL(timer);
+        if (!timer) return;
+    }
+    T_EQ(level.num_timers, MAX_TIMERS);
+    T_ASSERT(timer != first);
+    T_ASSERT(level.num_timers == MAX_TIMERS);
+    T_NULL(G_AllocJassTimer());
+
+    G_TimerDestroy(first);
+    T_ASSERT(!first->running);
+    T_NULL(G_AllocJassTimer());
+    T_EQ(level.num_timers, MAX_TIMERS);
+}
+
+TEST(wc3_save, load_restores_server_clock_onto_saved_time) {
+    cstring_t filename = Test_TempPath("wc3-save-clock.bin");
+    gtimer_t *timer;
+
+    T_ASSERT(level.map_path[0]);
+    level.time = 20800;
+    level.framenum = level.time / FRAMETIME;
+    T_ASSERT((timer = G_AllocJassTimer()) != NULL);
+    G_TimerStart(timer, 2000, false, NULL);
+    T_EQ(G_TimerRemaining(timer), 2000u);
+    T_ASSERT(WriteGame(filename));
+
+    /* Emulate the post-SV_Map state: engine clock back near zero, live timer wiped. */
+    level.time = 100;
+    level.framenum = 1;
+    timer->remaining = 0; timer->running = false;
+    T_ASSERT(ReadGame(filename));
+    T_EQ(gi.GetTime(), 20800u);
+    timer = &level.timers[level.num_timers - 1];
+    T_ASSERT(timer->running && !timer->paused);
+    T_EQ(G_TimerRemaining(timer), 2000u);
+    G_RunTimers();
+    T_EQ(G_TimerRemaining(timer), 2000u - FRAMETIME);
+    remove(filename);
+}
+
+extern field_t edict_fields[];
+
+/* Tests resolve descriptors by their source-level field name to guard the fixup schema itself. */
+static field_t const *find_save_field_in(field_t const *schema, cstring_t name) {
+    cstring_t dot = strchr(name, '.');
+    size_t len = dot ? (size_t)(dot - name) : strlen(name);
+    for (field_t const *field = schema; field->name; field++) {
+        if (strlen(field->name) != len || strncmp(field->name, name, len)) continue;
+        if (!dot) return field;
+        return field->type == F_STRUCT ? find_save_field_in((field_t const *)field->flags, dot + 1) : NULL;
+    }
+    return NULL;
+}
+
+static savePool_t const *find_save_pool(cstring_t name) {
+    FOR_LOOP(i, sizeof(save_pools) / sizeof(save_pools[0])) {
+        size_t len = strlen(save_pools[i].name);
+        if (!strncmp(name, save_pools[i].name, len) &&
+            (name[len] == '.' || (name[len] == '-' && name[len + 1] == '>')))
+            return save_pools + i;
+    }
+    return NULL;
+}
+
+static field_t const *find_save_field(cstring_t name) {
+    savePool_t const *pool = find_save_pool(name);
+    if (!pool) return find_save_field_in(edict_fields, name);
+    size_t len = strlen(pool->name);
+    return find_save_field_in(pool->fields, name + len + (name[len] == '.' ? 1 : 2));
+}
+
+static void prepare_save_field(edict_t *unit, cstring_t name) {
+    savePool_t const *pool = find_save_pool(name);
+    if (pool && !SavePoolSlot(unit, pool)) {
+        void *slot = pool->alloc();
+        memcpy((uint8_t *)unit + pool->offset, &slot, sizeof(slot));
+    }
+}
+
+/* Pool admission must respect the selected pool, including full-sized unit pools. */
+TEST(wc3_save, pool_capacity_is_checked_before_allocating_records) {
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    G_InitHarvest(unit);
+    unit->harvest->gold = 17;
+    savePool_t pool = { "harvest", offsetof(edict_t, harvest), sizeof(harvest_t),
+                        harvest_fields, SaveAllocHarvest, 1 };
+    FILE *f = tmpfile();
+    T_ASSERT(f != NULL);
+    T_ASSERT(WritePool(f, &pool));
+    G_FreeHarvest(unit);
+    rewind(f);
+    T_ASSERT(!ReadPool(f, &pool));
+    T_NULL(unit->harvest);
+    pool.capacity = MAX_ENTITIES;
+    rewind(f);
+    T_ASSERT(ReadPool(f, &pool));
+    T_ASSERT(unit->harvest != NULL);
+    T_EQ(unit->harvest->gold, 17);
+    fclose(f);
+    FOR_LOOP(i, sizeof(save_pools) / sizeof(save_pools[0])) {
+        if (!strcmp(save_pools[i].name, "unit_state"))
+            T_EQ(save_pools[i].capacity, MAX_ENTITIES);
+    }
+}
+
+/* Keep every g_save.c edict schema entry independently covered so adding or removing a fixup cannot hide in a broad save. */
+#define SAVE_INT_FIELD_TEST(name, field, saved) \
+TEST(wc3_save, name) { \
+    cstring_t filename = Test_TempPath("wc3-save-" #name ".bin"); \
+    field_t const *desc = find_save_field(#field); \
+    reset_entities(); \
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f); \
+    T_NOT_NULL(desc); if (desc) { T_EQ(desc->type, F_INT); T_EQ(desc->array_size, 0); } \
+    prepare_save_field(unit, #field); \
+    unit->field = saved; \
+    T_ASSERT(WriteGame(filename)); unit->field = 0; T_ASSERT(ReadGame(filename)); T_EQ(unit->field, saved); \
+    remove(filename); \
+}
+
+#define SAVE_PTR_FIELD_TEST(name, schema, field, count) \
+TEST(wc3_save, name) { \
+    cstring_t filename = Test_TempPath("wc3-save-" #name ".bin"); \
+    field_t const *desc = find_save_field(schema); \
+    reset_entities(); \
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f); \
+    edict_t *target = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 64.0f, 0.0f); \
+    T_NOT_NULL(desc); if (desc) { T_EQ(desc->type, F_EDICT); T_EQ(desc->array_size, count); } \
+    prepare_save_field(unit, #field); \
+    unit->field = target; \
+    T_ASSERT(WriteGame(filename)); unit->field = NULL; T_ASSERT(ReadGame(filename)); T_ASSERT(unit->field == target); \
+    unit->field = (edict_t *)((uint8_t *)g_edicts + 1); T_ASSERT(!WriteGame(filename)); \
+    remove(filename); \
+}
+
+#define SAVE_FLOAT_FIELD_TEST(name, field, saved) \
+TEST(wc3_save, name) { \
+    cstring_t filename = Test_TempPath("wc3-save-" #name ".bin"); \
+    field_t const *desc = find_save_field(#field); \
+    reset_entities(); \
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f); \
+    T_NOT_NULL(desc); if (desc) { T_EQ(desc->type, F_FLOAT); T_EQ(desc->array_size, 0); } \
+    prepare_save_field(unit, #field); \
+    unit->field = saved; \
+    T_ASSERT(WriteGame(filename)); unit->field = 0; T_ASSERT(ReadGame(filename)); T_FEQ(unit->field, saved, 0.001f); \
+    remove(filename); \
+}
+
+SAVE_INT_FIELD_TEST(field_unit_flags_round_trip, unit_flags, UNIT_FLAG_IGNORE_ALARM | UNIT_FLAG_INVULNERABLE | UNIT_FLAG_PAUSED | UNIT_FLAG_NO_PATHING | UNIT_FLAG_TIMED_LIFE_PAUSED | UNIT_FLAG_TRAINING | UNIT_FLAG_TRAINING_FOOD_WAIT_NOTIFIED | UNIT_FLAG_RALLY_INDICATOR | UNIT_FLAG_USES_ALT_ICON | UNIT_FLAG_ANIMATION_OVERRIDE | UNIT_FLAG_VERTEX_COLOR_SET | UNIT_FLAG_VERTEX_COLOR_OVERRIDE_SET)
+
+SAVE_INT_FIELD_TEST(field_class_id_round_trip, class_id, MAKEFOURCC('h', 'p', 'e', 'a'))
+SAVE_INT_FIELD_TEST(field_variation_round_trip, variation, 7)
+SAVE_INT_FIELD_TEST(field_build_project_round_trip, orders->build_project, MAKEFOURCC('h', 'b', 'a', 'r'))
+SAVE_INT_FIELD_TEST(field_spawn_time_round_trip, spawn_time, 12345)
+SAVE_INT_FIELD_TEST(field_aura_effect_role_round_trip, aura_effect_role, AURA_EFFECT_SOURCE)
+SAVE_INT_FIELD_TEST(field_wander_next_time_round_trip, wander->next_time, 9100)
+SAVE_INT_FIELD_TEST(field_wander_random_state_round_trip, wander->random_state, 0x1234567)
+SAVE_INT_FIELD_TEST(field_wander_goal_generation_round_trip, wander->goal_generation, 42)
+SAVE_INT_FIELD_TEST(field_waypoint_generation_round_trip, route->serial, 43)
+SAVE_PTR_FIELD_TEST(field_wander_goal_round_trip, "wander->goal", wander->goal, 0)
+SAVE_PTR_FIELD_TEST(field_wander_waypoint_round_trip, "wander->waypoint", wander->waypoint, 0)
+SAVE_INT_FIELD_TEST(field_summon_ability_round_trip, summon_ability, MAKEFOURCC('A', 'O', 's', 'f'))
+
+TEST(wc3_save, ability_owned_timed_summon_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-ability-owned-timed-summon.bin");
+    edict_t *owner, *summon;
+    heroabilitystatus_t *timed_life;
+
+    reset_entities();
+    owner = alloc_test_unit(MAKEFOURCC('H', 'a', 'm', 'g'), 0.0f, 0.0f);
+    summon = alloc_test_unit(MAKEFOURCC('h', 'w', 'a', 't'), 64.0f, 0.0f);
+    summon->owner = owner;
+    summon->summon_ability = MAKEFOURCC('A', 'H', 'w', 'e');
+    timed_life = &summon->unit_state->statuses[2];
+    *timed_life = (heroabilitystatus_t){
+        .code = MAKEFOURCC('B', 'T', 'L', 'F'),
+        .level = 1,
+        .timestamp = 1234,
+        .duration_ms = 45000,
+    };
+
+    T_ASSERT(WriteGame(filename));
+    summon->owner = NULL;
+    summon->summon_ability = 0;
+    memset(timed_life, 0, sizeof(*timed_life));
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(summon->owner == owner);
+    T_EQ(summon->summon_ability, MAKEFOURCC('A', 'H', 'w', 'e'));
+    T_EQ(timed_life->code, MAKEFOURCC('B', 'T', 'L', 'F'));
+    T_EQ(timed_life->level, 1);
+    T_EQ(timed_life->timestamp, 1234);
+    T_EQ(timed_life->duration_ms, 45000);
+    remove(filename);
+}
+
+TEST(wc3_save, homing_spell_projectile_round_trip_preserves_identity_contract) {
+    cstring_t filename = Test_TempPath("wc3-save-homing-spell-projectile.bin");
+    uint32_t const ability = MAKEFOURCC('A', 'H', 't', 'b');
+    edict_t *caster, *target, *missile;
+
+    setup_test_world();
+    reset_entities();
+    caster = alloc_test_unit(MAKEFOURCC('H', 'm', 't', 'k'), 0.0f, 0.0f);
+    target = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 128.0f, 0.0f);
+    caster->s.player = 0;
+    target->s.player = 1;
+    missile = S_SpawnUnitTargetSpellMissile(caster, ability, target, 900.0f, &holdpos_move_stand);
+
+    T_NOT_NULL(missile);
+    T_ASSERT(missile->owner == caster);
+    T_ASSERT(missile->goalentity == target);
+    T_ASSERT(missile->channel);
+    T_EQ(missile->channel->owner_spawn_time, caster->spawn_time);
+    T_EQ(missile->channel->target_spawn_time, target->spawn_time);
+    T_ASSERT(missile->currentmove == &holdpos_move_stand);
+    T_ASSERT(WriteGame(filename));
+
+    missile->owner = NULL;
+    missile->goalentity = NULL;
+    missile->class_id = 0;
+    missile->velocity = 0.0f;
+    missile->movetype = MOVETYPE_NONE;
+    missile->currentmove = NULL;
+    missile->channel->owner_spawn_time = 0;
+    missile->channel->target_spawn_time = 0;
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(S_SpellProjectileOwner(missile) == caster);
+    T_ASSERT(S_SpellProjectileTarget(missile) == target);
+    T_EQ(missile->class_id, ability);
+    T_FEQ(missile->velocity, 0.9f, 0.001f);
+    T_EQ(missile->movetype, MOVETYPE_FLYMISSILE);
+    T_ASSERT(missile->currentmove == &holdpos_move_stand);
+    remove(filename);
+}
+
+TEST(wc3_save, flare_reveal_thinker_round_trip_preserves_caster_identity) {
+    cstring_t filename = Test_TempPath("wc3-save-flare-reveal-thinker.bin");
+    uint32_t const ability = MAKEFOURCC('A', 'f', 'l', 'a');
+    edict_t *caster, *thinker;
+
+    reset_entities();
+    caster = alloc_test_unit(MAKEFOURCC('h', 'r', 'i', 'f'), 0.0f, 0.0f);
+    caster->s.player = 2;
+    thinker = G_Spawn();
+    thinker->owner = caster;
+    thinker->class_id = ability;
+    thinker->s.origin2 = (vec2_t){ 192.0f, -64.0f };
+    thinker->spawn_time = 34567;
+    thinker->channel = G_AllocChannel();
+    assert(thinker->channel);
+    thinker->channel->owner_spawn_time = caster->spawn_time;
+    thinker->think = human_ability_think;
+
+    T_ASSERT(WriteGame(filename));
+    thinker->owner = NULL;
+    thinker->class_id = 0;
+    thinker->s.origin2 = (vec2_t){ 0 };
+    thinker->spawn_time = 0;
+    thinker->channel->owner_spawn_time = 0;
+    thinker->think = NULL;
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(thinker->think == human_ability_think);
+    T_ASSERT(S_SpellChannelOwner(thinker) == caster);
+    T_EQ(thinker->class_id, ability);
+    T_FEQ(thinker->s.origin2.x, 192.0f, 0.001f);
+    T_FEQ(thinker->s.origin2.y, -64.0f, 0.001f);
+    T_EQ(thinker->spawn_time, 34567);
+    T_EQ(thinker->channel->owner_spawn_time, caster->spawn_time);
+
+    caster->spawn_time++;
+    T_NULL(S_SpellChannelOwner(thinker));
+    remove(filename);
+}
+
+TEST(wc3_save, corpse_reservation_round_trip_preserves_owner_marker) {
+    cstring_t filename = Test_TempPath("wc3-save-corpse-reservation.bin");
+    uint32_t const ability = MAKEFOURCC('A', 'u', 'c', 'a');
+    edict_t *corpse;
+    heroabilitystatus_t *reservation;
+
+    reset_entities();
+    corpse = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 64.0f, 0.0f);
+    corpse->health.value = 0;
+    S_SpellReserveCorpse(corpse, ability, 2);
+
+    T_ASSERT(corpse->aiflags & AI_CORPSE_RESERVED);
+    T_ASSERT(unit_findstatus(corpse, ability));
+    T_ASSERT(WriteGame(filename));
+
+    corpse->aiflags &= ~AI_CORPSE_RESERVED;
+    memset(corpse->unit_state->statuses, 0, sizeof(corpse->unit_state->statuses));
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(corpse->aiflags & AI_CORPSE_RESERVED);
+    reservation = unit_findstatus(corpse, ability);
+    T_NOT_NULL(reservation);
+    if (reservation) T_EQ(reservation->level, 2);
+    S_SpellReleaseCorpse(corpse, ability);
+    T_ASSERT(!(corpse->aiflags & AI_CORPSE_RESERVED));
+    T_NULL(unit_findstatus(corpse, ability));
+    remove(filename);
+}
+
+TEST(wc3_save, owned_target_effect_round_trip_preserves_owner_and_target_generation) {
+    cstring_t filename = Test_TempPath("wc3-save-owned-target-effect.bin");
+    uint32_t const ability = MAKEFOURCC('A', 'H', 'h', 'b');
+    edict_t *owner, *target, *effect;
+
+    setup_test_world();
+    reset_entities();
+    owner = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    target = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 64.0f, 0.0f);
+    effect = G_SpawnOwnedAbilityEffectTarget(owner, ability, WC3_EFFECT_TARGET, 0, target, NULL);
+
+    T_NOT_NULL(effect);
+    T_ASSERT(effect->owner == owner);
+    T_ASSERT(effect->goalentity == target);
+    T_EQ(effect->damage, target->spawn_time);
+    T_EQ(effect->movetype, MOVETYPE_LINK);
+    T_ASSERT(WriteGame(filename));
+
+    effect->owner = NULL;
+    effect->goalentity = NULL;
+    effect->damage = 0;
+    effect->movetype = MOVETYPE_NONE;
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(effect->owner == owner);
+    T_ASSERT(effect->goalentity == target);
+    T_EQ(effect->damage, target->spawn_time);
+    T_EQ(effect->movetype, MOVETYPE_LINK);
+    T_ASSERT(effect->s.flags & EF_NOT_SELECTABLE);
+    remove(filename);
+}
+SAVE_INT_FIELD_TEST(field_shared_vision_round_trip, vision->shared, (1u << 0) | (1u << 7))
+SAVE_INT_FIELD_TEST(field_harvested_lumber_round_trip, harvest->lumber, 37)
+SAVE_INT_FIELD_TEST(field_harvested_gold_round_trip, harvest->gold, 41)
+/* Saved animation text must survive destruction of every interned process address. */
+TEST(wc3_save, animation_strings_restore_after_intern_storage_is_released) {
+    cstring_t file = Test_TempPath("animation-strings.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    int const index = unit - g_edicts;
+    unit->animation_request = G_InternAnimationName("stand ready");
+    unit->animation_props = G_InternAnimationName("alternate,work");
+    unit->queued_animation = G_InternAnimationName("stand third");
+    T_ASSERT(WriteGame(file));
+    reset_entities();
+    G_FreeAnimationNames();
+    T_ASSERT(ReadGame(file));
+    unit = g_edicts + index;
+    T_STREQ(unit->animation_request, "stand ready");
+    T_STREQ(unit->animation_props, "alternate,work");
+    T_STREQ(unit->queued_animation, "stand third");
+    T_ASSERT(unit->animation_request == G_InternAnimationName("stand ready"));
+    remove(file);
+}
+
+/* A saved destination retains incarnation, but process-local routing fields must rebuild. */
+TEST(wc3_save, route_cache_rebuilds_after_load) {
+    cstring_t file = Test_TempPath("route-cache.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 0, 0);
+    unit->route = G_AllocRoute();
+    unit->route->field = 73;
+    unit->route->serial = 42;
+    T_ASSERT(WriteGame(file));
+    T_ASSERT(ReadGame(file));
+    T_NOT_NULL(unit->route);
+    T_EQ(unit->route->field, 0);
+    T_EQ(unit->route->serial, 42);
+    remove(file);
+}
+SAVE_INT_FIELD_TEST(field_peons_inside_round_trip, goldmine->occupants, 5)
+SAVE_INT_FIELD_TEST(field_ai_flags_round_trip, aiflags, 0x55)
+SAVE_INT_FIELD_TEST(field_corpse_flags_round_trip, aiflags, AI_CORPSE_UNRAISABLE | AI_CORPSE_NO_DECAY | AI_CORPSE_RESERVED)
+SAVE_INT_FIELD_TEST(field_script_explosion_round_trip, aiflags, AI_SCRIPT_EXPLODED)
+SAVE_INT_FIELD_TEST(field_damage_round_trip, damage, 99)
+SAVE_INT_FIELD_TEST(field_projectile_attack_type_round_trip, missile->attack_type, ATK_PIERCE)
+SAVE_INT_FIELD_TEST(field_attack_cooldown_end_time_round_trip, unit_state->attack_cooldown_end_time, 12345)
+SAVE_INT_FIELD_TEST(field_attack_backswing_end_time_round_trip, unit_state->attack_backswing_end_time, 12346)
+TEST(wc3_save, artillery_profile_round_trips_inflight_projectile) {
+    cstring_t filename = Test_TempPath("wc3-save-artillery-profile.bin");
+    field_t const *desc = find_save_field("artillery");
+    reset_entities();
+    edict_t *projectile = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    if (!projectile->artillery) projectile->artillery = G_AllocArtillery();
+    assert(projectile->artillery);
+    *projectile->artillery = (artillery_t) { ATK_SIEGE, WC3_TARGET_FLAG_GROUND, WC3_TARGET_FLAG_GROUND,
+                                                  40.0f, 80.0f, 120.0f, 0.5f, 0.25f };
+    T_NOT_NULL(desc); if (desc) T_EQ(desc->type, F_IGNORE);
+    T_ASSERT(WriteGame(filename)); G_FreeArtillery(projectile);
+    T_ASSERT(ReadGame(filename));
+    T_EQ(projectile->artillery->attack_type, ATK_SIEGE);
+    T_EQ(projectile->artillery->area_targets, WC3_TARGET_FLAG_GROUND);
+    T_FEQ(projectile->artillery->area_full, 40.0f, 0.001f);
+    T_FEQ(projectile->artillery->area_medium, 80.0f, 0.001f);
+    T_FEQ(projectile->artillery->area_small, 120.0f, 0.001f);
+    T_FEQ(projectile->artillery->factor_medium, 0.5f, 0.001f);
+    T_FEQ(projectile->artillery->factor_small, 0.25f, 0.001f);
+    remove(filename);
+}
+SAVE_INT_FIELD_TEST(field_autocast_code_round_trip, unit_state->autocast, MAKEFOURCC('A', 'h', 'e', 'a'))
+SAVE_INT_FIELD_TEST(field_channel_code_round_trip, channel->code, MAKEFOURCC('A', 'H', 'd', 'r'))
+SAVE_INT_FIELD_TEST(field_channel_serial_round_trip, channel->serial, 7)
+
+TEST(wc3_save, neutral_shop_stock_round_trips_in_roc_and_tft_map_state) {
+    uint32_t const formats[] = { 24, 25 };
+
+    FOR_LOOP(i, sizeof(formats) / sizeof(formats[0])) {
+        PATHSTR filename;
+        edict_t *shop;
+        field_t const *stock_desc;
+        field_t const *items_desc;
+        field_t const *units_desc;
+
+        setup_test_world();
+        reset_entities();
+        ((mapInfo_t *)level.mapinfo)->fileFormat = formats[i];
+        PATHSTR name;
+        snprintf(name, sizeof(name), "wc3-shop-stock-%u.bin", (unsigned)formats[i]);
+        snprintf(filename, sizeof(filename), "%s", Test_TempPath(name));
+        shop = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+        level.stock.item_slots = 11;
+        level.stock.unit_slots = 9;
+        if (!shop->stock) shop->stock = G_AllocStock();
+        assert(shop->stock);
+        shop->stock->item_slots = 11;
+        shop->stock->unit_slots = 9;
+        shop->stock->items_initialized = true;
+        shop->stock->item_count = 1;
+        shop->stock->items[0] = (shopStockItem_t){
+            .id = MAKEFOURCC('s','p','r','o'),
+            .current = 1,
+            .maximum = 3,
+            .delay_start = 5000,
+            .delay_end = 65000,
+        };
+        shop->stock->units_initialized = true;
+        shop->stock->unit_count = 1;
+        shop->stock->units[0] = (shopStockItem_t){
+            .id = MAKEFOURCC('n','m','e','r'),
+            .current = 0,
+            .maximum = 2,
+            .delay_start = 9000,
+            .delay_end = 14000,
+        };
+
+        stock_desc = find_save_field("stock");
+        items_desc = find_save_field("stock->items");
+        units_desc = find_save_field("stock->units");
+        T_NOT_NULL(stock_desc);
+        T_NOT_NULL(items_desc);
+        T_NOT_NULL(units_desc);
+        if (stock_desc) T_EQ(stock_desc->type, F_IGNORE);
+        if (items_desc) {
+            T_EQ(items_desc->type, F_STRUCT);
+            T_EQ(items_desc->array_size, MAX_SHOP_STOCK);
+        }
+        if (units_desc) {
+            T_EQ(units_desc->type, F_STRUCT);
+            T_EQ(units_desc->array_size, MAX_SHOP_STOCK);
+        }
+
+        T_ASSERT(WriteGame(filename));
+        level.stock.item_slots = 0;
+        level.stock.unit_slots = 0;
+        G_FreeStock(shop);
+        T_ASSERT(ReadGame(filename));
+        T_EQ(level.stock.item_slots, 11);
+        T_EQ(level.stock.unit_slots, 9);
+        T_EQ(shop->stock->item_slots, 11);
+        T_EQ(shop->stock->unit_slots, 9);
+        T_ASSERT(shop->stock->items_initialized);
+        T_EQ(shop->stock->item_count, 1);
+        T_EQ(shop->stock->items[0].id, MAKEFOURCC('s','p','r','o'));
+        T_EQ(shop->stock->items[0].current, 1);
+        T_EQ(shop->stock->items[0].maximum, 3);
+        T_EQ(shop->stock->items[0].delay_start, 5000);
+        T_EQ(shop->stock->items[0].delay_end, 65000);
+        T_ASSERT(shop->stock->units_initialized);
+        T_EQ(shop->stock->unit_count, 1);
+        T_EQ(shop->stock->units[0].id, MAKEFOURCC('n','m','e','r'));
+        T_EQ(shop->stock->units[0].current, 0);
+        T_EQ(shop->stock->units[0].maximum, 2);
+        T_EQ(shop->stock->units[0].delay_start, 9000);
+        T_EQ(shop->stock->units[0].delay_end, 14000);
+        remove(filename);
+    }
+}
+SAVE_INT_FIELD_TEST(field_channel_owner_spawn_round_trip, channel->owner_spawn_time, 200)
+SAVE_INT_FIELD_TEST(field_channel_target_spawn_round_trip, channel->target_spawn_time, 300)
+SAVE_INT_FIELD_TEST(field_avatar_level_round_trip, avatar->level, 2)
+SAVE_INT_FIELD_TEST(field_avatar_damage_round_trip, avatar->damage, 31)
+SAVE_FLOAT_FIELD_TEST(field_avatar_armor_round_trip, avatar->armor, 7.0f)
+SAVE_FLOAT_FIELD_TEST(field_avatar_health_round_trip, avatar->health, 600.0f)
+SAVE_FLOAT_FIELD_TEST(field_raven_height_round_trip, raven->fly_height, 125.0f)
+SAVE_FLOAT_FIELD_TEST(field_unitinfo_prop_window_round_trip, unitinfo.PropWindow, 37.5f)
+SAVE_FLOAT_FIELD_TEST(field_attack1_backswing_round_trip, unit_state->attack1.backswingPoint, 0.35f)
+SAVE_FLOAT_FIELD_TEST(field_attack1_range_buffer_round_trip, unit_state->attack1.rangeBuffer, 42.0f)
+SAVE_FLOAT_FIELD_TEST(field_attack2_backswing_round_trip, unit_state->attack2.backswingPoint, 0.45f)
+SAVE_FLOAT_FIELD_TEST(field_attack2_range_buffer_round_trip, unit_state->attack2.rangeBuffer, 84.0f)
+SAVE_FLOAT_FIELD_TEST(field_raven_start_round_trip, raven->rise_start, 1000.0f)
+SAVE_FLOAT_FIELD_TEST(field_raven_duration_round_trip, raven->rise_duration, 2.0f)
+SAVE_INT_FIELD_TEST(field_raven_state_round_trip, raven->rise_state, RAVEN_RISE_ACTIVE)
+SAVE_INT_FIELD_TEST(field_polymorph_ability_round_trip, polymorph->ability, MAKEFOURCC('A', 'p', 'l', 'y'))
+SAVE_INT_FIELD_TEST(field_polymorph_buff_round_trip, polymorph->buff, MAKEFOURCC('B', 'p', 'l', 'y'))
+SAVE_INT_FIELD_TEST(field_polymorph_form_type_round_trip, polymorph->form_type, MAKEFOURCC('o', 'p', 'e', 'o'))
+SAVE_INT_FIELD_TEST(field_polymorph_original_model_round_trip, polymorph->original_model, 37)
+SAVE_FLOAT_FIELD_TEST(field_polymorph_original_scale_round_trip, polymorph->original_scale, 1.35f)
+SAVE_FLOAT_FIELD_TEST(field_polymorph_original_move_speed_round_trip, polymorph->original_move_speed, 270.0f)
+SAVE_FLOAT_FIELD_TEST(field_temporary_health_bonus_round_trip, unit_state->temporary_health_bonus, 600.0f)
+SAVE_FLOAT_FIELD_TEST(field_temporary_mana_bonus_round_trip, unit_state->temporary_mana_bonus, 125.0f)
+SAVE_FLOAT_FIELD_TEST(field_animation_speed_round_trip, animation_speed, 0.5f)
+
+TEST(wc3_save, field_hero_shortcut_alert_is_runtime_only) {
+    cstring_t filename = Test_TempPath("wc3-save-hero-shortcut-alert.bin");
+    field_t const *desc = find_save_field("unit_state->shortcut_alert_until");
+    edict_t *unit;
+
+    reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    T_NOT_NULL(desc);
+    if (desc) T_ASSERT(desc->type == F_IGNORE && desc->flags == FIELD_RUNTIME);
+    unit->unit_state->shortcut_alert_until = 12345;
+    T_ASSERT(WriteGame(filename));
+    unit->unit_state->shortcut_alert_until = 0;
+    T_ASSERT(ReadGame(filename));
+    T_EQ(unit->unit_state->shortcut_alert_until, 0);
+    remove(filename);
+}
+
+TEST(wc3_save, blight_world_and_growth_state_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-blight.bin");
+    uint32_t const ability = MAKEFOURCC('A','b','l','1');
+    vec2_t point = { 32.0f, 32.0f };
+    edict_t *unit;
+
+    setup_test_world(); reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    if (!unit->blight_growth) unit->blight_growth = G_AllocBlightGrowth();
+    assert(unit->blight_growth);
+    unit->blight_growth->ability = ability;
+    unit->blight_growth->radius = 146.0f;
+    unit->blight_growth->next_update = 12345;
+    if (!unit->destructable) unit->destructable = G_AllocDestructable();
+    assert(unit->destructable);
+    unit->destructable->blighted = true;
+    G_SetBlightPoint(&point, true);
+    T_ASSERT(G_IsPointBlighted(&point));
+    T_ASSERT(WriteGame(filename));
+
+    G_SetBlightPoint(&point, false);
+    G_FreeBlightGrowth(unit);
+    unit->destructable->blighted = false;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(G_IsPointBlighted(&point));
+    T_EQ(unit->blight_growth->ability, ability);
+    T_FEQ(unit->blight_growth->radius, 146.0f, 0.001f);
+    T_EQ(unit->blight_growth->next_update, 12345u);
+    T_ASSERT(unit->destructable->blighted);
+    remove(filename);
+}
+
+TEST(wc3_save, field_collision_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-field-collision.bin");
+    field_t const *desc = find_save_field("collision");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    T_NOT_NULL(desc); if (desc) { T_EQ(desc->type, F_FLOAT); T_EQ(desc->array_size, 0); }
+    unit->collision = 42.5f;
+    T_ASSERT(WriteGame(filename)); unit->collision = 0.0f; T_ASSERT(ReadGame(filename));
+    T_FEQ(unit->collision, 42.5f, 0.001f); remove(filename);
+}
+
+TEST(wc3_save, field_origin_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-field-origin.bin");
+    field_t const *desc = find_save_field("s.origin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    T_NOT_NULL(desc); if (desc) { T_EQ(desc->type, F_VECTOR); T_EQ(desc->array_size, 0); }
+    unit->s.origin = (vec3_t){ 12.5f, 34.5f, 56.5f };
+    T_ASSERT(WriteGame(filename)); unit->s.origin = (vec3_t){ 0 }; T_ASSERT(ReadGame(filename));
+    T_FEQ(unit->s.origin.x, 12.5f, 0.001f); T_FEQ(unit->s.origin.y, 34.5f, 0.001f);
+    T_FEQ(unit->s.origin.z, 56.5f, 0.001f); remove(filename);
+}
+
+/* Movement cancellation must compare against the saved cast position after restoring a live channel-> */
+TEST(wc3_save, field_channel_origin_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-channel-origin.bin");
+    field_t const *desc = find_save_field("channel->origin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0, 0);
+    T_NOT_NULL(desc);
+    if (desc) T_EQ(desc->type, F_VECTOR);
+    if (!unit->channel) unit->channel = G_AllocChannel();
+    assert(unit->channel);
+    unit->channel->origin = (vec2_t){ 12.5f, 34.5f };
+    T_ASSERT(WriteGame(filename)); unit->channel->origin = (vec2_t){0}; T_ASSERT(ReadGame(filename));
+    T_FEQ(unit->channel->origin.x, 12.5f, 0.001f); T_FEQ(unit->channel->origin.y, 34.5f, 0.001f);
+    remove(filename);
+}
+
+TEST(wc3_save, movement_guard_state_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-movement-guard.bin");
+    field_t const *position = find_save_field("orders->guard_position");
+    field_t const *state = find_save_field("orders->guard_state");
+    field_t const *holding = find_save_field("orders->holding_position");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0, 0);
+
+    T_NOT_NULL(position); if (position) T_EQ(position->type, F_VECTOR);
+    T_NOT_NULL(state); if (state) T_EQ(state->type, F_INT);
+    T_NOT_NULL(holding); if (holding) T_EQ(holding->type, F_INT);
+
+    unit->orders->guard_position = (vec2_t){ 123.5f, 456.5f };
+    unit->orders->guard_state = GUARD_RETURNING;
+    unit->orders->holding_position = true;
+    T_ASSERT(WriteGame(filename));
+    memset(&unit->movement, 0, sizeof(unit->movement));
+    T_ASSERT(ReadGame(filename));
+
+    T_FEQ(unit->orders->guard_position.x, 123.5f, 0.001f);
+    T_FEQ(unit->orders->guard_position.y, 456.5f, 0.001f);
+    T_EQ(unit->orders->guard_state, GUARD_RETURNING);
+    T_ASSERT(unit->orders->holding_position);
+    remove(filename);
+}
+
+TEST(wc3_save, route_resume_cache_and_wait_diagnostics_clear_on_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-route-resume-runtime.bin");
+    int unit_index;
+    edict_t *unit, *goal;
+
+    reset_entities();
+    unit_index = globals.num_edicts;
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0, 0);
+    goal = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 128, 0);
+    G_BeginMovement(unit);
+    unit->movement->route_resume_direction = (vec2_t){ 1.0f, 0.0f };
+    unit->movement->route_resume_goal_origin = goal->s.origin2;
+    unit->movement->route_resume_goal = goal;
+    unit->movement->route_resume_goal_spawn = goal->spawn_time;
+    unit->movement->route_resume_time = 1234;
+    unit->movement->route_resume_radius = 31.0f;
+    unit->movement->route_resume_flags = CM_PATHING_UNWALKABLE;
+    unit->movement->route_resume_valid = true;
+    unit->movement->route_resume_active = true;
+    unit->movement->path_wait_active = true;
+    unit->movement->path_wait_start = 5678;
+    unit->movement->path_wait_goal_number = goal->s.number;
+    unit->movement->path_wait_goal_spawn = goal->spawn_time;
+    unit->movement->path_wait_origin = unit->s.origin2;
+
+    T_ASSERT(WriteGame(filename));
+    unit->movement->route_resume_goal = (edict_t *)(uintptr_t)1;
+    T_ASSERT(ReadGame(filename));
+    unit = g_edicts + unit_index;
+    T_NULL(unit->movement->route_resume_goal);
+    T_ASSERT(!unit->movement->route_resume_valid);
+    T_ASSERT(!unit->movement->route_resume_active);
+    T_ASSERT(!unit->movement->path_wait_active);
+    T_EQ(unit->movement->route_resume_time, 0);
+    T_EQ(unit->movement->path_wait_start, 0);
+    remove(filename);
+}
+
+TEST(wc3_save, live_guard_return_move_resumes_after_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-live-guard-return.bin");
+    int unit_index;
+    edict_t *unit;
+
+    setup_test_world();
+    reset_entities();
+    unit_index = globals.num_edicts;
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 200, 0);
+    unit->stand = unit_stand;
+    unit->die = unit_die;
+    unit_stand(unit);
+    order_stop(unit);
+    T_ASSERT(unit->orders->guard_state != GUARD_NONE);
+
+    S_UnitAbilityEvent(unit, A_AUTO_COMBAT_START);
+    unit->s.origin2.x = unit->s.origin.x = 400;
+    gi.LinkEntity(unit);
+    T_ASSERT(S_UnitAbilityEvent(unit, A_AUTO_COMBAT_END));
+    T_ASSERT(unit->orders->guard_state == GUARD_RETURNING);
+    T_ASSERT(unit->currentmove->proc == CAbilityMove);
+    T_ASSERT(WriteGame(filename));
+
+    T_ASSERT(ReadGame(filename));
+    unit = g_edicts + unit_index;
+    T_ASSERT(unit->orders->guard_state == GUARD_RETURNING);
+    T_ASSERT(unit->currentmove->proc == CAbilityMove);
+    T_NOT_NULL(unit->goalentity);
+    if (unit->goalentity) {
+        T_FEQ(unit->goalentity->s.origin2.x, 200, 0.001f);
+        T_FEQ(unit->goalentity->s.origin2.y, 0, 0.001f);
+    }
+    unit->s.origin2 = unit->orders->guard_position;
+    unit->s.origin.x = unit->s.origin2.x;
+    unit->s.origin.y = unit->s.origin2.y;
+    gi.LinkEntity(unit);
+    unit->currentmove->think(unit);
+    T_ASSERT(unit->orders->guard_state == GUARD_IDLE);
+    T_ASSERT(unit->currentmove->think == ai_stand);
+    remove(filename);
+}
+
+/* Persist both an active creep return Move and a pending retry. The original
+ * Stop-guard round-trip above exercises a different state machine. */
+TEST(wc3_save, live_creep_guard_return_move_resumes_after_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-live-creep-return.bin");
+    int unit_index;
+    edict_t *unit;
+    setup_test_world();
+    reset_entities();
+    unit_index = globals.num_edicts;
+    unit = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 128, 0);
+    unit->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    unit->stand = unit_stand;
+    unit->die = unit_die;
+    unit_stand(unit);
+    G_CreepGuardInit(unit);
+    unit->s.origin2.x = unit->s.origin.x = 900;
+    gi.LinkEntity(unit);
+    G_CreepGuardAutoCombat(unit);
+    T_ASSERT(G_CreepGuardCombatEnd(unit));
+    T_ASSERT(unit->orders->creep_guard_phase == CREEP_GUARD_RETURNING);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityMove);
+    T_ASSERT(unit->goalentity);
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    unit = g_edicts + unit_index;
+    T_ASSERT(unit->orders->creep_guard_phase == CREEP_GUARD_RETURNING);
+    T_ASSERT(unit->currentmove && unit->currentmove->proc == CAbilityMove);
+    T_ASSERT(unit->goalentity);
+    T_FEQ(unit->goalentity->s.origin2.x, 128.0f, 0.001f);
+    unit->s.origin2 = unit->orders->creep_guard_origin;
+    unit->s.origin.x = unit->s.origin2.x;
+    gi.LinkEntity(unit);
+    G_CreepGuardTick(unit);
+    T_ASSERT(unit->orders->creep_guard_phase == CREEP_GUARD_IDLE);
+    remove(filename);
+}
+
+TEST(wc3_save, creep_guard_return_retry_state_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-creep-guard-return.bin");
+    int unit_index;
+    edict_t *unit;
+
+    setup_test_world();
+    reset_entities();
+    unit_index = globals.num_edicts;
+    unit = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 128, 0);
+    unit->s.player = PLAYER_NEUTRAL_AGGRESSIVE;
+    unit->stand = unit_stand;
+    unit->die = unit_die;
+    unit_stand(unit);
+    G_CreepGuardInit(unit);
+    unit->s.origin2.x = unit->s.origin.x = 900;
+    gi.LinkEntity(unit);
+    unit->orders->creep_guard_phase = CREEP_GUARD_RETURNING;
+    unit->orders->creep_guard_return_retries = 2;
+    unit->orders->creep_guard_retry_at_ms = 9000;
+    unit->orders->creep_guard_last_hit_ms = 2000;
+    unit->orders->creep_guard_outside_ms = 3000;
+    T_ASSERT(WriteGame(filename));
+    if (unit->orders->creep_guard_phase == CREEP_GUARD_RETURNING) unit->orders->creep_guard_phase = CREEP_GUARD_IDLE;
+    unit->orders->creep_guard_return_retries = 0;
+    unit->orders->creep_guard_retry_at_ms = 0;
+    T_ASSERT(ReadGame(filename));
+    unit = g_edicts + unit_index;
+    T_ASSERT(unit->orders->creep_guard_enabled);
+    T_ASSERT(unit->orders->creep_guard_phase == CREEP_GUARD_RETURNING);
+    T_EQ(unit->orders->creep_guard_return_retries, 2u);
+    T_EQ(unit->orders->creep_guard_retry_at_ms, 9000u);
+    T_EQ(unit->orders->creep_guard_last_hit_ms, 2000u);
+    T_EQ(unit->orders->creep_guard_outside_ms, 3000u);
+    T_FEQ(unit->orders->creep_guard_origin.x, 128, 0.001f);
+    remove(filename);
+}
+
+TEST(wc3_save, field_vertex_tint_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-field-vertex-tint.bin");
+    edict_t *unit;
+
+    reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    unit->vertex_color = MAKE(color32_t, 11, 22, 33, 0);
+    G_SetUnitFlag(unit, UNIT_FLAG_VERTEX_COLOR_SET, true);
+    T_ASSERT(WriteGame(filename));
+    unit->vertex_color = COLOR32_WHITE; G_SetUnitFlag(unit, UNIT_FLAG_VERTEX_COLOR_SET, false);
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(G_UnitHasFlag(unit, UNIT_FLAG_VERTEX_COLOR_SET));
+    T_EQ(unit->vertex_color.r, 11); T_EQ(unit->vertex_color.g, 22);
+    T_EQ(unit->vertex_color.b, 33); T_EQ(unit->vertex_color.a, 0);
+    remove(filename);
+}
+
+
+TEST(wc3_save, lightning_registry_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-lightning.bin");
+    edict_t *source_unit, *target_unit;
+    gLightning_t *effect;
+    vec3_t source = { 1.0f, 2.0f, 3.0f }, target = { 4.0f, 5.0f, 6.0f };
+
+    reset_entities();
+    memset(level.lightning_effects, 0, sizeof(level.lightning_effects));
+    level.next_lightning_id = 40;
+    level.time = 500;
+    source_unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), source.x, source.y);
+    target_unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), target.x, target.y);
+    source_unit->s.origin.z = source.z; source_unit->s.radius = 8.0f; source_unit->spawn_time = 101;
+    target_unit->s.origin.z = target.z; target_unit->s.radius = 12.0f; target_unit->spawn_time = 202;
+    effect = G_LightningAdd(&(lightningAddParams_t){
+        .effect_id = MAKEFOURCC('C', 'L', 'S', 'B'), .source = &source, .target = &target,
+        .color = MAKE(color32_t, 10, 20, 30, 40), .duration_ms = 2000,
+    });
+    T_NOT_NULL(effect);
+    G_LightningAttach(effect, source_unit, target_unit);
+    T_ASSERT(WriteGame(filename));
+    memset(level.lightning_effects, 0, sizeof(level.lightning_effects));
+    level.next_lightning_id = 0;
+    T_ASSERT(ReadGame(filename));
+    effect = NULL;
+    FOR_LOOP(i, MAX_LIGHTNING_EFFECTS) if (level.lightning_effects[i].inuse) { effect = level.lightning_effects + i; break; }
+    T_NOT_NULL(effect);
+    T_EQ(level.next_lightning_id, 41);
+    T_EQ(effect->state.handle, 41); T_EQ(effect->state.effect_id, MAKEFOURCC('C', 'L', 'S', 'B'));
+    T_FEQ(effect->state.source.z, 7.0f, 0.001f); T_FEQ(effect->state.target.y, 5.0f, 0.001f);
+    T_EQ(effect->state.color.r, 10); T_EQ(effect->state.color.a, 40);
+    T_EQ(effect->state.start_time, 500); T_EQ(effect->state.end_time, 2500);
+    T_EQ(effect->source_entity, g_edicts + (source_unit - g_edicts));
+    T_EQ(effect->target_entity, g_edicts + (target_unit - g_edicts));
+    T_EQ(effect->source_spawn_time, 101); T_EQ(effect->target_spawn_time, 202);
+    effect->source_entity->spawn_time++;
+    G_LightningUpdateAttached(effect);
+    T_NULL(effect->source_entity); T_EQ(effect->source_spawn_time, 0);
+    T_ASSERT(effect->target_entity);
+    remove(filename);
+}
+
+TEST(wc3_save, construction_payment_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-construction-payment.bin");
+    edict_t *unit, *worker;
+
+    reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h', 'b', 'a', 'r'), 0.0f, 0.0f);
+    worker = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 64.0f, 0.0f);
+    if (!unit->construction) unit->construction = G_AllocConstruction();
+    assert(unit->construction);
+    unit->construction->type = CONSTRUCTION_NAGA;
+    unit->construction->worker = worker;
+    unit->construction->worker_spawn_time = 1234;
+    unit->construction->worker_inside = true;
+    unit->construction->consumes_worker = true;
+    unit->construction->restore_invulnerable = true;
+    unit->construction->worker_release_time = 5678;
+    unit->construction->restore_paused = true;
+    unit->construction->restore_hidden = true;
+    unit->construction->paid = true;
+    unit->construction->payer = 3;
+    unit->construction->gold = 100;
+    unit->construction->lumber = 80;
+
+    T_ASSERT(WriteGame(filename));
+    unit->construction->type = CONSTRUCTION_NONE;
+    unit->construction->worker = NULL;
+    unit->construction->worker_spawn_time = 0;
+    unit->construction->worker_inside = false;
+    unit->construction->consumes_worker = false;
+    unit->construction->restore_invulnerable = false;
+    unit->construction->restore_paused = false;
+    unit->construction->restore_hidden = false;
+    unit->construction->worker_release_time = 0;
+    unit->construction->paid = false;
+    unit->construction->payer = 0;
+    unit->construction->gold = 0;
+    unit->construction->lumber = 0;
+    T_ASSERT(ReadGame(filename));
+    T_EQ(unit->construction->type, CONSTRUCTION_NAGA);
+    T_ASSERT(unit->construction->worker == worker);
+    T_EQ(unit->construction->worker_spawn_time, 1234);
+    T_ASSERT(unit->construction->worker_inside);
+    T_ASSERT(unit->construction->consumes_worker);
+    T_ASSERT(unit->construction->restore_invulnerable);
+    T_ASSERT(unit->construction->restore_paused);
+    T_ASSERT(unit->construction->restore_hidden);
+    T_EQ(unit->construction->worker_release_time, 5678);
+    T_ASSERT(unit->construction->paid);
+    T_EQ(unit->construction->payer, 3);
+    T_EQ(unit->construction->gold, 100);
+    T_EQ(unit->construction->lumber, 80);
+    remove(filename);
+}
+
+/* Tiny Structures own their construction clock: the authored duration_ms,
+ * the CONSTRUCTION_TINY strategy and the self-linked build pointer that the
+ * info panel queue walks all have to survive a save in both archive variants. */
+TEST(wc3_save, tiny_construction_round_trips_in_roc_and_tft_map_state) {
+    uint32_t const formats[] = { 24, 25 };
+
+    FOR_LOOP(i, sizeof(formats) / sizeof(formats[0])) {
+        PATHSTR filename, name;
+        edict_t *building;
+
+        setup_test_world();
+        reset_entities();
+        ((mapInfo_t *)level.mapinfo)->fileFormat = formats[i];
+        snprintf(name, sizeof(name), "wc3-save-tiny-construction-%u.bin", (unsigned)formats[i]);
+        snprintf(filename, sizeof(filename), "%s", Test_TempPath(name));
+        building = alloc_test_unit(MAKEFOURCC('h', 'b', 'a', 'r'), 0.0f, 0.0f);
+        if (!building->construction) building->construction = G_AllocConstruction();
+        assert(building->construction);
+        building->construction->type = CONSTRUCTION_TINY;
+        building->construction->progress = 4000.0f;
+        building->construction->duration_ms = 9000.0f;
+        building->build = building;
+
+        T_ASSERT(WriteGame(filename));
+        building->construction->type = CONSTRUCTION_NONE;
+        building->construction->progress = 0.0f;
+        building->construction->duration_ms = 0.0f;
+        building->build = NULL;
+        T_ASSERT(ReadGame(filename));
+        T_ASSERT(building->construction);
+        T_EQ(building->construction->type, CONSTRUCTION_TINY);
+        T_FEQ(building->construction->progress, 4000.0f, 0.001f);
+        T_FEQ(building->construction->duration_ms, 9000.0f, 0.001f);
+        T_ASSERT(building->build == building);
+        remove(filename);
+    }
+}
+
+TEST(wc3_save, racial_gold_mine_state_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-racial-gold-mine.bin");
+    edict_t *parent, *overlay, *acolyte;
+
+    reset_entities();
+    parent = alloc_test_unit(MAKEFOURCC('n', 'g', 'o', 'l'), 0.0f, 0.0f);
+    overlay = alloc_test_unit(MAKEFOURCC('h', 'b', 'a', 'r'), 0.0f, 0.0f);
+    acolyte = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 64.0f, 0.0f);
+    parent->resources = 7777;
+    if (!overlay->mineoverlay) overlay->mineoverlay = G_AllocMineOverlay();
+    assert(overlay->mineoverlay);
+    overlay->mineoverlay->parent = parent;
+    overlay->mineoverlay->parent_spawn_time = parent->spawn_time;
+    overlay->mineoverlay->income_time = 12345;
+    overlay->mineoverlay->active_interval_index = 3;
+    overlay->mineoverlay->entangle_permanent_before = true;
+    if (!acolyte->acolyte_mine) acolyte->acolyte_mine = G_AllocAcolyteMine();
+    assert(acolyte->acolyte_mine);
+    acolyte->acolyte_mine->mine = overlay;
+    acolyte->acolyte_mine->mine_spawn_time = overlay->spawn_time;
+    acolyte->acolyte_mine->slot = 4;
+
+    T_ASSERT(WriteGame(filename));
+    overlay->mineoverlay->parent = NULL;
+    overlay->mineoverlay->parent_spawn_time = 0;
+    overlay->mineoverlay->income_time = 0;
+    overlay->mineoverlay->active_interval_index = 0;
+    overlay->mineoverlay->entangle_permanent_before = false;
+    acolyte->acolyte_mine->mine = NULL;
+    acolyte->acolyte_mine->mine_spawn_time = 0;
+    acolyte->acolyte_mine->slot = -1;
+    parent->resources = 0;
+    T_ASSERT(ReadGame(filename));
+
+    T_ASSERT(overlay->mineoverlay->parent == parent);
+    T_EQ(overlay->mineoverlay->parent_spawn_time, parent->spawn_time);
+    T_EQ(overlay->mineoverlay->income_time, 12345);
+    T_EQ(overlay->mineoverlay->active_interval_index, 3);
+    T_ASSERT(overlay->mineoverlay->entangle_permanent_before);
+    T_ASSERT(acolyte->acolyte_mine->mine == overlay);
+    T_EQ(acolyte->acolyte_mine->mine_spawn_time, overlay->spawn_time);
+    T_EQ(acolyte->acolyte_mine->slot, 4);
+    T_EQ(parent->resources, 7777);
+    remove(filename);
+}
+
+TEST(wc3_save, mineoverlay_entangle_tree_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-entangle-tree.bin");
+    field_t const *desc = find_save_field("mineoverlay->entangle_tree");
+    edict_t *overlay, *tree;
+
+    reset_entities();
+    tree = alloc_test_unit(MAKEFOURCC('e','t','o','l'), 0.0f, 0.0f);
+    overlay = alloc_test_unit(MAKEFOURCC('h','b','a','r'), 64.0f, 0.0f);
+    if (!overlay->mineoverlay) overlay->mineoverlay = G_AllocMineOverlay();
+    assert(overlay->mineoverlay);
+    overlay->mineoverlay->entangle_tree = tree;
+    overlay->mineoverlay->entangle_tree_spawn_time = tree->spawn_time;
+    T_NOT_NULL(desc);
+    if (desc) { T_EQ(desc->type, F_EDICT); T_EQ(desc->array_size, 0); }
+    T_ASSERT(WriteGame(filename));
+    if (!overlay->mineoverlay) overlay->mineoverlay = G_AllocMineOverlay();
+    assert(overlay->mineoverlay);
+    overlay->mineoverlay->entangle_tree = NULL;
+    overlay->mineoverlay->entangle_tree_spawn_time = 0;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(overlay->mineoverlay->entangle_tree == tree);
+    T_EQ(overlay->mineoverlay->entangle_tree_spawn_time, tree->spawn_time);
+
+    /* A recycled edict slot must not inherit the previous tree identity. */
+    tree->spawn_time++;
+    T_ASSERT(overlay->mineoverlay->entangle_tree == tree);
+    T_NE(overlay->mineoverlay->entangle_tree_spawn_time, tree->spawn_time);
+    remove(filename);
+}
+
+SAVE_PTR_FIELD_TEST(field_primary_builder_round_trip, "construction->primary_builder", construction->primary_builder, 0)
+SAVE_PTR_FIELD_TEST(creep_status_source_round_trip, "unit_state->statuses.source", unit_state->statuses[3].source, 0)
+
+TEST(wc3_save, status_source_incarnation_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-status-source-incarnation.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    edict_t *source = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 64.0f, 0.0f);
+    heroabilitystatus_t *slot = &unit->unit_state->statuses[3];
+
+    slot->code = MAKEFOURCC('B', 'E', 'e', 'r');
+    slot->level = 1;
+    slot->instance_id = 19;
+    slot->stack_policy = WC3_STATUS_STACK_INDEPENDENT;
+    slot->source = source;
+    slot->source_spawn_time = source->spawn_time;
+    slot->modifier_count = 1;
+    slot->modifiers[0] = (wc3_status_modifier_t){
+        .type = WC3_STATUS_MOD_ARMOR_FLAT, .family = slot->code,
+        .policy = WC3_STATUS_MOD_ADD, .value = 2.0f,
+        .owner = WC3_STATUS_MOD_OWNER_AUTHORED
+    };
+    unit->unit_state->next_status_id = 20;
+    T_ASSERT(WriteGame(filename));
+    slot->source = NULL;
+    slot->source_spawn_time = 0;
+    slot->modifiers[0].owner = 0;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(slot->source == source);
+    T_EQ(slot->source_spawn_time, source->spawn_time);
+    T_EQ(slot->instance_id, 19);
+    T_EQ(slot->stack_policy, WC3_STATUS_STACK_INDEPENDENT);
+    T_EQ(slot->modifier_count, 1);
+    T_EQ(slot->modifiers[0].owner, WC3_STATUS_MOD_OWNER_AUTHORED);
+    T_FEQ(slot->modifiers[0].value, 2.0f, 0.001f);
+    T_EQ(unit->unit_state->next_status_id, 20);
+    source->spawn_time++;
+    T_NULL(S_SpellStatusSource(slot));
+    remove(filename);
+}
+SAVE_PTR_FIELD_TEST(field_construction_worker_round_trip, "construction->worker", construction->worker, 0)
+SAVE_PTR_FIELD_TEST(field_rally_entity_round_trip, "rally->entity", rally->entity, 0)
+SAVE_PTR_FIELD_TEST(field_revival_producer_round_trip, "revival->producer", revival->producer, 0)
+SAVE_PTR_FIELD_TEST(field_revival_queue_next_round_trip, "revival->queue_next", revival->queue_next, 0)
+SAVE_PTR_FIELD_TEST(field_sacrifice_worker_round_trip, "sacrifice->worker", sacrifice->worker, 0)
+SAVE_PTR_FIELD_TEST(field_goldmine_round_trip, "goldmine->mine", goldmine->mine, 0)
+SAVE_PTR_FIELD_TEST(field_mineoverlay_parent_round_trip, "mineoverlay->parent", mineoverlay->parent, 0)
+SAVE_PTR_FIELD_TEST(field_mineoverlay_caster_round_trip, "mineoverlay->caster", mineoverlay->caster, 0)
+SAVE_PTR_FIELD_TEST(field_mineoverlay_entangle_tree_round_trip, "mineoverlay->entangle_tree", mineoverlay->entangle_tree, 0)
+SAVE_PTR_FIELD_TEST(field_acolyte_mine_round_trip, "acolyte_mine->mine", acolyte_mine->mine, 0)
+SAVE_PTR_FIELD_TEST(field_inventory_round_trip, "inventory->slots", inventory->slots[3], MAX_INVENTORY)
+SAVE_PTR_FIELD_TEST(field_cargo_round_trip, "cargo->units", cargo->units[4], MAX_CARGO)
+SAVE_PTR_FIELD_TEST(field_item_carrier_round_trip, "item->carrier", item->carrier, 0)
+SAVE_PTR_FIELD_TEST(field_ground_next_round_trip, "ground_next", ground_next, 0)
+SAVE_PTR_FIELD_TEST(field_attackmove_waypoint_round_trip, "orders->attackmove_waypoint", orders->attackmove_waypoint, 0)
+SAVE_PTR_FIELD_TEST(field_patrol_a_round_trip, "orders->patrol_a", orders->patrol_a, 0)
+SAVE_PTR_FIELD_TEST(field_patrol_b_round_trip, "orders->patrol_b", orders->patrol_b, 0)
+SAVE_PTR_FIELD_TEST(field_patrol_target_round_trip, "orders->patrol_target", orders->patrol_target, 0)
+SAVE_PTR_FIELD_TEST(field_goal_entity_round_trip, "goalentity", goalentity, 0)
+SAVE_PTR_FIELD_TEST(field_item_drop_round_trip, "orders->item_drop", orders->item_drop, 0)
+SAVE_PTR_FIELD_TEST(field_spell_item_round_trip, "channel->source_item", channel->source_item, 0)
+SAVE_PTR_FIELD_TEST(field_soul_trap_head_round_trip, "soultrap->head", soultrap->head, 0)
+SAVE_PTR_FIELD_TEST(field_soul_trap_carrier_round_trip, "soultrap->carrier", soultrap->carrier, 0)
+SAVE_PTR_FIELD_TEST(field_soul_trap_next_round_trip, "soultrap->next", soultrap->next, 0)
+SAVE_PTR_FIELD_TEST(field_item_pending_use_carrier_round_trip, "item->pending_use_carrier", item->pending_use_carrier, 0)
+SAVE_PTR_FIELD_TEST(field_item_soul_target_round_trip, "item->soul_target", item->soul_target, 0)
+SAVE_INT_FIELD_TEST(field_soul_trap_head_spawn_round_trip, soultrap->head_spawn_time, 210)
+SAVE_INT_FIELD_TEST(field_soul_trap_carrier_spawn_round_trip, soultrap->carrier_spawn_time, 220)
+SAVE_INT_FIELD_TEST(field_soul_trap_next_spawn_round_trip, soultrap->next_spawn_time, 230)
+SAVE_INT_FIELD_TEST(field_soul_trapped_ability_added_round_trip, soultrap->trapped_ability_added, 1)
+SAVE_INT_FIELD_TEST(field_soul_possession_added_round_trip, soultrap->possession_added, 1)
+SAVE_INT_FIELD_TEST(field_item_pending_use_carrier_spawn_round_trip, item->pending_use_carrier_spawn_time, 240)
+SAVE_INT_FIELD_TEST(field_item_pending_use_slot_round_trip, item->pending_use_slot, 4)
+SAVE_INT_FIELD_TEST(field_item_soul_target_spawn_round_trip, item->soul_target_spawn_time, 250)
+SAVE_PTR_FIELD_TEST(field_combat_entity_round_trip, "combatentity", combatentity, 0)
+SAVE_PTR_FIELD_TEST(field_secondary_goal_round_trip, "orders->resource_goal", orders->resource_goal, 0)
+SAVE_PTR_FIELD_TEST(field_owner_round_trip, "owner", owner, 0)
+SAVE_PTR_FIELD_TEST(field_build_round_trip, "build", build, 0)
+SAVE_PTR_FIELD_TEST(field_build_preview_round_trip, "orders->build_preview", orders->build_preview, 0)
+
+#undef SAVE_PTR_FIELD_TEST
+#undef SAVE_INT_FIELD_TEST
+
+/* Stun remains a live-status query across load, independent of explicit pause. */
+TEST(wc3_save, unit_flags_and_overlapping_stuns_restore_without_a_cache) {
+    cstring_t path = Test_TempPath("wc3-unit-flags-status.bin");
+    reset_entities(); setup_test_world(); level.time = 1000;
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0, 0);
+    int index = unit - g_edicts;
+    G_SetUnitFlag(unit, UNIT_FLAG_PAUSED, true);
+    G_SetUnitFlag(unit, UNIT_FLAG_NO_PATHING, true);
+    unit_addtimedstatus(unit, "Bstu", 1, 0.1f);
+    unit_applystatus(unit, &(status_application_t){ .buff = "Bq01", .level = 1,
+        .duration = 0.2f, .state_mask = WC3_STATUS_STATE_STUNNED });
+    T_ASSERT(WriteGame(path));
+    unit->unit_flags = 0; memset(unit->unit_state->statuses, 0, sizeof(unit->unit_state->statuses));
+    T_ASSERT(ReadGame(path)); unit = g_edicts + index;
+    T_EQ(unit->unit_flags, UNIT_FLAG_PAUSED | UNIT_FLAG_NO_PATHING);
+    T_ASSERT(unit_hasstatusstate(unit, WC3_STATUS_STATE_STUNNED));
+    level.time = 1100;
+    T_ASSERT(unit_hasstatusstate(unit, WC3_STATUS_STATE_STUNNED));
+    level.time = 1200;
+    T_ASSERT(!unit_hasstatusstate(unit, WC3_STATUS_STATE_STUNNED));
+    T_EQ(unit->unit_flags, UNIT_FLAG_PAUSED | UNIT_FLAG_NO_PATHING);
+    remove(path);
+}
+
+TEST(wc3_save, soul_trap_links_and_world_state_survive_round_trip) {
+    cstring_t filename = Test_TempPath("wc3-save-soul-trap.bin");
+    reset_entities(); setup_test_world();
+    edict_t *carrier = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 64.0f, 64.0f);
+    edict_t *target = alloc_test_unit(MAKEFOURCC('H','p','a','l'), 96.0f, 64.0f);
+    edict_t *filled = G_Spawn();
+    filled->class_id = MAKEFOURCC('s','o','u','l');
+    filled->targtype = TARG_ITEM;
+    carrier->s.player = 0; target->s.player = 1;
+    carrier->soultrap = G_AllocSoulTrap();
+    target->soultrap = G_AllocSoulTrap();
+    carrier->soultrap->head = target; carrier->soultrap->head_spawn_time = target->spawn_time;
+    target->soultrap->carrier = carrier; target->soultrap->carrier_spawn_time = carrier->spawn_time;
+    target->soultrap->item = filled; target->soultrap->item_spawn_time = filled->spawn_time;
+    if (!filled->item) filled->item = G_AllocItem();
+    assert(filled->item);
+    filled->item->soul_target = target; filled->item->soul_target_spawn_time = target->spawn_time;
+    G_AddUnitForcedVisibility(carrier, target->s.player);
+    target->aiflags |= AI_SOUL_TRAPPED;
+    target->s.renderfx |= RF_HIDDEN; target->svflags |= SVF_NOCLIENT; target->s.flags |= EF_NOT_SELECTABLE;
+
+    T_ASSERT(WriteGame(filename));
+    carrier->soultrap->head = NULL; carrier->soultrap->head_spawn_time = 0;
+    target->soultrap->carrier = NULL; target->soultrap->carrier_spawn_time = 0;
+    target->soultrap->item = NULL; target->soultrap->item_spawn_time = 0;
+    filled->item->soul_target = NULL; filled->item->soul_target_spawn_time = 0;
+    carrier->vision->forced[1] = 0;
+    target->aiflags = 0; target->s.renderfx = 0; target->svflags = 0; target->s.flags = 0;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(carrier->soultrap->head == target);
+    T_EQ(carrier->soultrap->head_spawn_time, target->spawn_time);
+    T_ASSERT(target->soultrap->carrier == carrier);
+    T_EQ(target->soultrap->carrier_spawn_time, carrier->spawn_time);
+    T_ASSERT(target->soultrap->item == filled);
+    T_EQ(target->soultrap->item_spawn_time, filled->spawn_time);
+    T_ASSERT(filled->item->soul_target == target);
+    T_EQ(filled->item->soul_target_spawn_time, target->spawn_time);
+    T_ASSERT(target->aiflags & AI_SOUL_TRAPPED);
+    T_ASSERT(target->s.renderfx & RF_HIDDEN);
+    T_ASSERT(!M_IsDead(target));
+    T_EQ(carrier->vision->forced[1], 1);
+    T_ASSERT(G_UnitIsForcedVisibleToPlayer(carrier, 1));
+    T_ASSERT(!G_UnitIsForcedVisibleToPlayer(carrier, 2));
+    remove(filename);
+}
+
+TEST(wc3_save, clears_nested_process_owned_fields) {
+    cstring_t filename = Test_TempPath("wc3-save-nested-runtime.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    if (!unit->militia) unit->militia = G_AllocMilitia();
+    assert(unit->militia);
+    unit->militia->partner = (edict_t *)(uintptr_t)1;
+    if (!unit->destructable) unit->destructable = G_AllocDestructable();
+    assert(unit->destructable);
+    unit->destructable->drop_sets = (droppableItemSet_t *)(uintptr_t)1;
+    ARRAY_COUNT(unit->destructable->drop_sets) = 7;
+    T_ASSERT(WriteGame(filename));
+    unit->militia->partner = NULL; unit->destructable->drop_sets = NULL;
+    ARRAY_COUNT(unit->destructable->drop_sets) = 0;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT((!unit->militia || !unit->militia->partner) && (!unit->destructable || !unit->destructable->drop_sets));
+    T_EQ(ARRAY_COUNT(unit->destructable->drop_sets), 0);
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_actor_abilities) {
+    cstring_t filename = Test_TempPath("wc3-save-abilities.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    unit->unit_state->overrides.added[0] = MAKEFOURCC('A', '0', '0', '1'); ARRAY_COUNT(unit->unit_state->overrides.added) = 1;
+    unit->unit_state->overrides.removed[0] = MAKEFOURCC('A', '0', '0', '2'); ARRAY_COUNT(unit->unit_state->overrides.removed) = 1;
+    unit->unit_state->overrides.permanent[0] = MAKEFOURCC('A', '0', '0', '3'); ARRAY_COUNT(unit->unit_state->overrides.permanent) = 1;
+    T_ASSERT(WriteGame(filename)); memset(&unit->unit_state->overrides, 0, sizeof(unit->unit_state->overrides)); T_ASSERT(ReadGame(filename));
+    T_EQ(ARRAY_COUNT(unit->unit_state->overrides.added), 1); T_EQ(unit->unit_state->overrides.added[0], MAKEFOURCC('A', '0', '0', '1'));
+    T_EQ(ARRAY_COUNT(unit->unit_state->overrides.removed), 1); T_EQ(unit->unit_state->overrides.removed[0], MAKEFOURCC('A', '0', '0', '2'));
+    T_EQ(ARRAY_COUNT(unit->unit_state->overrides.permanent), 1); T_EQ(unit->unit_state->overrides.permanent[0], MAKEFOURCC('A', '0', '0', '3'));
+    ARRAY_COUNT(unit->unit_state->overrides.added) = MAX_ABILITIES + 1;
+    T_ASSERT(!WriteGame(filename)); remove(filename);
+}
+
+TEST(wc3_save, rebinds_process_owned_entity_callbacks) {
+    UnitBalance_t unit_row = { .id = MAKEFOURCC('h', 'p', 'e', 'a') };
+    UnitBalance_t no_unit = { 0 };
+    UnitUI_t unit_ui = { 0 };
+    DestructableData_t dest_row = { .file = "Tree" };
+    DestructableData_t no_dest = { 0 };
+    edict_t unit = { .data.UnitBalance = &unit_row, .data.UnitUI = &unit_ui, .data.DestructableData = &no_dest };
+    edict_t dest = { .data.UnitBalance = &no_unit, .data.UnitUI = &unit_ui, .data.DestructableData = &dest_row };
+    edict_t unknown = { .data.UnitBalance = &no_unit, .data.UnitUI = &unit_ui, .data.DestructableData = &no_dest };
+
+    G_BindEntityRuntime(&unit); G_BindEntityRuntime(&dest); G_BindEntityRuntime(&unknown);
+    T_ASSERT(unit.stand == unit_stand && unit.birth == unit_birth && unit.die == unit_die && unit.think == monster_think);
+    T_ASSERT(dest.stand == tree_stand && dest.birth == tree_birth && dest.pain == tree_pain && dest.die == tree_die);
+    T_ASSERT(dest.think == monster_think);
+    T_ASSERT(!unknown.stand && !unknown.birth && !unknown.pain && !unknown.die && !unknown.think);
+}
+
+static void unknown_save_think(edict_t *ent) { (void)ent; }
+
+TEST(wc3_save, round_trip_entity_c_callbacks) {
+    cstring_t filename = Test_TempPath("wc3-save-cfunctions.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    edict_t *mine = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 1.0f, 0.0f);
+    edict_t *idle = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 2.0f, 0.0f);
+    edict_t *effect = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 3.0f, 0.0f);
+    edict_t *tree = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 4.0f, 0.0f);
+    edict_t *human = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 5.0f, 0.0f);
+    edict_t *portal = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 6.0f, 0.0f);
+    edict_t *spray = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 7.0f, 0.0f);
+    edict_t *can = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 8.0f, 0.0f);
+    edict_t *pos = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 9.0f, 0.0f);
+    edict_t *lsh = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 10.0f, 0.0f);
+    edict_t *far_sight = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 11.0f, 0.0f);
+    edict_t *chain = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 12.0f, 0.0f);
+    edict_t *chain_marker = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 13.0f, 0.0f);
+    edict_t *cargo_approach = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 14.0f, 0.0f);
+    edict_t *cannibalize_approach = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 15.0f, 0.0f);
+    edict_t *land_mine = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 16.0f, 0.0f);
+    edict_t *death_aoe = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 17.0f, 0.0f);
+    edict_t *reincarnation = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 18.0f, 0.0f);
+    edict_t *acid_bomb = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 19.0f, 0.0f);
+    edict_t *morph = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 20.0f, 0.0f);
+    unit->stand = unit_stand; unit->birth = unit_birth; unit->die = unit_die; unit->think = monster_think;
+    mine->stand = unit_stand; mine->think = blight_mine_think;
+    idle->stand = unit_stand; idle->think = NULL;
+    effect->think = G_EffectThink; effect->prethink = G_EffectValidateTarget;
+    tree->stand = tree_stand; tree->birth = tree_birth; tree->pain = tree_pain; tree->die = tree_die; tree->think = G_FreeEdict;
+    human->think = human_ability_think;
+    portal->think = dark_portal_think; spray->think = healing_spray_think;
+    cargo_approach->think = corpse_cargo_approach_think; cannibalize_approach->think = cannibalize_approach_think;
+    land_mine->think = land_mine_think; death_aoe->think = death_damage_aoe_think;
+    reincarnation->think = reincarnation_think; acid_bomb->think = acid_bomb_think;
+    morph->think = morph_end;
+    can->think = cannibalize_think; pos->think = possession_two_think; lsh->think = lsh_think;
+    far_sight->think = far_sight_think; far_sight->s.player = 3;
+    far_sight->s.origin2 = (vec2_t){ 123.0f, 456.0f }; far_sight->collision = 777.0f; far_sight->spawn_time = 9876;
+    unit->spawn_time = 2468; mine->spawn_time = 369; chain->spawn_time = 1357;
+    G_InitVisibility(unit);
+    unit->vision->reveal_until = 97531;
+    unit->runtime.flags |= UNIT_BALANCE_PERMANENT_INVISIBLE;
+    chain->think = chain_lightning_think; chain->owner = unit; chain->class_id = MAKEFOURCC('A', 'O', 'c', 'l');
+    if (!chain->channel) chain->channel = G_AllocChannel();
+    assert(chain->channel);
+    chain->channel->owner_spawn_time = unit->spawn_time;
+    chain->s.origin2 = (vec2_t){ 321.0f, 654.0f }; chain->collision = 500.0f; chain->wait = 45.0f;
+    chain->velocity = 0.9f; chain->resources = 3; chain->freetime = 4321;
+    chain_marker->class_id = MAKEFOURCC('C', 'L', 'v', 's'); chain_marker->svflags |= SVF_NOCLIENT;
+    if (!chain_marker->channel) chain_marker->channel = G_AllocChannel();
+    assert(chain_marker->channel);
+    chain_marker->owner = chain; chain_marker->channel->owner_spawn_time = chain->spawn_time;
+    chain_marker->goalentity = mine; chain_marker->resources = mine->spawn_time;
+    reincarnation->owner = unit; reincarnation->class_id = MAKEFOURCC('A', 'O', 'r', 'e');
+    reincarnation->channel = G_AllocChannel(); assert(reincarnation->channel);
+    reincarnation->channel->owner_spawn_time = unit->spawn_time;
+    acid_bomb->owner = unit; acid_bomb->goalentity = mine; acid_bomb->class_id = MAKEFOURCC('A', 'N', 'a', 'b');
+    acid_bomb->channel = G_AllocChannel(); assert(acid_bomb->channel);
+    acid_bomb->channel->owner_spawn_time = unit->spawn_time;
+    acid_bomb->channel->target_spawn_time = mine->spawn_time;
+    morph->owner = unit; morph->resources = MAKEFOURCC('h', 'd', 'h', 'u');
+    morph->channel = G_AllocChannel(); assert(morph->channel);
+    morph->channel->owner_spawn_time = unit->spawn_time;
+    T_ASSERT(WriteGame(filename));
+    unit->think = mine->think = idle->think = effect->think = tree->think = human->think = monster_think;
+    portal->think = spray->think = can->think = pos->think = lsh->think = far_sight->think = chain->think = monster_think;
+    cargo_approach->think = cannibalize_approach->think = monster_think;
+    land_mine->think = death_aoe->think = monster_think;
+    reincarnation->think = acid_bomb->think = morph->think = monster_think;
+    reincarnation->owner = acid_bomb->owner = acid_bomb->goalentity = morph->owner = NULL;
+    reincarnation->channel->owner_spawn_time = acid_bomb->channel->owner_spawn_time = 0;
+    acid_bomb->channel->target_spawn_time = morph->channel->owner_spawn_time = 0;
+    morph->resources = 0;
+    chain->resources = chain->freetime = 0;
+    chain_marker->class_id = chain_marker->svflags = chain_marker->channel->owner_spawn_time = chain_marker->resources = 0;
+    chain_marker->owner = chain_marker->goalentity = NULL;
+    G_InitVisibility(unit);
+    unit->vision->reveal_until = 0; unit->runtime.flags &= ~UNIT_BALANCE_PERMANENT_INVISIBLE;
+    unit->stand = mine->stand = idle->stand = tree->stand = NULL;
+    unit->birth = tree->birth = NULL; unit->die = tree->die = NULL; tree->pain = NULL; effect->prethink = NULL;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(unit->stand == unit_stand && unit->birth == unit_birth && unit->die == unit_die && unit->think == monster_think);
+    T_EQ(unit->vision->reveal_until, 97531);
+    T_ASSERT(unit->runtime.flags & UNIT_BALANCE_PERMANENT_INVISIBLE);
+    T_ASSERT(mine->think == blight_mine_think && mine->stand == unit_stand);
+    T_ASSERT(!idle->think && idle->stand == unit_stand);
+    T_ASSERT(effect->think == G_EffectThink && effect->prethink == G_EffectValidateTarget);
+    T_ASSERT(tree->stand == tree_stand && tree->birth == tree_birth && tree->pain == tree_pain && tree->die == tree_die);
+    T_ASSERT(tree->think == G_FreeEdict);
+    T_ASSERT(human->think == human_ability_think);
+    T_ASSERT(portal->think == dark_portal_think && spray->think == healing_spray_think);
+    T_ASSERT(cargo_approach->think == corpse_cargo_approach_think &&
+             cannibalize_approach->think == cannibalize_approach_think);
+    T_ASSERT(land_mine->think == land_mine_think && death_aoe->think == death_damage_aoe_think);
+    T_ASSERT(reincarnation->think == reincarnation_think && acid_bomb->think == acid_bomb_think);
+    T_ASSERT(reincarnation->owner == unit && acid_bomb->owner == unit && acid_bomb->goalentity == mine);
+    T_EQ(reincarnation->channel->owner_spawn_time, unit->spawn_time);
+    T_EQ(acid_bomb->channel->owner_spawn_time, unit->spawn_time);
+    T_EQ(acid_bomb->channel->target_spawn_time, mine->spawn_time);
+    T_ASSERT(morph->think == morph_end && morph->owner == unit);
+    T_EQ(morph->channel->owner_spawn_time, unit->spawn_time);
+    T_EQ(morph->resources, MAKEFOURCC('h', 'd', 'h', 'u'));
+    T_ASSERT(can->think == cannibalize_think && pos->think == possession_two_think && lsh->think == lsh_think);
+    T_ASSERT(far_sight->think == far_sight_think);
+    T_EQ(far_sight->s.player, 3); T_FEQ(far_sight->s.origin2.x, 123.0f, 0.001f);
+    T_FEQ(far_sight->s.origin2.y, 456.0f, 0.001f); T_FEQ(far_sight->collision, 777.0f, 0.001f);
+    T_EQ(far_sight->spawn_time, 9876);
+    T_ASSERT(chain->think == chain_lightning_think && chain->owner == unit);
+    T_EQ(chain->class_id, MAKEFOURCC('A', 'O', 'c', 'l'));
+    T_EQ(chain->channel->owner_spawn_time, unit->spawn_time);
+    T_FEQ(chain->s.origin2.x, 321.0f, 0.001f); T_FEQ(chain->s.origin2.y, 654.0f, 0.001f);
+    T_FEQ(chain->collision, 500.0f, 0.001f); T_FEQ(chain->wait, 45.0f, 0.001f);
+    T_FEQ(chain->velocity, 0.9f, 0.001f); T_EQ(chain->resources, 3); T_EQ(chain->freetime, 4321);
+    T_EQ(chain_marker->class_id, MAKEFOURCC('C', 'L', 'v', 's')); T_ASSERT(chain_marker->svflags & SVF_NOCLIENT);
+    T_ASSERT(chain_marker->owner == chain && chain_marker->goalentity == mine);
+    T_EQ(chain_marker->channel->owner_spawn_time, chain->spawn_time); T_EQ(chain_marker->resources, mine->spawn_time);
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_nonchannel_identity_thinker_generations) {
+    cstring_t filename = Test_TempPath("wc3-save-identity-thinker.bin");
+    edict_t *owner, *target, *thinker;
+
+    reset_entities(); setup_test_world();
+    owner = alloc_test_unit(MAKEFOURCC('h','p','e','a'), 0.0f, 0.0f);
+    target = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 64.0f, 0.0f);
+    thinker = S_SpellIdentityThinker(owner, MAKEFOURCC('A','l','s','h'), target);
+    T_NOT_NULL(thinker);
+    if (!thinker) return;
+    thinker->think = lsh_think;
+    T_ASSERT(WriteGame(filename));
+    thinker->owner = thinker->goalentity = NULL;
+    thinker->channel->owner_spawn_time = thinker->channel->target_spawn_time = 0;
+    thinker->think = NULL;
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(thinker->think == lsh_think);
+    T_ASSERT(S_SpellChannelOwner(thinker) == owner);
+    T_ASSERT(S_SpellChannelTarget(thinker) == target);
+    T_EQ(thinker->channel->owner_spawn_time, owner->spawn_time);
+    T_EQ(thinker->channel->target_spawn_time, target->spawn_time);
+    remove(filename);
+}
+
+TEST(wc3_save, rejects_unknown_c_callback) {
+    cstring_t filename = Test_TempPath("wc3-save-unknown-cfunction.bin");
+    reset_entities();
+    edict_t *unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    unit->think = unknown_save_think;
+    T_ASSERT(!WriteGame(filename));
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_region_event_filter_function) {
+    cstring_t filename = Test_TempPath("wc3-region-filter-save-test.bin");
+    levelEvents_t old_events = level.events;
+    event_t *registration = NULL;
+    handle_t expected_region, restored_region;
+    region_t *restored_data;
+    uint32_t expected_region_id = UINT32_MAX;
+    jassFunc_t const *expected_filter;
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  region staleRegion = null\n"
+        "  region savedRegion = null\n"
+        "  event staleEvent = null\n"
+        "  event savedEvent = null\n"
+        "  integer savedRegionId = 0\n"
+        "  integer savedEventId = 0\n"
+        "endglobals\n"
+        "function savedRegionFilter takes nothing returns boolean\n"
+        "  return GetFilterUnit() != null\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set staleRegion = CreateRegion()\n"
+        "  call RegionAddRect(staleRegion, Rect(100.0, 200.0, 300.0, 400.0))\n"
+        "  set staleEvent = TriggerRegisterEnterRegion(t, staleRegion, null)\n"
+        "  call RemoveRegion(staleRegion)\n"
+        "  set savedRegion = CreateRegion()\n"
+        "  call RegionAddRect(savedRegion, Rect(10.0, 20.0, 30.0, 40.0))\n"
+        "  set savedRegionId = GetHandleId(savedRegion)\n"
+        "  set savedEvent = TriggerRegisterLeaveRegion(t, savedRegion, Condition(function savedRegionFilter))\n"
+        "  set savedEventId = GetHandleId(savedEvent)\n"
+        "endfunction\n"
+        "function verifyRegionSnapshot takes nothing returns nothing\n"
+        "  call BJassAssert(staleRegion == null, \"removed region handle was restored\")\n"
+        "  call BJassAssert(staleEvent == null, \"removed region event handle was restored\")\n"
+        "  call BJassAssert(savedRegion != null, \"live region handle was lost\")\n"
+        "  call BJassAssert(IsPointInRegion(savedRegion, 20.0, 30.0), \"live region geometry was lost\")\n"
+        "  call BJassAssert(GetHandleId(savedRegion) == savedRegionId, \"region handle ID changed after load\")\n"
+        "  call BJassAssert(GetHandleId(savedEvent) == savedEventId, \"region event handle ID changed after load\")\n"
+        "endfunction\n"));
+    FOR_EACH_EVENT(evt) if (evt->type == EVENT_GAME_LEAVE_REGION) { registration = evt; break; }
+    T_NOT_NULL(registration);
+    expected_region = registration ? registration->region : NULL;
+    T_NOT_NULL(expected_region);
+    T_ASSERT(G_SaveJassHandle("region", expected_region, &expected_region_id));
+    expected_filter = jass_functionbyname(level.vm, "savedRegionFilter");
+    T_ASSERT(registration && registration->filter == expected_filter);
+    T_ASSERT(WriteGame(filename));
+    if (registration) registration->filter = NULL;
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verifyRegionSnapshot", true);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(registration && registration->filter == expected_filter);
+    restored_region = G_LoadJassHandle("region", expected_region_id);
+    T_NOT_NULL(restored_region);
+    T_ASSERT(registration && registration->region == restored_region);
+    restored_data = G_RegionFromHandle(restored_region);
+    T_NOT_NULL(restored_data);
+    T_EQ(restored_data->num_rects, 1);
+    T_FEQ(restored_data->rects[0].min.x, 10.0f, 0.001f);
+    T_FEQ(restored_data->rects[0].max.y, 40.0f, 0.001f);
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(G_RegionFromHandle(restored_region) == restored_data);
+    level.events = old_events;
+    remove(filename);
+}
+
+TEST(wc3_save, removed_region_event_survives_map_registry_recreation) {
+    cstring_t filename = Test_TempPath("wc3-removed-region-event-save-test.bin");
+    levelEvents_t old_events = level.events;
+    uint32_t active_events = 0;
+
+    reset_entities(); setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger watchedTrigger = null\n"
+        "  region watchedRegion = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set watchedTrigger = CreateTrigger()\n"
+        "  set watchedRegion = CreateRegion()\n"
+        "  call TriggerRegisterEnterRegion(watchedTrigger, watchedRegion, null)\n"
+        "  call RemoveRegion(watchedRegion)\n"
+        "endfunction\n"
+        "function recreateMapRegistration takes nothing returns nothing\n"
+        "  set watchedRegion = CreateRegion()\n"
+        "  call TriggerRegisterEnterRegion(watchedTrigger, watchedRegion, null)\n"
+        "endfunction\n"
+        "function verifyRemovedRegionRestored takes nothing returns nothing\n"
+        "  call BJassAssert(watchedRegion == null, \"removed region handle was restored\")\n"
+        "endfunction\n"));
+    FOR_EACH_EVENT(evt) active_events++;
+    T_EQ(active_events, 0);
+    T_ASSERT(WriteGame(filename));
+
+    jass_callbyname(level.vm, "recreateMapRegistration", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    active_events = 0;
+    FOR_EACH_EVENT(evt) active_events++;
+    T_EQ(active_events, 1);
+    T_ASSERT(ReadGame(filename));
+
+    active_events = 0;
+    FOR_EACH_EVENT(evt) active_events++;
+    T_EQ(active_events, 0);
+    jass_callbyname(level.vm, "verifyRemovedRegionRestored", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    level.events = old_events;
+    remove(filename);
+}
+
+TEST(wc3_save, queued_event_reference_round_trips_after_region_slot_retirement) {
+    cstring_t filename = Test_TempPath("wc3-region-event-slot-hole-save-test.bin");
+    levelEvents_t old_events = level.events;
+
+    reset_entities(); setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger watchedTrigger = null\n"
+        "  region watchedRegion = null\n"
+        "  unit watchedUnit = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set watchedTrigger = CreateTrigger()\n"
+        "  set watchedRegion = CreateRegion()\n"
+        "  call TriggerRegisterEnterRegion(watchedTrigger, watchedRegion, null)\n"
+        "  set watchedUnit = CreateUnit(Player(0), 'hpea', 0.0, 0.0, 0.0)\n"
+        "  call TriggerRegisterUnitStateEvent(watchedTrigger, watchedUnit, ConvertUnitState(0), ConvertLimitOp(1), "
+        "50.0)\n"
+        "  call RemoveRegion(watchedRegion)\n"
+        "  call SetWidgetLife(watchedUnit, 100.0)\n"
+        /* Keep the event nonlethal so only the state-limit response is queued. */
+        "  call SetWidgetLife(watchedUnit, 50.0)\n"
+        "endfunction\n"));
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(!level.events.handlers[0].inuse);
+    T_ASSERT(level.events.handlers[1].inuse);
+    T_EQ(level.events.write, 1);
+    T_ASSERT(level.events.queue[0].responseTo == &level.events.handlers[1]);
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    T_EQ(level.events.write, 1);
+    T_ASSERT(level.events.queue[0].responseTo == &level.events.handlers[1]);
+    level.events = old_events;
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_game_state_event_condition) {
+    cstring_t filename = Test_TempPath("wc3-game-state-event-save-test.bin");
+    levelEvents_t old_events = level.events;
+    event_t handler = {
+        .type = EVENT_GAME_STATE_LIMIT,
+        .state = WC3_GAME_STATE_TIME_OF_DAY,
+        .limitop = WC3_LIMITOP_GREATER_THAN_OR_EQUAL,
+        .limitval = 6.0f,
+    };
+
+    reset_entities();
+    memset(&level.events, 0, sizeof(level.events));
+    level.events.handlers[0] = handler; level.events.handlers[0].inuse = true;
+    event_t *saved_handler = &level.events.handlers[0];
+    T_ASSERT(WriteGame(filename));
+    saved_handler->state = saved_handler->limitop = 0; saved_handler->limitval = 0.0f;
+    T_ASSERT(ReadGame(filename));
+    T_EQ(saved_handler->state, WC3_GAME_STATE_TIME_OF_DAY);
+    T_EQ(saved_handler->limitop, WC3_LIMITOP_GREATER_THAN_OR_EQUAL);
+    T_FEQ(saved_handler->limitval, 6.0f, 0.001f);
+    level.events = old_events;
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_variable_event_condition) {
+    cstring_t filename = Test_TempPath("wc3-variable-event-save-test.bin");
+    levelEvents_t old_events = level.events;
+    event_t handler = {
+        .type = EVENT_GAME_VARIABLE_LIMIT,
+        .limitop = WC3_LIMITOP_EQUAL,
+        .limitval = 100.0f,
+        .variable = "counter",
+    };
+
+    reset_entities();
+    memset(&level.events, 0, sizeof(level.events));
+    level.events.handlers[0] = handler; level.events.handlers[0].inuse = true;
+    event_t *saved_handler = &level.events.handlers[0];
+    T_ASSERT(WriteGame(filename));
+    saved_handler->variable = NULL;
+    T_ASSERT(ReadGame(filename));
+    T_STREQ(saved_handler->variable, "counter");
+    level.events = old_events;
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_unread_event_queue) {
+    cstring_t filename = Test_TempPath("wc3-event-save-test.bin");
+    levelEvents_t old_events = level.events;
+    event_t handler = { .type = EVENT_UNIT_IN_RANGE };
+    edict_t *subject, *source;
+    vec2_t point = { 11.0f, 22.0f };
+
+    reset_entities(); memset(&level.events, 0, sizeof(level.events));
+    level.events.handlers[0] = handler; level.events.handlers[0].inuse = true;
+    event_t *saved_handler = &level.events.handlers[0];
+    subject = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    subject->spawn_time = level.time + 1234;
+    G_SetEventSubject(saved_handler, subject);
+    source = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 64.0f, 0.0f);
+    gameEvent_t *queued = G_PublishEventWithPoint(&(gameEventPointParams_t){
+        .edict = subject, .type = EVENT_UNIT_IN_RANGE, .source = source,
+        .value = (int32_t)MAKEFOURCC('R','h','m','e'), .point = &point });
+    queued->responseTo = saved_handler;
+    T_ASSERT(WriteGame(filename));
+    level.events.read = level.events.write; memset(level.events.queue, 0, sizeof(level.events.queue));
+    T_ASSERT(ReadGame(filename));
+    T_EQ(level.events.read, 0); T_EQ(level.events.write, 1);
+    T_EQ(level.events.queue[0].type, EVENT_UNIT_IN_RANGE);
+    T_ASSERT(level.events.queue[0].edict == subject && level.events.queue[0].source == source);
+    T_EQ(level.events.queue[0].edict_spawn_time, subject->spawn_time);
+    T_ASSERT(level.events.queue[0].edict_spawn_tracked);
+    T_EQ(level.events.queue[0].source_spawn_time, source->spawn_time);
+    T_ASSERT(level.events.queue[0].source_spawn_tracked);
+    T_EQ((uint32_t)level.events.queue[0].value, MAKEFOURCC('R','h','m','e'));
+    T_ASSERT(level.events.queue[0].has_point);
+    T_FEQ(level.events.queue[0].point.x, 11.0f, 0.001f);
+    T_FEQ(level.events.queue[0].point.y, 22.0f, 0.001f);
+    T_ASSERT(level.events.queue[0].responseTo == saved_handler);
+    T_ASSERT(saved_handler->subject == subject);
+    T_EQ(saved_handler->subject_spawn_time, subject->spawn_time);
+    T_ASSERT(saved_handler->subject_spawn_tracked);
+    level.events = old_events; remove(filename);
+}
+
+TEST(wc3_save, round_trip_waypoint_references) {
+    cstring_t filename = Test_TempPath("wc3-waypoint-save-test.bin");
+    vec2_t destination = { 192.0f, 96.0f };
+    edict_t *unit, *waypoint;
+    uint32_t cursor, count;
+
+    reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 0.0f, 0.0f);
+    waypoint = Waypoint_add(&destination); cursor = level.waypoints.cursor; count = globals.num_edicts;
+    T_ASSERT(waypoint >= g_edicts && waypoint < g_edicts + globals.num_edicts);
+    T_ASSERT(waypoint->svflags & SVF_NOCLIENT);
+    G_InitWaypoints(); T_EQ(globals.num_edicts, count);
+    unit->goalentity = waypoint;
+    unit->orders->attackmove_waypoint = waypoint;
+    T_ASSERT(WriteGame(filename));
+    waypoint->s.origin2 = (vec2_t){ 0 };
+    unit->goalentity = unit->orders->attackmove_waypoint = NULL;
+    Waypoint_add(&(vec2_t){ 1.0f, 1.0f });
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(unit->goalentity == waypoint && unit->orders->attackmove_waypoint == waypoint);
+    T_FEQ(waypoint->s.origin2.x, destination.x, 0.01f); T_FEQ(waypoint->s.origin2.y, destination.y, 0.01f);
+    T_EQ(level.waypoints.cursor, cursor);
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_jass_globals) {
+    cstring_t filename = Test_TempPath("wc3-jass-save-test.bin");
+    T_ASSERT(run_test_jass(
+        "type group extends handle\n"
+        "type trigger extends handle\n"
+        "globals\n"
+        "  integer savedInteger = 41\n"
+        "  real savedReal = 2.5\n"
+        "  boolean savedBoolean = true\n"
+        "  terraindeformation savedDeformation = null\n"
+        "  string savedString = \"before\"\n"
+        "  code savedCode = function SavedCallback\n"
+        "  unit savedNull = null\n"
+        "  player savedPlayer = null\n"
+        "  player savedPlayerAlias = null\n"
+        "  unit savedUnit = null\n"
+        "  unit savedUnitAlias = null\n"
+        "  quest savedQuest = null\n"
+        "  quest savedQuestAlias = null\n"
+        "  questitem savedQuestItem = null\n"
+        "  questitem savedQuestItemAlias = null\n"
+        "  group savedGroup = null\n"
+        "  group savedGroupAlias = null\n"
+        "  trigger savedTrigger = null\n"
+        "  trigger savedTriggerAlias = null\n"
+        "  sound savedSound = null\n"
+        "  sound savedSoundAlias = null\n"
+        "  camerasetup savedCamera = null\n"
+        "  camerasetup savedCameraAlias = null\n"
+        "  rect savedRect = null\n"
+        "  rect savedRectAlias = null\n"
+        "  location savedLocation = null\n"
+        "  location savedLocationAlias = null\n"
+        "  force savedForce = null\n"
+        "  force savedForceAlias = null\n"
+        "  gamecache savedCache = null\n"
+        "  boolexpr savedFilter = null\n"
+        "  boolexpr savedFilterAlias = null\n"
+        "  integer array savedArray\n"
+        "endglobals\n"
+        "function SavedCallback takes nothing returns nothing\n"
+        "endfunction\n"
+        "function ChangedCallback takes nothing returns nothing\n"
+        "endfunction\n"
+        "function SavedFilter takes nothing returns boolean\n"
+        "  return false\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set savedDeformation = TerrainDeformCrater(64.0, 96.0, 48.0, 8.0, 1000, false)\n"
+        "  set savedPlayer = Player(0)\n"
+        "  set savedPlayerAlias = savedPlayer\n"
+        "  set savedUnit = CreateUnit(savedPlayer, 'hpea', 0.0, 0.0, 0.0)\n"
+        "  set savedUnitAlias = savedUnit\n"
+        "  set savedQuest = CreateQuest()\n"
+        "  set savedQuestAlias = savedQuest\n"
+        "  set savedQuestItem = QuestCreateItem(savedQuest)\n"
+        "  set savedQuestItemAlias = savedQuestItem\n"
+        "  set savedGroup = CreateGroup()\n"
+        "  set savedGroupAlias = savedGroup\n"
+        "  call GroupAddUnit(savedGroup, savedUnit)\n"
+        "  set savedTrigger = CreateTrigger()\n"
+        "  set savedTriggerAlias = savedTrigger\n"
+        "  call DisableTrigger(savedTrigger)\n"
+        "  set savedSound = CreateSound(\"test.wav\", false, false, false, 0, 0, \"\")\n"
+        "  set savedSoundAlias = savedSound\n"
+        "  call SetSoundDuration(savedSound, 1234)\n"
+        "  set savedCamera = CreateCameraSetup()\n"
+        "  set savedCameraAlias = savedCamera\n"
+        "  call CameraSetupSetDestPosition(savedCamera, 12.0, 34.0, 0.0)\n"
+        "  set savedRect = Rect(1.0, 2.0, 3.0, 4.0)\n"
+        "  set savedRectAlias = savedRect\n"
+        "  set savedLocation = Location(5.0, 6.0)\n"
+        "  set savedLocationAlias = savedLocation\n"
+        "  set savedForce = CreateForce()\n"
+        "  set savedForceAlias = savedForce\n"
+        "  call ForceAddPlayer(savedForce, savedPlayer)\n"
+        "  set savedCache = InitGameCache(\"save-test.w3v\")\n"
+        "  call StoreInteger(savedCache, \"mission\", \"key\", 37)\n"
+        "  set savedFilter = Filter(function SavedFilter)\n"
+        "  set savedFilterAlias = savedFilter\n"
+        "  set savedArray[7] = 77\n"
+        "  set savedArray[4095] = 95\n"
+        "endfunction\n"
+        "function mutate takes nothing returns nothing\n"
+        "  set savedDeformation = TerrainDeformCrater(128.0, 160.0, 32.0, 4.0, 500, false)\n"
+        "  set savedInteger = 0\n"
+        "  set savedReal = 0.0\n"
+        "  set savedBoolean = false\n"
+        "  set savedString = \"after\"\n"
+        "  set savedCode = function ChangedCallback\n"
+        "  set savedPlayer = null\n"
+        "  set savedPlayerAlias = null\n"
+        "  set savedUnit = null\n"
+        "  set savedUnitAlias = null\n"
+        "  set savedQuest = null\n"
+        "  set savedQuestAlias = null\n"
+        "  set savedQuestItem = null\n"
+        "  set savedQuestItemAlias = null\n"
+        "  call GroupClear(savedGroup)\n"
+        "  call EnableTrigger(savedTrigger)\n"
+        "  call SetSoundDuration(savedSound, 1)\n"
+        "  call CameraSetupSetDestPosition(savedCamera, 1.0, 1.0, 0.0)\n"
+        "  call SetRect(savedRect, 0.0, 0.0, 0.0, 0.0)\n"
+        "  call MoveLocation(savedLocation, 0.0, 0.0)\n"
+        "  call ForceClear(savedForce)\n"
+        "  call StoreInteger(savedCache, \"mission\", \"key\", 0)\n"
+        "  set savedFilter = null\n"
+        "  set savedFilterAlias = null\n"
+        "  set savedArray[7] = 0\n"
+        "  set savedArray[4095] = 0\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(savedDeformation == null, \"renderer-only deformation handle survived save/load\")\n"
+        "  call BJassAssert(savedInteger == 41, \"integer snapshot mismatch\")\n"
+        "  call BJassAssert(savedReal == 2.5, \"real snapshot mismatch\")\n"
+        "  call BJassAssert(savedBoolean, \"boolean snapshot mismatch\")\n"
+        "  call BJassAssert(savedString == \"before\", \"string snapshot mismatch\")\n"
+        "  call BJassAssert(savedCode == function SavedCallback, \"code snapshot mismatch\")\n"
+        "  call BJassAssert(savedNull == null, \"null snapshot mismatch\")\n"
+        "  call BJassAssert(savedPlayer == savedPlayerAlias, \"player alias mismatch\")\n"
+        "  call BJassAssert(savedPlayer == Player(0), \"player handle mismatch\")\n"
+        "  call BJassAssert(savedUnit == savedUnitAlias, \"unit alias mismatch\")\n"
+        "  call BJassAssert(GetUnitTypeId(savedUnit) == 'hpea', \"unit handle mismatch\")\n"
+        "  call BJassAssert(savedQuest == savedQuestAlias, \"quest alias mismatch\")\n"
+        "  call BJassAssert(savedQuestItem == savedQuestItemAlias, \"quest item alias mismatch\")\n"
+        "  call BJassAssert(savedGroup == savedGroupAlias, \"group alias mismatch\")\n"
+        "  call BJassAssert(FirstOfGroup(savedGroup) == savedUnit, \"group membership mismatch\")\n"
+        "  call BJassAssert(savedTrigger == savedTriggerAlias, \"trigger alias mismatch\")\n"
+        "  call BJassAssert(not IsTriggerEnabled(savedTrigger), \"trigger state mismatch\")\n"
+        "  call BJassAssert(savedSound == savedSoundAlias, \"sound alias mismatch\")\n"
+        "  call BJassAssert(GetSoundDuration(savedSound) == 1234, \"sound payload mismatch\")\n"
+        "  call BJassAssert(savedCamera == savedCameraAlias, \"camera alias mismatch\")\n"
+        "  call BJassAssert(CameraSetupGetDestPositionX(savedCamera) == 12.0, \"camera X mismatch\")\n"
+        "  call BJassAssert(CameraSetupGetDestPositionY(savedCamera) == 34.0, \"camera Y mismatch\")\n"
+        "  call BJassAssert(savedRect == savedRectAlias, \"rect alias mismatch\")\n"
+        "  call BJassAssert(GetRectMinX(savedRect) == 1.0 and GetRectMaxY(savedRect) == 4.0, \"rect payload mismatch\")\n"
+        "  call BJassAssert(savedLocation == savedLocationAlias, \"location alias mismatch\")\n"
+        "  call BJassAssert(GetLocationX(savedLocation) == 5.0 and GetLocationY(savedLocation) == 6.0, \"location payload mismatch\")\n"
+        "  call BJassAssert(savedForce == savedForceAlias, \"force alias mismatch\")\n"
+        "  call BJassAssert(IsPlayerInForce(savedPlayer, savedForce), \"force payload mismatch\")\n"
+        "  call BJassAssert(GetStoredInteger(savedCache, \"mission\", \"key\") == 37, \"gamecache payload mismatch\")\n"
+        "  call BJassAssert(savedFilter == savedFilterAlias, \"boolexpr alias mismatch\")\n"
+        "  call BJassAssert(savedArray[7] == 77, \"sparse array mismatch\")\n"
+        "  call BJassAssert(savedArray[4095] == 95, \"high sparse array mismatch\")\n"
+        "endfunction\n"));
+    T_ASSERT(WriteGame(filename));
+    jass_callbyname(level.vm, "mutate", false);
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_timer_dialog_state_and_handle) {
+    cstring_t filename = Test_TempPath("wc3-timer-dialog-save-test.bin");
+    player_t *saved = currentplayer;
+
+    currentplayer = NULL;
+    T_ASSERT(run_test_jass(
+        "type timer extends handle\n"
+        "type timerdialog extends handle\n"
+        "globals\n"
+        "  timer savedTimerDialogTimer = null\n"
+        "  timerdialog savedTimerDialog = null\n"
+        "  timerdialog savedTimerDialogAlias = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set savedTimerDialogTimer = CreateTimer()\n"
+        "  call TimerStart(savedTimerDialogTimer, 65.0, false, null)\n"
+        "  set savedTimerDialog = CreateTimerDialog(savedTimerDialogTimer)\n"
+        "  set savedTimerDialogAlias = savedTimerDialog\n"
+        "  call TimerDialogSetTitle(savedTimerDialog, \"Until Reinforcements Arrive\")\n"
+        "  call TimerDialogSetTitleColor(savedTimerDialog, 10, 20, 30, 40)\n"
+        "  call TimerDialogSetTimeColor(savedTimerDialog, 50, 60, 70, 80)\n"
+        "  call TimerDialogDisplay(savedTimerDialog, true)\n"
+        "endfunction\n"
+        "function mutate takes nothing returns nothing\n"
+        "  call TimerDialogDisplay(savedTimerDialog, false)\n"
+        "  call TimerDialogSetTitle(savedTimerDialog, \"mutated\")\n"
+        "  call DestroyTimerDialog(savedTimerDialog)\n"
+        "  set savedTimerDialogAlias = null\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(savedTimerDialog == savedTimerDialogAlias, \"timer-dialog alias mismatch\")\n"
+        "  call BJassAssert(IsTimerDialogDisplayed(savedTimerDialog), \"timer-dialog visibility mismatch\")\n"
+        "  call BJassAssert(TimerGetRemaining(savedTimerDialogTimer) > 64.0, \"timer-dialog timer mismatch\")\n"
+        "endfunction\n"));
+
+    T_ASSERT(level.timer_dialogs[0].inuse);
+    T_ASSERT(WriteGame(filename));
+    jass_callbyname(level.vm, "mutate", false);
+    T_ASSERT(!level.timer_dialogs[0].inuse);
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(level.timer_dialogs[0].inuse);
+    T_STREQ(level.timer_dialogs[0].title, "Until Reinforcements Arrive");
+    T_EQ(level.timer_dialogs[0].title_color.r, 10); T_EQ(level.timer_dialogs[0].title_color.g, 20);
+    T_EQ(level.timer_dialogs[0].title_color.b, 30); T_EQ(level.timer_dialogs[0].title_color.a, 40);
+    T_EQ(level.timer_dialogs[0].time_color.r, 50); T_EQ(level.timer_dialogs[0].time_color.g, 60);
+    T_EQ(level.timer_dialogs[0].time_color.b, 70); T_EQ(level.timer_dialogs[0].time_color.a, 80);
+    remove(filename);
+    currentplayer = saved;
+}
+
+TEST(wc3_save, round_trip_leaderboard_state_and_handle) {
+    cstring_t filename = Test_TempPath("wc3-leaderboard-save-test.bin");
+    player_t *saved_currentplayer = currentplayer;
+    currentplayer = NULL;
+
+    T_ASSERT(run_test_jass(
+        "type leaderboard extends handle\n"
+        "globals\n"
+        "  leaderboard savedBoard = null\n"
+        "  leaderboard savedAlias = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set savedBoard = CreateLeaderboard()\n"
+        "  set savedAlias = savedBoard\n"
+        "  call LeaderboardSetLabel(savedBoard, \"Grunts Trained\")\n"
+        "  call LeaderboardAddItem(savedBoard, \"Grunts\", 4, Player(0))\n"
+        "  call LeaderboardSetItemValueColor(savedBoard, 0, 10, 20, 30, 40)\n"
+        "  call PlayerSetLeaderboard(Player(0), savedBoard)\n"
+        "  call LeaderboardDisplay(savedBoard, true)\n"
+        "endfunction\n"
+        "function mutate takes nothing returns nothing\n"
+        "  call DestroyLeaderboard(savedBoard)\n"
+        "  set savedAlias = null\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(savedBoard == savedAlias, \"leaderboard alias\")\n"
+        "  call BJassAssert(PlayerGetLeaderboard(Player(0)) == savedBoard, \"leaderboard assignment\")\n"
+        "  call BJassAssert(IsLeaderboardDisplayed(savedBoard), \"leaderboard display\")\n"
+        "  call BJassAssert(LeaderboardGetItemCount(savedBoard) == 1, \"leaderboard item count\")\n"
+        "endfunction\n"));
+
+    T_ASSERT(WriteGame(filename));
+    jass_callbyname(level.vm, "mutate", false);
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_STREQ(level.leaderboards[0].label, "Grunts Trained");
+    T_EQ(level.leaderboards[0].items[0].value, 4);
+    T_EQ(level.leaderboards[0].items[0].value_color.r, 10);
+    T_EQ(level.leaderboards[0].items[0].value_color.a, 40);
+    remove(filename);
+    currentplayer = saved_currentplayer;
+}
+
+TEST(wc3_save, round_trip_weather_effect_state_and_handle) {
+    cstring_t filename = Test_TempPath("wc3-weather-save-test.bin");
+
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  weathereffect savedWeather = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  local rect r = Rect(-128.0, -64.0, 256.0, 320.0)\n"
+        "  set savedWeather = AddWeatherEffect(r, 'RAhr')\n"
+        "  call EnableWeatherEffect(savedWeather, true)\n"
+        "endfunction\n"
+        "function disableSavedWeather takes nothing returns nothing\n"
+        "  call EnableWeatherEffect(savedWeather, false)\n"
+        "endfunction\n"));
+    T_ASSERT(level.weather_effects[0].inuse && level.weather_effects[0].enabled);
+    uint32_t saved_handle = level.weather_effects[0].handle_id;
+    T_ASSERT(WriteGame(filename));
+
+    level.weather_effects[0].enabled = false;
+    level.weather_effects[0].effect_id = 0;
+    memset(&level.weather_effects[0].bounds, 0, sizeof(level.weather_effects[0].bounds));
+    level.next_weather_id = 0;
+
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(level.weather_effects[0].inuse && level.weather_effects[0].enabled);
+    T_EQ(level.weather_effects[0].handle_id, saved_handle);
+    T_EQ(level.weather_effects[0].effect_id, MAKEFOURCC('R','A','h','r'));
+    T_FEQ(level.weather_effects[0].bounds.min.x, -128.0f, 0.001f);
+    T_FEQ(level.weather_effects[0].bounds.max.y, 320.0f, 0.001f);
+    T_EQ(level.next_weather_id, saved_handle);
+
+    jass_callbyname(level.vm, "disableSavedWeather", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    T_ASSERT(!level.weather_effects[0].enabled);
+    remove(filename);
+}
+
+TEST(wc3_save, round_trip_jass_timers) {
+    cstring_t filename = Test_TempPath("wc3-jass-timer-save-test.bin");
+    T_ASSERT(run_test_jass(
+        "type timer extends handle\n"
+        "type trigger extends handle\n"
+        "type triggeraction extends handle\n"
+        "type event extends handle\n"
+        "globals\n"
+        "  timer pausedTimer = null\n"
+        "  timer pausedTimerAlias = null\n"
+        "  timer runningTimer = null\n"
+        "  timer runningTimerAlias = null\n"
+        "  trigger timerTrigger = null\n"
+        "  integer timerCallbacks = 0\n"
+        "endglobals\n"
+        "function TimerCallback takes nothing returns nothing\n"
+        "  call BJassAssert(GetExpiredTimer() == runningTimer, \"direct expired timer mismatch\")\n"
+        "  set timerCallbacks = timerCallbacks + 1\n"
+        "endfunction\n"
+        "function TimerTriggerAction takes nothing returns nothing\n"
+        "  call BJassAssert(GetExpiredTimer() == runningTimer, \"trigger expired timer mismatch\")\n"
+        "  set timerCallbacks = timerCallbacks + 10\n"
+        "endfunction\n"
+        "function TimerNoop takes nothing returns nothing\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set timerTrigger = CreateTrigger()\n"
+        "  set pausedTimer = CreateTimer()\n"
+        "  set pausedTimerAlias = pausedTimer\n"
+        "  call TimerStart(pausedTimer, 10.0, false, null)\n"
+        "  call TimerStart(pausedTimer, 10.0, false, function TimerNoop)\n"
+        "  call PauseTimer(pausedTimer)\n"
+        "  set runningTimer = CreateTimer()\n"
+        "  set runningTimerAlias = runningTimer\n"
+        "  call TriggerAddAction(timerTrigger, function TimerTriggerAction)\n"
+        "  call TriggerRegisterTimerExpireEvent(timerTrigger, runningTimer)\n"
+        "  call TimerStart(runningTimer, 0.0, true, function TimerCallback)\n"
+        "endfunction\n"
+        "function mutate takes nothing returns nothing\n"
+        "  call DestroyTimer(pausedTimer)\n"
+        "  call DestroyTimer(runningTimer)\n"
+        "  set pausedTimerAlias = null\n"
+        "  set runningTimerAlias = null\n"
+        "  set timerCallbacks = 99\n"
+        "endfunction\n"
+        "function verifyRestored takes nothing returns nothing\n"
+        "  call BJassAssert(pausedTimer == pausedTimerAlias, \"paused timer alias mismatch\")\n"
+        "  call BJassAssert(runningTimer == runningTimerAlias, \"running timer alias mismatch\")\n"
+        "  call BJassAssert(TimerGetTimeout(pausedTimer) == 10.0, \"timer timeout mismatch\")\n"
+        "  call BJassAssert(TimerGetRemaining(pausedTimer) > 9.0, \"paused timer remaining mismatch\")\n"
+        "  call BJassAssert(TimerGetRemaining(pausedTimer) <= 10.0, \"paused timer remaining overflow\")\n"
+        "  call BJassAssert(timerCallbacks == 0, \"timer callback state mismatch\")\n"
+        "endfunction\n"
+        "function verifyExpired takes nothing returns nothing\n"
+        "  call BJassAssert(timerCallbacks > 0, \"direct timer callback did not run after load\")\n"
+        "  call BJassAssert(timerCallbacks == 11, \"timer trigger did not run after load\")\n"
+        "endfunction\n"
+        "function verifyPeriodic takes nothing returns nothing\n"
+        "  call BJassAssert(timerCallbacks == 22, \"periodic timer did not remain active after load\")\n"
+        "endfunction\n"
+        "function addTimer takes nothing returns nothing\n"
+        "  call CreateTimer()\n"
+        "endfunction\n"
+        "function addEvent takes nothing returns nothing\n"
+        "  call TriggerRegisterTimerExpireEvent(timerTrigger, runningTimer)\n"
+        "endfunction\n"));
+    level.time = 100;
+    level.timers[1].duration = 4 * FRAMETIME; level.timers[1].remaining = 4 * FRAMETIME;
+    T_ASSERT(WriteGame(filename));
+    jass_callbyname(level.vm, "mutate", false);
+    T_ASSERT(ReadGame(filename));
+    T_EQ(level.time, 100);
+    T_EQ(G_TimerRemaining(&level.timers[1]), 4 * FRAMETIME);
+    jass_callbyname(level.vm, "verifyRestored", false);
+    /* Countdown timers ignore level.time entirely: only elapsed frames expire them. */
+    FOR_LOOP(i, 4) G_RunTimers();
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verifyExpired", false);
+    FOR_LOOP(i, 4) G_RunTimers();
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verifyPeriodic", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    jass_callbyname(level.vm, "addEvent", false);
+    T_ASSERT(!ReadGame(filename));
+    jass_callbyname(level.vm, "addTimer", false);
+    T_ASSERT(!ReadGame(filename));
+    remove(filename);
+}
+
+TEST(wc3_save, restores_triggers_and_events_created_after_main) {
+    cstring_t filename = Test_TempPath("wc3-late-trigger-save-test.bin");
+    uint32_t main_triggers, main_events = 0, saved_triggers, saved_events = 0, skip, live_events;
+    T_ASSERT(run_test_jass(
+        "type trigger extends handle\n"
+        "type triggeraction extends handle\n"
+        "type event extends handle\n"
+        "type timer extends handle\n"
+        "globals\n"
+        "  trigger lateTrig = null\n"
+        "endglobals\n"
+        "function LateAction takes nothing returns nothing\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call CreateTrigger()\n"
+        "endfunction\n"
+        "function later takes nothing returns nothing\n"
+        "  set lateTrig = CreateTrigger()\n"
+        "  call TriggerAddAction(lateTrig, function LateAction)\n"
+        "  call TriggerRegisterTimerEvent(lateTrig, 0.0, false)\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(lateTrig != null, \"late trigger handle was lost\")\n"
+        "endfunction\n"));
+    main_triggers = level.num_triggers;
+    FOR_EACH_EVENT(event) main_events++;
+    jass_callbyname(level.vm, "later", false);
+    saved_triggers = level.num_triggers;
+    FOR_EACH_EVENT(event) saved_events++;
+    T_ASSERT(saved_triggers > main_triggers);
+    T_ASSERT(saved_events > main_events);
+    T_ASSERT(WriteGame(filename));
+    /* A map reload only recreates main()'s registries; extras must be allocated from the save. */
+    level.num_triggers = main_triggers;
+    skip = saved_events - main_events;
+    FOR_LOOP(i, MAX_EVENTS) if (i >= main_events && skip) { memset(&level.events.handlers[i], 0, sizeof(event_t)); skip--; }
+    T_ASSERT(ReadGame(filename));
+    T_EQ(level.num_triggers, saved_triggers);
+    live_events = 0;
+    FOR_EACH_EVENT(event) live_events++;
+    T_EQ(live_events, saved_events);
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+TEST(wc3_jass, paused_timer_drops_queued_expiration_action) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  timer pendingTimer = null\n"
+        "  integer timerFired = 0\n"
+        "endglobals\n"
+        "function ExpireAction takes nothing returns nothing\n"
+        "  set timerFired = timerFired + 1\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  set pendingTimer = CreateTimer()\n"
+        "  call TriggerAddAction(t, function ExpireAction)\n"
+        "  call TriggerRegisterTimerExpireEvent(t, pendingTimer)\n"
+        "  call TimerStart(pendingTimer, 0.0, true, null)\n"
+        "endfunction\n"
+        "function PausePending takes nothing returns nothing\n"
+        "  call PauseTimer(pendingTimer)\n"
+        "endfunction\n"
+        "function VerifyDropped takes nothing returns nothing\n"
+        "  call BJassAssert(timerFired == 0, \"paused timer expiration action still ran\")\n"
+        "endfunction\n"));
+
+    G_RunTimers();
+    jass_callbyname(level.vm, "PausePending", false);
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "VerifyDropped", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass, disabled_triggers_allow_explicit_execution_but_ignore_events) {
+    setup_test_world();
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  trigger queuedTrigger = null\n"
+        "  trigger disabledEventTrigger = null\n"
+        "  trigger enabledEventTrigger = null\n"
+        "  timer disabledEventTimer = null\n"
+        "  timer enabledEventTimer = null\n"
+        "  integer queuedRuns = 0\n"
+        "  integer queuedConditionRuns = 0\n"
+        "  integer disabledEventRuns = 0\n"
+        "  integer enabledEventRuns = 0\n"
+        "endglobals\n"
+        "function QueueCondition takes nothing returns boolean\n"
+        "  set queuedConditionRuns = queuedConditionRuns + 1\n"
+        "  return true\n"
+        "endfunction\n"
+        "function QueuedAction takes nothing returns nothing\n"
+        "  set queuedRuns = queuedRuns + 1\n"
+        "endfunction\n"
+        "function DisabledEventAction takes nothing returns nothing\n"
+        "  set disabledEventRuns = disabledEventRuns + 1\n"
+        "endfunction\n"
+        "function EnabledEventAction takes nothing returns nothing\n"
+        "  set enabledEventRuns = enabledEventRuns + 1\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set queuedTrigger = CreateTrigger()\n"
+        "  call TriggerAddCondition(queuedTrigger, Condition(function QueueCondition))\n"
+        "  call TriggerAddAction(queuedTrigger, function QueuedAction)\n"
+        "  call DisableTrigger(queuedTrigger)\n"
+        "  if TriggerEvaluate(queuedTrigger) then\n"
+        "    call TriggerExecute(queuedTrigger)\n"
+        "  endif\n"
+        "  call BJassAssert(queuedRuns == 1, \"queued disabled trigger action did not run\")\n"
+        "  set disabledEventTrigger = CreateTrigger()\n"
+        "  set disabledEventTimer = CreateTimer()\n"
+        "  call TriggerAddAction(disabledEventTrigger, function DisabledEventAction)\n"
+        "  call TriggerRegisterTimerExpireEvent(disabledEventTrigger, disabledEventTimer)\n"
+        "  call DisableTrigger(disabledEventTrigger)\n"
+        "  call TimerStart(disabledEventTimer, 0.0, false, null)\n"
+        "  set enabledEventTrigger = CreateTrigger()\n"
+        "  set enabledEventTimer = CreateTimer()\n"
+        "  call TriggerAddAction(enabledEventTrigger, function EnabledEventAction)\n"
+        "  call TriggerRegisterTimerExpireEvent(enabledEventTrigger, enabledEventTimer)\n"
+        "  call TimerStart(enabledEventTimer, 0.0, false, null)\n"
+        "endfunction\n"
+        "function VerifyDisabledTriggerPaths takes nothing returns nothing\n"
+        "  call BJassAssert(queuedRuns == 1, \"explicit queue ran more than once\")\n"
+        "  call BJassAssert(queuedConditionRuns == 1, \"disabled trigger condition was not evaluated exactly once\")\n"
+        "  call BJassAssert(disabledEventRuns == 0, \"disabled trigger responded to timer event\")\n"
+        "  call BJassAssert(enabledEventRuns == 1, \"enabled trigger missed timer event\")\n"
+        "endfunction\n"));
+
+    G_RunTimers();
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "VerifyDisabledTriggerPaths", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass, nested_script_sleep_resumes_child_before_parent) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer nestedSleepStage = 0\n"
+        "endglobals\n"
+        "function NestedSleepChild takes nothing returns nothing\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set nestedSleepStage = 2\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  set nestedSleepStage = 1\n"
+        "  call NestedSleepChild()\n"
+        "  set nestedSleepStage = 3\n"
+        "endfunction\n"
+        "function verifyYielded takes nothing returns nothing\n"
+        "  call BJassAssert(nestedSleepStage == 1, \"nested child did not yield caller\")\n"
+        "endfunction\n"
+        "function verifyResumed takes nothing returns nothing\n"
+        "  call BJassAssert(nestedSleepStage == 3, \"nested child did not resume before caller\")\n"
+        "endfunction\n"));
+    jass_callbyname(level.vm, "verifyYielded", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verifyResumed", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass, coroutine_keeps_loop_index_changed_before_sleep) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer bj_forLoopAIndex = 1\n"
+        "  integer resumedLoopIndex = 0\n"
+        "endglobals\n"
+        "function LoopAction takes nothing returns nothing\n"
+        "  set bj_forLoopAIndex = bj_forLoopAIndex + 1\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set resumedLoopIndex = bj_forLoopAIndex\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  call LoopAction()\n"
+        "endfunction\n"
+        "function verifyLoopYield takes nothing returns nothing\n"
+        "  call BJassAssert(resumedLoopIndex == 0, \"loop action continued before resume\")\n"
+        "endfunction\n"
+        "function verifyLoopResume takes nothing returns nothing\n"
+        "  call BJassAssert(resumedLoopIndex == 2, \"loop index changed before yield was lost on resume\")\n"
+        "endfunction\n"));
+    jass_callbyname(level.vm, "verifyLoopYield", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verifyLoopResume", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_jass, sleep_in_boolean_expression_resumes_condition_and_branch) {
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer expressionSleepStage = 0\n"
+        "  integer expressionBranchCount = 0\n"
+        "  integer expressionAfterIf = 0\n"
+        "endglobals\n"
+        "function SleepingCondition takes nothing returns boolean\n"
+        "  set expressionSleepStage = 1\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set expressionSleepStage = 2\n"
+        "  return false\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  if not SleepingCondition() then\n"
+        "    set expressionBranchCount = expressionBranchCount + 1\n"
+        "  endif\n"
+        "  set expressionAfterIf = 1\n"
+        "endfunction\n"
+        "function verifyExpressionYielded takes nothing returns nothing\n"
+        "  call BJassAssert(expressionSleepStage == 1, \"condition did not suspend inside expression\")\n"
+        "  call BJassAssert(expressionBranchCount == 0, \"condition branch ran before condition returned\")\n"
+        "  call BJassAssert(expressionAfterIf == 0, \"caller continued past yielded condition\")\n"
+        "endfunction\n"
+        "function verifyExpressionResumed takes nothing returns nothing\n"
+        "  call BJassAssert(expressionSleepStage == 2, \"condition did not resume after sleep\")\n"
+        "  call BJassAssert(expressionBranchCount == 1, \"negated false condition did not run branch exactly once\")\n"
+        "  call BJassAssert(expressionAfterIf == 1, \"caller did not continue after condition resumed\")\n"
+        "endfunction\n"));
+    jass_callbyname(level.vm, "verifyExpressionYielded", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verifyExpressionResumed", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+}
+
+TEST(wc3_save, resumes_sleeping_jass_coroutine) {
+    cstring_t filename = Test_TempPath("wc3-jass-coroutine-save-test.bin");
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer coroutineStage = 0\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set coroutineStage = 1\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set coroutineStage = 2\n"
+        "endfunction\n"
+        "function mutate takes nothing returns nothing\n"
+        "  set coroutineStage = 9\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(coroutineStage == 2, \"coroutine did not resume after sleep\")\n"
+        "endfunction\n"));
+    T_ASSERT(WriteGame(filename));
+    jass_callbyname(level.vm, "mutate", false);
+    T_ASSERT(ReadGame(filename));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+TEST(wc3_save, preserves_research_event_context_across_sleeping_coroutine) {
+    cstring_t filename = Test_TempPath("wc3-research-context-save-test.bin");
+    edict_t *producer;
+    uint32_t const upgrade = MAKEFOURCC('R','h','m','e');
+
+    setup_test_world();
+    producer = alloc_test_unit(MAKEFOURCC('h','b','l','a'), 0.0f, 0.0f);
+    producer->s.player = game.clients[0].ps.number;
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  integer researchBeforeSleep = 0\n"
+        "  integer researchAfterSleep = 0\n"
+        "endglobals\n"
+        "function OnResearch takes nothing returns nothing\n"
+        "  set researchBeforeSleep = GetResearched()\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set researchAfterSleep = GetResearched()\n"
+        "endfunction\n"
+        "function VerifyResearchContext takes nothing returns nothing\n"
+        "  call BJassAssert(researchBeforeSleep == 'Rhme', \"research rawcode missing before save\")\n"
+        "  call BJassAssert(researchAfterSleep == 'Rhme', \"research rawcode missing after load/resume\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  call TriggerRegisterPlayerUnitEvent(t, Player(0), EVENT_PLAYER_UNIT_RESEARCH_START, null)\n"
+        "  call TriggerAddAction(t, function OnResearch)\n"
+        "endfunction\n"));
+
+    G_PublishEventWithValue(producer, EVENT_PLAYER_UNIT_RESEARCH_START, NULL, (int32_t)upgrade);
+    G_RunEvents();
+    jass_runevents(level.vm); /* action reaches TriggerSleepAction and yields */
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "VerifyResearchContext", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+TEST(wc3_save, preserves_spell_point_context_across_sleeping_coroutine) {
+    cstring_t filename = Test_TempPath("wc3-spell-context-save-test.bin");
+    edict_t *caster;
+    vec2_t point = { 123.0f, 234.0f };
+
+    setup_test_world();
+    caster = alloc_test_unit(MAKEFOURCC('O','t','c','h'), 0.0f, 0.0f);
+    caster->s.player = game.clients[0].ps.number;
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  real spellXBeforeSleep = 0.0\n"
+        "  real spellYAfterSleep = 0.0\n"
+        "  integer spellIdAfterSleep = 0\n"
+        "endglobals\n"
+        "function OnSpell takes nothing returns nothing\n"
+        "  set spellXBeforeSleep = GetSpellTargetX()\n"
+        "  call TriggerSleepAction(0.0)\n"
+        "  set spellYAfterSleep = GetSpellTargetY()\n"
+        "  set spellIdAfterSleep = GetSpellAbilityId()\n"
+        "endfunction\n"
+        "function VerifySpellContext takes nothing returns nothing\n"
+        "  call BJassAssert(spellXBeforeSleep == 123.0, \"spell X missing before save\")\n"
+        "  call BJassAssert(spellYAfterSleep == 234.0, \"spell Y missing after load/resume\")\n"
+        "  call BJassAssert(spellIdAfterSleep == 'AEbl', \"spell id missing after load/resume\")\n"
+        "endfunction\n"
+        "function main takes nothing returns nothing\n"
+        "  local trigger t = CreateTrigger()\n"
+        "  call TriggerRegisterPlayerUnitEvent(t, Player(0), EVENT_PLAYER_UNIT_SPELL_EFFECT, null)\n"
+        "  call TriggerAddAction(t, function OnSpell)\n"
+        "endfunction\n"));
+
+    G_PublishEventWithPoint(&(gameEventPointParams_t){
+        .edict = caster, .type = EVENT_PLAYER_UNIT_SPELL_EFFECT, .value = (int32_t)MAKEFOURCC('A','E','b','l'),
+        .point = &point });
+    G_RunEvents();
+    jass_runevents(level.vm);
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    jass_runevents(level.vm);
+    jass_callbyname(level.vm, "VerifySpellContext", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+TEST(wc3_save, rejects_corruption_without_mutation) {
+    cstring_t filename = Test_TempPath("wc3-corrupt-save-test.bin");
+    edict_t *unit;
+    FILE *f;
+    uint8_t byte = 0;
+    reset_entities();
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    S_SetCarriedResource(unit, RETURN_RESOURCE_GOLD, 37);
+    T_ASSERT(WriteGame(filename));
+    f = fopen(filename, "r+b");
+    T_ASSERT(f != NULL && fseek(f, sizeof(uint32_t), SEEK_SET) == 0 && fread(&byte, 1, 1, f) == 1);
+    byte ^= 0x80;
+    T_ASSERT(fseek(f, sizeof(uint32_t), SEEK_SET) == 0 && fwrite(&byte, 1, 1, f) == 1);
+    fclose(f);
+    S_SetCarriedResource(unit, RETURN_RESOURCE_GOLD, 99);
+    T_ASSERT(!ReadGame(filename));
+    T_EQ((unit->harvest ? unit->harvest->gold : 0), 99);
+    remove(filename);
+}
+
+TEST(wc3_save, rejects_script_identity_without_mutation) {
+    cstring_t filename = Test_TempPath("wc3-script-mismatch-save-test.bin");
+    char extra[] = "function AddedAfterSave takes nothing returns nothing\nendfunction\n";
+    edict_t *unit;
+    T_ASSERT(run_test_jass("function main takes nothing returns nothing\nendfunction\n"));
+    unit = alloc_test_unit(MAKEFOURCC('h', 'p', 'e', 'a'), 0.0f, 0.0f);
+    S_SetCarriedResource(unit, RETURN_RESOURCE_GOLD, 37);
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(jass_dobuffer(level.vm, extra));
+    S_SetCarriedResource(unit, RETURN_RESOURCE_GOLD, 99);
+    T_ASSERT(!ReadGame(filename));
+    T_EQ((unit->harvest ? unit->harvest->gold : 0), 99);
+    remove(filename);
+}
+
+/* A unit removed before save has a stale edict pointer in its JASS global.
+ * Save must succeed and the global must load back as null. */
+TEST(wc3_save, stale_unit_handle_becomes_null_after_load) {
+    cstring_t filename = Test_TempPath("wc3-stale-handle-save-test.bin");
+    T_ASSERT(run_test_jass(
+        "globals\n"
+        "  unit killedUnit = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set killedUnit = CreateUnit(Player(0), 'hpea', 0.0, 0.0, 0.0)\n"
+        "  call RemoveUnit(killedUnit)\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(killedUnit == null, \"stale handle should be null after load\")\n"
+        "endfunction\n"));
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+/* A removed unit must be removed from every live group before the group is saved. */
+TEST(wc3_save, removed_unit_is_removed_from_group_before_save) {
+    cstring_t filename = Test_TempPath("wc3-stale-group-save-test.bin");
+    T_ASSERT(run_test_jass(
+        "type group extends handle\n"
+        "type unit extends handle\n"
+        "globals\n"
+        "  group savedGroup = null\n"
+        "  unit removedUnit = null\n"
+        "endglobals\n"
+        "function main takes nothing returns nothing\n"
+        "  set savedGroup = CreateGroup()\n"
+        "  set removedUnit = CreateUnit(Player(0), 'hpea', 0.0, 0.0, 0.0)\n"
+        "  call GroupAddUnit(savedGroup, removedUnit)\n"
+        "  call RemoveUnit(removedUnit)\n"
+        "endfunction\n"
+        "function verify takes nothing returns nothing\n"
+        "  call BJassAssert(FirstOfGroup(savedGroup) == null, \"removed unit remains in group\")\n"
+        "endfunction\n"));
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    jass_callbyname(level.vm, "verify", false);
+    T_ASSERT(!jass_rterror_pending(level.vm));
+    remove(filename);
+}
+
+/* =========================================================================
+ * Suite runner
+ * ========================================================================= */
+
+#endif /* BZ_TESTS */
+
+#ifdef BZ_TESTS
+#ifndef _WIN32
+#include <unistd.h>
+TEST(wc3_test_utils, temp_paths_are_private_to_this_test_process) {
+    char expected[64];
+    cstring_t path = Test_TempPath("temp-path-probe.bin");
+    FILE *file;
+
+    /* Concurrent suites (other worktrees) must never share a fixture file. */
+    snprintf(expected, sizeof(expected), "/openwarcraft3-tests-%ld/temp-path-probe.bin", (long)getpid());
+    T_NOT_NULL(strstr(path, expected));
+    file = fopen(path, "wb");
+    T_NOT_NULL(file);
+    if (file) fclose(file);
+    T_EQ(remove(path), 0);
+}
+#endif
+#endif

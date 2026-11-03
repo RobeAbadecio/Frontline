@@ -1,0 +1,7 @@
+[Default]
+Background=Default.blp
+ConsoleTexture06=Custom06.blp
+[Human]
+Background=Human.blp
+[Orc]
+Background=Orc.blp

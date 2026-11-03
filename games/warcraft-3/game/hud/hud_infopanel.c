@@ -1,0 +1,1668 @@
+/*
+ * hud_infopanel.c — Info panel, multiselect, and per-frame update stubs.
+ *
+ * Builds the single-unit info panel (name, level, damage, armor, hero
+ * attributes, XP bar, HP/mana), the multi-select grid, and the
+ * build-queue overlay.  Also contains the stubbed entry points that
+ * console_ui.c now handles client-side.
+ */
+
+#include "hud_local.h"
+#include "hud_utils.h"
+#include "../skills/s_skills.h"
+
+#define INVENTORY_CHARGE_FONT_SIZE 10
+/* Warsmash anchors its 0.180 x 0.120 simple info panel at the bottom-centre
+ * of the 0.800 x 0.600 UI. Cargo icons are TOPLEFT-relative to that panel at
+ * y = -0.75 * frontQueueIconWidth. Convert that bottom-origin geometry to
+ * OpenRealm's top-left proxy-frame coordinates instead of positioning the
+ * slots in world-screen space above the status panel. */
+static int timed_status_debug_level(void) {
+    cstring_t value;
+
+    value = gi.CvarString("wc3_timed_status_debug", "0");
+    return value ? atoi(value) : 0;
+}
+
+static void timed_status_debug_dump(edict_t *ent, gameClient_t *viewer, cstring_t stage) {
+    int const debug = timed_status_debug_level();
+    uint32_t const now = G_Time();
+    char unit_code[5] = { 0 };
+
+    if (debug < 1 || !ent) return;
+    memcpy(unit_code, &ent->class_id, 4);
+    fprintf(stderr,
+            "WC3_TIMED_STATUS server stage=%s unit=%u type=%s owner=%u viewer=%d now=%u\n",
+            stage ? stage : "?", (unsigned)ent->s.number, unit_code,
+            (unsigned)ent->s.player, viewer ? (int)viewer->ps.number : -1,
+            (unsigned)now);
+    FOR_LOOP(i, ent->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t const *status = ent->unit_state->statuses + i;
+        char code[5] = { 0 };
+        int32_t remaining;
+
+        if (!status->level) continue;
+        memcpy(code, &status->code, 4);
+        remaining = status->timestamp > now ? (int32_t)(status->timestamp - now) : 0;
+        fprintf(stderr,
+                "WC3_TIMED_STATUS server status slot=%u code=%s level=%u timestamp=%u duration_ms=%u remaining_ms=%ld eligible=%u fraction=%.4f\n",
+                (unsigned)i, code, (unsigned)status->level,
+                (unsigned)status->timestamp, (unsigned)status->duration_ms,
+                (long)remaining, (unsigned)unit_statusshowstimedbar(status->code),
+                unit_statusremainingfraction(status));
+    }
+}
+
+static bool InfoPanelStringsResolved(void) {
+    static cstring_t const required[] = {
+        "COLON_DAMAGE",
+        "COLON_ARMOR",
+        "COLON_FOOD",
+        "COLON_FOOD_PROVIDED",
+        "COLON_GOLD",
+        "COLON_STRENGTH",
+        "COLON_AGILITY",
+        "COLON_INTELLECT",
+        "COLON_STATUS",
+    };
+
+    FOR_LOOP(i, sizeof(required) / sizeof(required[0])) {
+        cstring_t const value = UI_GetString(required[i]);
+        if (!value || !strcmp(value, required[i])) return false;
+    }
+    return true;
+}
+
+static void InitStatusWrapper(frameDef_t *frame, float x, float y, float width, float height) {
+    UI_InitFrame(frame, FT_SIMPLEFRAME);
+    UI_SetSize(frame, width, height);
+    UI_SetPoint(frame, FRAMEPOINT_TOPLEFT, hud.simple.SimpleInfoPanelUnitDetail,
+                FRAMEPOINT_TOPLEFT, x, y);
+}
+
+void UI_LoadHudInfoPanel(void) {
+    bool global_strings_loaded;
+    bool infopanel_strings_loaded;
+
+    if (hud.bottom.Type) return;
+
+    /* FrameDef.toc registers both localized StringLists before any info-panel
+     * frame definitions. Classic data splits the labels across them (for
+     * example COLON_ARMOR is in GlobalStrings while COLON_DAMAGE and the Hero
+     * attributes are in InfoPanelStrings), so load both before parsing frames
+     * or unresolved IDs become baked into the cached templates. */
+    global_strings_loaded = UI_EnsureFDF("UI\\FrameDef\\GlobalStrings.fdf");
+    infopanel_strings_loaded = UI_EnsureFDF("UI\\FrameDef\\InfoPanelStrings.fdf");
+    if (!global_strings_loaded) {
+        fprintf(stderr, "UI_LoadHudInfoPanel: missing UI\\FrameDef\\GlobalStrings.fdf; cannot resolve info-panel string IDs\n");
+    }
+    if (!infopanel_strings_loaded && !InfoPanelStringsResolved()) {
+        fprintf(stderr, "UI_LoadHudInfoPanel: missing UI\\FrameDef\\InfoPanelStrings.fdf and required info-panel strings are unresolved\n");
+    }
+
+    InfoPanelUnitDetail_Load(&hud.unit);
+    InfoPanelBuildingDetail_Load(&hud.building);
+    if (!global_strings_loaded || !InfoPanelStringsResolved() || !SimpleInfoPanel_Load(&hud.simple)) {
+        fprintf(stderr, "UI_LoadHudInfoPanel: missing UI\\FrameDef\\UI\\SimpleInfoPanel.fdf status templates\n");
+    } else {
+        /* The retail SimpleInfoPanel FDF owns every icon/label/value offset.
+         * The game only supplies the dynamic wrappers that WC3 repositions
+         * according to attack count and Hero state. */
+        hud.attack2_icon = UI_CloneFrameTree(hud.simple.SimpleInfoPanelIconDamage, NULL);
+        if (hud.attack2_icon) {
+            hud.attack2_icon_backdrop = UI_FindChildFrame(hud.attack2_icon, "InfoPanelIconBackdrop");
+            hud.attack2_icon_level = UI_FindChildFrame(hud.attack2_icon, "InfoPanelIconLevel");
+            hud.attack2_icon_label = UI_FindChildFrame(hud.attack2_icon, "InfoPanelIconLabel");
+            hud.attack2_icon_value = UI_FindChildFrame(hud.attack2_icon, "InfoPanelIconValue");
+        }
+        if (!hud.attack2_icon || !hud.attack2_icon_backdrop || !hud.attack2_icon_level ||
+            !hud.attack2_icon_label || !hud.attack2_icon_value) {
+            fprintf(stderr, "UI_LoadHudInfoPanel: failed to clone SimpleInfoPanelIconDamage context 1\n");
+            hud.simple.SimpleInfoPanelUnitDetail = NULL;
+        }
+    }
+
+    UI_InitFrame(&hud.bottom, FT_SIMPLEFRAME);
+    UI_SetSize(&hud.bottom, 0.180f, 0.120f);
+    /* UI_SetPoint Y uses WC3 FDF convention: negative = downward from TOPLEFT.
+     * UI_CopyFrameBase encodes the raw float; the client negates it on decode.
+     * So to place the panel at top-origin y=0.480, pass -(0.480). */
+    UI_SetPoint(&hud.bottom, FRAMEPOINT_TOPLEFT, NULL, FRAMEPOINT_TOPLEFT, 0.310f, -(UI_BASE_HEIGHT - 0.120f));
+
+    if (hud.simple.SimpleInfoPanelUnitDetail) {
+        InitStatusWrapper(&hud.attack1, 0.000f, -0.04000f, 0.100f, 0.030125f);
+        InitStatusWrapper(&hud.attack2, 0.100f, -0.03925f, 0.100f, 0.030125f);
+        InitStatusWrapper(&hud.armor,   0.000f, -0.07050f, 0.100f, 0.030125f);
+        InitStatusWrapper(&hud.hero,    0.100f, -0.03700f, 0.100f, 0.062500f);
+        InitStatusWrapper(&hud.food,    0.100f, -0.03925f, 0.100f, 0.030125f);
+        InitStatusWrapper(&hud.gold,    0.100f, -0.03925f, 0.100f, 0.030125f);
+
+        /* Bind the runtime-controlled status bars to the retail FDF geometry.
+         * The FDF owns their anchors; Warsmash supplies only width, textures,
+         * colour and the live progress value. */
+        UI_SetSize(hud.simple.SimpleHeroLevelBar, 0.180f, hud.simple.SimpleHeroLevelBar->Height);
+        UI_SetTexture(hud.simple.SimpleHeroLevelBar, "SimpleXpBarConsole", false);
+        UI_SetTexture2(hud.simple.SimpleHeroLevelBar, "SimpleXpBarBorder", false);
+        hud.simple.SimpleHeroLevelBar->Color = MAKE(color32_t, 138, 0, 131, 255);
+        UI_SetSize(hud.simple.SimpleProgressIndicator, 0.180f, hud.simple.SimpleProgressIndicator->Height);
+        UI_SetTexture(hud.simple.SimpleProgressIndicator, "SimpleProgressBarConsole", false);
+        UI_SetTexture2(hud.simple.SimpleProgressIndicator, "SimpleProgressBarBorder", false);
+        hud.simple.SimpleProgressIndicator->Color = MAKE(color32_t, 65, 130, 210, 255);
+        UI_SetHidden(hud.simple.SimpleProgressIndicator, true);
+        UI_SetSize(hud.simple.SimpleBuildTimeIndicator, 0.10538f, 0.0103f);
+        UI_SetTexture(hud.simple.SimpleBuildTimeIndicator,
+                      "SimpleBuildTimeIndicator", false);
+        UI_SetTexture2(hud.simple.SimpleBuildTimeIndicator,
+                       "SimpleBuildTimeIndicatorBorder", false);
+        UI_SetSize(hud.simple.SimpleBuildQueueBackdrop, 0.180f, 0.090f);
+
+        /* Warsmash's status strip is runtime-owned rather than defined by the
+         * retail SimpleInfoPanel FDF.  Keep its geometry relative to the retail
+         * unit-detail frame: label at BOTTOMLEFT + (0.03, 0.003), then 0.015
+         * icons chained left-to-right with a 0.001 gap. */
+        UI_InitFrame(&hud.buff_label, FT_STRING);
+        snprintf(hud.buff_label.Name, sizeof(hud.buff_label.Name), "SmashBuffStatusBar");
+        UI_SetSize(&hud.buff_label, 0.035f, 0.010f);
+        UI_SetPoint(&hud.buff_label, FRAMEPOINT_BOTTOMLEFT, hud.simple.SimpleInfoPanelUnitDetail,
+                    FRAMEPOINT_BOTTOMLEFT, 0.030f, 0.003f);
+        hud.buff_label.Font.Size = 0.010f;
+        hud.buff_label.Font.Index = gi.FontIndex(Theme_String("MasterFont", "Fonts\\FRIZQT__.TTF"), HUD_FONT_SIZE);
+        hud.buff_label.Font.Justification.Horizontal = FONT_JUSTIFYLEFT;
+        hud.buff_label.Font.Justification.Vertical = FONT_JUSTIFYMIDDLE;
+        UI_SetText(&hud.buff_label, "%s", UI_GetString("COLON_STATUS"));
+
+        FOR_LOOP(i, MAX_UNIT_STATUSES) {
+            UI_InitFrame(&hud.buff_icon[i], FT_SIMPLEFRAME);
+            snprintf(hud.buff_icon[i].Name, sizeof(hud.buff_icon[i].Name),
+                     "SmashBuffStatusBarIcon%u", i);
+            UI_SetSize(&hud.buff_icon[i], 0.015f, 0.015f);
+            UI_SetPoint(&hud.buff_icon[i], FRAMEPOINT_LEFT,
+                        i ? &hud.buff_icon[i - 1] : &hud.buff_label,
+                        FRAMEPOINT_RIGHT, 0.001f, 0.0f);
+
+            UI_InitFrame(&hud.buff_tex[i], FT_TEXTURE);
+            snprintf(hud.buff_tex[i].Name, sizeof(hud.buff_tex[i].Name),
+                     "SmashBuffStatusBarIcon%uTexture", i);
+            UI_SetParent(&hud.buff_tex[i], &hud.buff_icon[i]);
+            UI_SetAllPoints(&hud.buff_tex[i]);
+        }
+    }
+}
+
+static void HideLegacyUnitStats(void) {
+    frameDef_t *const frames_to_hide[] = {
+        hud.unit.DefenseLabel, hud.unit.DefenseValue,
+        hud.unit.AttackLabel1, hud.unit.AttackValue1,
+        hud.unit.AttackLabel2, hud.unit.AttackValue2,
+        hud.unit.SpeedTitle, hud.unit.SpeedValue,
+        hud.unit.RangeTitle1, hud.unit.RangeValue1,
+        hud.unit.RangeTitle2, hud.unit.RangeValue2,
+        hud.unit.IconBackdrop1, hud.unit.IconValue1,
+        hud.unit.IconBackdrop2, hud.unit.IconValue2,
+        hud.unit.IconBackdrop3, hud.unit.IconValue3,
+        hud.unit.IconBackdrop4, hud.unit.IconValue4,
+    };
+    FOR_LOOP(i, sizeof(frames_to_hide) / sizeof(frames_to_hide[0]))
+        UI_SetHidden(frames_to_hide[i], true);
+}
+
+static void FormatAttackDamageValue(char *buffer, size_t buffer_size,
+                                    int32_t min_damage, int32_t max_damage, float temporary_bonus) {
+    int32_t const bonus = (int32_t)temporary_bonus;
+    if (bonus > 0) {
+        snprintf(buffer, buffer_size, "%ld - %ld |cff00ff00+%ld|r",
+                 (long)min_damage, (long)max_damage, (long)bonus);
+    } else if (bonus < 0) {
+        snprintf(buffer, buffer_size, "%ld - %ld |cffff0000%ld|r",
+                 (long)min_damage, (long)max_damage, (long)bonus);
+    } else {
+        snprintf(buffer, buffer_size, "%ld - %ld", (long)min_damage, (long)max_damage);
+    }
+}
+
+static void WriteLegacyUnitStats(edict_t *ent, UnitWeapons_t const *weapons,
+                                 bool has_attack2, int32_t min_damage, int32_t max_damage,
+                                 int32_t min_damage2, int32_t max_damage2, bool is_hero,
+                                 uint32_t level) {
+    char buffer[128];
+
+    UI_SetText(hud.unit.AttackLabel1, "Damage:");
+    FormatAttackDamageValue(buffer, sizeof(buffer), min_damage, max_damage,
+                            ent->unit_state->attack1.temporaryDamageBonus);
+    UI_SetText(hud.unit.AttackValue1, "%s", buffer);
+    UI_SetText(hud.unit.AttackLabel2, "Damage:");
+    FormatAttackDamageValue(buffer, sizeof(buffer), min_damage2, max_damage2,
+                            ent->unit_state->attack2.temporaryDamageBonus);
+    UI_SetText(hud.unit.AttackValue2, "%s", buffer);
+    UI_SetHidden(hud.unit.AttackLabel2, !has_attack2);
+    UI_SetHidden(hud.unit.AttackValue2, !has_attack2);
+    UI_SetText(hud.unit.DefenseLabel, "Armor:");
+    if (G_UnitHasFlag(ent, UNIT_FLAG_INVULNERABLE)) UI_SetText(hud.unit.DefenseValue, "%s", "|cffff0000Invulnerable|r");
+    else {
+        snprintf(buffer, sizeof(buffer), "%d", (int)(G_UnitArmorValue(ent) + 0.5f));
+        UI_SetText(hud.unit.DefenseValue, "%s", buffer);
+    }
+    UI_SetText(hud.unit.SpeedTitle, "Speed:");
+    UI_SetText(hud.unit.SpeedValue, "%d", (int)(ent->unitinfo.MoveSpeed + 0.5f));
+    UI_SetText(hud.unit.RangeTitle1, "Range:");
+    UI_SetText(hud.unit.RangeValue1, "%d", (int)(ent->unit_state->attack1.range + 0.5f));
+    UI_SetText(hud.unit.RangeTitle2, "Range:");
+    UI_SetText(hud.unit.RangeValue2, "%d", (int)(ent->unit_state->attack2.range + 0.5f));
+    UI_SetHidden(hud.unit.RangeTitle2, !has_attack2);
+    UI_SetHidden(hud.unit.RangeValue2, !has_attack2);
+
+    if (is_hero) {
+        cstring_t const prim = ent->data.UnitBalance->primaryAttribute;
+        struct { cstring_t code; uint32_t val; } attrs[3] = {
+            { "STR", ent->unit_state->hero.str }, { "AGI", ent->unit_state->hero.agi }, { "INT", ent->unit_state->hero.intel },
+        };
+        frameDef_t *icon_values[3] = {
+            hud.unit.IconValue1, hud.unit.IconValue2, hud.unit.IconValue3,
+        };
+
+        FOR_LOOP(a, 3) {
+            bool const isprim = prim && !strcmp(prim, attrs[a].code);
+            UI_SetText(icon_values[a], "%lu", (unsigned long)attrs[a].val);
+            icon_values[a]->Font.Color = isprim ? MAKE(color32_t, 120, 230, 120, 255) : COLOR32_WHITE;
+        }
+
+        uint32_t const need = G_HeroXPForLevel(level + 1);
+        uint32_t const have = G_HeroXPForLevel(level);
+        if (need > have) {
+            snprintf(buffer, sizeof(buffer), "XP: %lu / %lu",
+                     (unsigned long)(ent->unit_state->hero.xp - (ent->unit_state->hero.xp < have ? ent->unit_state->hero.xp : have)),
+                     (unsigned long)(need - have));
+            UI_SetText(hud.unit.IconValue4, "%s", buffer);
+            hud.unit.IconValue4->Font.Color = MAKE(color32_t, 200, 200, 200, 255);
+        }
+    }
+}
+
+static bool InfoPanelTextureExists(cstring_t path) {
+    uint32_t size = 0;
+    handle_t data;
+
+    if (!path || !*path) return false;
+    path = UI_ResolveTextureAlias(path);
+    data = gi.ReadFile(path, &size);
+    if (!data) return false;
+    gi.MemFree(data);
+    return true;
+}
+
+static int InfoPanelIconTypeIndex(cstring_t prefix, cstring_t type, cstring_t *normalized) {
+    static cstring_t const damage_types[] = {
+        "Unknown", "Normal", "Pierce", "Siege", "Spells", "Chaos", "Magic", "Hero",
+    };
+    static cstring_t const armor_types[] = {
+        "Small", "Medium", "Large", "Fort", "Normal", "Hero", "Divine", "None",
+    };
+    cstring_t const *types;
+    cstring_t fallback;
+
+    if (!strcasecmp(prefix, "Armor")) {
+        types = armor_types;
+        fallback = armor_types[0];
+        if (type && !strcasecmp(type, "heavy")) type = "Large";
+    } else {
+        types = damage_types;
+        fallback = damage_types[0];
+        if (type && !strcasecmp(type, "seige")) type = "Siege";
+    }
+    if (type && *type) {
+        FOR_LOOP(i, 8) {
+            if (!strcasecmp(type, types[i])) {
+                if (normalized) *normalized = types[i];
+                return (int)i;
+            }
+        }
+    }
+    if (normalized) *normalized = fallback;
+    return 0;
+}
+
+static cstring_t InfoPanelThemeIcon(cstring_t prefix, cstring_t type, bool has_upgrade) {
+    char key[96];
+    cstring_t texture;
+
+    UI_InfoPanelIconSkinKey(prefix, type, has_upgrade, key, sizeof(key));
+    texture = Theme_String(key, NULL);
+    if ((!texture || !*texture) && !strcasecmp(prefix, "Damage") &&
+        !strcasecmp(type, "Spells")) {
+        /* Warsmash only aliases Spells to Magic when the authored Spells skin
+         * field is absent; a custom skin is allowed to provide Spells art. */
+        UI_InfoPanelIconSkinKey(prefix, "Magic", has_upgrade, key, sizeof(key));
+        texture = Theme_String(key, NULL);
+    }
+    return texture;
+}
+
+static cstring_t ResolveTypedInfoPanelIcon(cstring_t prefix, cstring_t type, bool has_upgrade) {
+    cstring_t normalized;
+    cstring_t texture, fallback;
+    int const family = !strcasecmp(prefix, "Armor") ? 1 : 0;
+    int const type_index = InfoPanelIconTypeIndex(prefix, type, &normalized);
+    int const upgrade_index = has_upgrade ? 1 : 0;
+    infoPanelIconCache_t *cache = &hud.icon_cache[family][type_index][upgrade_index];
+
+    if (cache->resolved) return cache->texture[0] ? cache->texture : NULL;
+    cache->resolved = true;
+
+    texture = InfoPanelThemeIcon(prefix, normalized, has_upgrade);
+    if (texture && *texture && InfoPanelTextureExists(texture)) {
+        UI_CopyString(cache->texture, sizeof(cache->texture), texture);
+        return cache->texture;
+    }
+
+    if (!has_upgrade) {
+        /* InfoPanelIconBackdrops in Warsmash tries the Neutral texture first,
+         * then retries the same attack/defense type from the normal family if
+         * the Neutral asset fails to load (not merely when its skin key is
+         * absent). This is especially important for stock HeroNeutral entries
+         * whose path may be unavailable in a particular archive set. */
+        fallback = InfoPanelThemeIcon(prefix, normalized, true);
+        if (fallback && *fallback && InfoPanelTextureExists(fallback)) {
+            fprintf(stderr, "WC3 info panel: %s %s Neutral icon '%s' unavailable; using '%s'\n",
+                    prefix, normalized, texture && *texture ? texture : "<missing skin field>", fallback);
+            UI_CopyString(cache->texture, sizeof(cache->texture), fallback);
+            return cache->texture;
+        }
+    }
+
+    fprintf(stderr, "WC3 info panel: missing %s %s%s icon '%s'\n", prefix, normalized,
+            has_upgrade ? "" : " Neutral", texture && *texture ? texture : "<missing skin field>");
+    cache->texture[0] = '\0';
+    return NULL;
+}
+
+#ifdef BZ_TESTS
+void UI_TestResetInfoPanelIconCache(void) { memset(hud.icon_cache, 0, sizeof(hud.icon_cache)); }
+cstring_t UI_TestResolveTypedInfoPanelIcon(cstring_t prefix, cstring_t type, bool has_upgrade) {
+    return ResolveTypedInfoPanelIcon(prefix, type, has_upgrade);
+}
+#endif
+
+static void SetTypedInfoPanelIcon(frameDef_t *frame, cstring_t prefix, cstring_t type, bool has_upgrade) {
+    cstring_t texture;
+
+    if (!frame || !prefix) return;
+    texture = ResolveTypedInfoPanelIcon(prefix, type, has_upgrade);
+    if (!texture) {
+        /* Warsmash's backdrop table stores NULL when neither candidate loads.
+         * Clear the frame instead of retaining artwork from the last unit. */
+        frame->Texture.Image = 0;
+        return;
+    }
+    UI_SetTexture(frame, texture, false);
+}
+
+static void SetHeroPrimaryAttributeIcon(cstring_t primary) {
+    cstring_t key = "InfoPanelIconHeroIconSTR";
+    cstring_t texture;
+
+    if (!hud.simple.InfoPanelIconHeroIcon) return;
+    if (primary && !strcmp(primary, "AGI")) key = "InfoPanelIconHeroIconAGI";
+    else if (primary && !strcmp(primary, "INT")) key = "InfoPanelIconHeroIconINT";
+    texture = Theme_String(key, NULL);
+    if (!texture || !*texture) {
+        fprintf(stderr, "SetHeroPrimaryAttributeIcon: missing war3skins key %s\n", key);
+        return;
+    }
+    UI_SetTexture(hud.simple.InfoPanelIconHeroIcon, texture, false);
+}
+
+static void RefreshSimpleInfoPanelStrings(void) {
+    if (!hud.simple.SimpleInfoPanelUnitDetail) return;
+    UI_SetText(hud.simple.InfoPanelIconLabel, "%s", UI_GetString("COLON_DAMAGE"));
+    if (hud.attack2_icon_label) UI_SetText(hud.attack2_icon_label, "%s", UI_GetString("COLON_DAMAGE"));
+    UI_SetText(hud.simple.InfoPanelIconLabel_2, "%s", UI_GetString("COLON_ARMOR"));
+    UI_SetText(hud.simple.InfoPanelIconLabel_4, "%s", UI_GetString("COLON_FOOD_PROVIDED"));
+    UI_SetText(hud.simple.InfoPanelIconLabel_5, "%s", UI_GetString("COLON_GOLD"));
+    UI_SetText(hud.simple.InfoPanelIconHeroStrengthLabel, "%s", UI_GetString("COLON_STRENGTH"));
+    UI_SetText(hud.simple.InfoPanelIconHeroAgilityLabel, "%s", UI_GetString("COLON_AGILITY"));
+    UI_SetText(hud.simple.InfoPanelIconHeroIntellectLabel, "%s", UI_GetString("COLON_INTELLECT"));
+    UI_SetText(&hud.buff_label, "%s", UI_GetString("COLON_STATUS"));
+}
+
+static uint32_t UnitWeaponUpgrade(edict_t *ent) {
+    static cstring_t const classes[] = { "melee", "ranged", "artillery" };
+
+    if (!ent || !ent->data.UnitBalance) return 0;
+    FOR_LOOP(i, sizeof(classes) / sizeof(classes[0])) {
+        uint32_t const upgrade = G_GetUnitUpgradeForClass(ent, classes[i]);
+        if (upgrade) return upgrade;
+    }
+    return 0;
+}
+
+static uint32_t UnitArmorUpgrade(edict_t *ent) {
+    if (!ent || !ent->data.UnitBalance) return 0;
+    return G_GetUnitUpgradeForClass(ent, "armor");
+}
+
+static void SetUpgradeLevel(frameDef_t *frame, uint32_t upgrade, edict_t *ent) {
+    gameClient_t *owner;
+
+    if (!frame) return;
+    if (!upgrade || !ent || !(owner = G_GetPlayerClientByNumber(ent->s.player))) {
+        UI_SetText(frame, "%s", "");
+        UI_SetHidden(frame, true);
+        return;
+    }
+    UI_SetHidden(frame, false);
+    UI_SetText(frame, "%ld", (long)G_GetPlayerTechResearchedLevel(owner, upgrade));
+}
+
+static cstring_t StatusBuffField(uint32_t code, cstring_t field) {
+    char name[5] = { 0 };
+    AbilityBuffData_t const *buff;
+    cstring_t value;
+
+    memcpy(name, &code, 4);
+    value = FindConfigValue(name, field);
+    if (value && *value) return value;
+
+    buff = G_AbilityBuffData(code);
+    if (!buff || !buff->id) return NULL;
+    if (!strcmp(field, "Buffart")) return buff->buffArt;
+    if (!strcmp(field, "Bufftip")) return buff->buffTip;
+    if (!strcmp(field, "Buffubertip")) return buff->buffUberTip;
+    return NULL;
+}
+
+static cstring_t TimedStatusLabel(heroabilitystatus_t const *status) {
+    uint32_t buff_code;
+    cstring_t tip;
+
+    if (!status || !unit_statusshowstimedbar(status->code)) return NULL;
+    buff_code = G_UnitStatusBuffCode(status);
+    if (!buff_code) return NULL;
+    tip = StatusBuffField(buff_code, "Bufftip");
+    if (!tip || !*tip) return "";
+    return UI_GetString(tip);
+}
+
+static cstring_t StatusBuffArt(uint32_t code) {
+    cstring_t art;
+
+    /* Warsmash routes timed-life-bar buffs through SimpleProgressIndicator
+     * instead of the ordinary status icon strip. Cooldowns are stored
+     * separately and never enter this status presentation path. */
+    if (unit_statusshowstimedbar(code)) return NULL;
+    art = StatusBuffField(code, "Buffart");
+    if (!art || !*art) return NULL;
+    return art;
+}
+
+static void WriteVirtualBuffStatusFrame(uint32_t buff_code, uint32_t shown[MAX_UNIT_STATUSES], uint32_t *slot) {
+    bool duplicate = false;
+    cstring_t art;
+    cstring_t tip;
+    cstring_t ubertip;
+    frameDef_t *icon;
+
+    if (!buff_code || !slot || *slot >= MAX_UNIT_STATUSES) return;
+    FOR_LOOP(i, *slot) if (shown[i] == buff_code) { duplicate = true; break; }
+    if (duplicate || !(art = StatusBuffArt(buff_code))) return;
+
+    icon = &hud.buff_icon[*slot];
+    UI_SetTexture(&hud.buff_tex[*slot], art, false);
+    tip = StatusBuffField(buff_code, "Bufftip");
+    ubertip = StatusBuffField(buff_code, "Buffubertip");
+    icon->Tip = tip && *tip ? UI_GetString(tip) : NULL;
+    icon->Ubertip = ubertip && *ubertip ? UI_GetString(ubertip) : NULL;
+    UI_WriteFrame(icon);
+    UI_WriteFrame(&hud.buff_tex[*slot]);
+    shown[*slot] = buff_code;
+    (*slot)++;
+}
+
+/* Ship status icons (burning, flooding, a knocked-out turret, listing, critical, docked) share
+ * the status strip; art from tools/frontline/status_icons.py, text from S_ShipStatusTooltip. */
+static struct { uint32_t flag; cstring_t art; } const ship_status_icons[] = {
+    { SHIP_STATUS_BURNING, "Emberfield\\Icons\\status_burning.blp" },
+    { SHIP_STATUS_FLOODING, "Emberfield\\Icons\\status_flooding.blp" },
+    { SHIP_STATUS_TURRET_OUT, "Emberfield\\Icons\\status_turret.blp" },
+    { SHIP_STATUS_LISTING, "Emberfield\\Icons\\status_listing.blp" },
+    { SHIP_STATUS_DEAD_IN_WATER, "Emberfield\\Icons\\status_dead.blp" },
+    { SHIP_STATUS_CRITICAL, "Emberfield\\Icons\\status_critical.blp" },
+    { SHIP_STATUS_DOCKED, "Emberfield\\Icons\\status_docked.blp" },
+};
+
+static void WriteShipStatusFrames(edict_t *ent, uint32_t *slot) {
+    uint32_t const flags = S_ShipStatusFlags(ent);
+    FOR_LOOP(i, sizeof(ship_status_icons) / sizeof(ship_status_icons[0])) {
+        if (!(flags & ship_status_icons[i].flag) || *slot >= MAX_UNIT_STATUSES) continue;
+        frameDef_t *icon = &hud.buff_icon[*slot];
+        UI_SetTexture(&hud.buff_tex[*slot], ship_status_icons[i].art, false);
+        icon->Tip = S_ShipStatusTooltip(ship_status_icons[i].flag);
+        icon->Ubertip = NULL;
+        UI_WriteFrame(icon);
+        UI_WriteFrame(&hud.buff_tex[*slot]);
+        (*slot)++;
+    }
+}
+
+static void WriteBuffStatusFrames(edict_t *ent) {
+    uint32_t slot = 0;
+    uint32_t shown[MAX_UNIT_STATUSES] = { 0 };
+
+    if (!ent || !hud.simple.SimpleInfoPanelUnitDetail) return;
+    UI_SetText(&hud.buff_label, "%s", UI_GetString("COLON_STATUS"));
+    UI_WriteFrame(&hud.buff_label);
+
+    FOR_LOOP(i, ent->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t const *status = ent->unit_state->statuses + i;
+        cstring_t art;
+        cstring_t tip;
+        cstring_t ubertip;
+        frameDef_t *icon;
+        uint32_t const buff_code = G_UnitStatusBuffCode(status);
+
+        if (!status->level || slot >= MAX_UNIT_STATUSES || !buff_code) continue;
+        /* Auras may be represented by both their ability rawcode (AHad) and
+         * their buff rawcode (BHad) in abilstatus[].  Resolve first, then emit
+         * each visible buff once. */
+        {
+            bool duplicate = false;
+            FOR_LOOP(j, slot) {
+                if (shown[j] == buff_code) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+        }
+        art = StatusBuffArt(buff_code);
+        if (!art) {
+            if (!unit_statusshowstimedbar(buff_code)) {
+                char rawcode[5] = { 0 };
+                memcpy(rawcode, &buff_code, 4);
+                fprintf(stderr, "WriteBuffStatusFrames: missing Buffart for status %s\n", rawcode);
+            }
+            continue;
+        }
+
+        icon = &hud.buff_icon[slot];
+        UI_SetTexture(&hud.buff_tex[slot], art, false);
+        tip = StatusBuffField(buff_code, "Bufftip");
+        ubertip = StatusBuffField(buff_code, "Buffubertip");
+        icon->Tip = tip && *tip ? UI_GetString(tip) : NULL;
+        icon->Ubertip = ubertip && *ubertip ? UI_GetString(ubertip) : NULL;
+        UI_WriteFrame(icon);
+        UI_WriteFrame(&hud.buff_tex[slot]);
+        shown[slot] = buff_code;
+        slot++;
+    }
+
+    /* Passive auras do not own gameplay status slots. Devotion and Unholy
+     * Aura recipient presentation is reconciled by the shared aura cadence;
+     * render the authored BuffID virtually without fabricating abilstatus[]. */
+    WriteVirtualBuffStatusFrame(S_DevotionAuraBuff(ent), shown, &slot);
+    WriteVirtualBuffStatusFrame(S_UnholyAuraBuff(ent), shown, &slot);
+    WriteShipStatusFrames(ent, &slot);
+}
+
+static void WriteSelectedUnitStatusFrames(edict_t *ent, UnitWeapons_t const *weapons,
+                                          bool has_attack1, bool has_attack2,
+                                          int32_t min_damage, int32_t max_damage,
+                                          int32_t min_damage2, int32_t max_damage2,
+                                          bool is_hero) {
+    char value[64];
+    uint32_t const weapon_upgrade = UnitWeaponUpgrade(ent);
+    uint32_t const armor_upgrade = UnitArmorUpgrade(ent);
+
+    if (!hud.simple.SimpleInfoPanelUnitDetail) return;
+    RefreshSimpleInfoPanelStrings();
+
+    UI_SetPoint(&hud.armor, FRAMEPOINT_TOPLEFT, hud.simple.SimpleInfoPanelUnitDetail,
+                FRAMEPOINT_TOPLEFT, 0.0f, has_attack1 ? -0.0705f : -0.0400f);
+
+    if (has_attack1) {
+        SetTypedInfoPanelIcon(hud.simple.InfoPanelIconBackdrop, "Damage", weapons->attack1.attackType,
+                              weapon_upgrade != 0);
+        FormatAttackDamageValue(value, sizeof(value), min_damage, max_damage,
+                                ent->unit_state->attack1.temporaryDamageBonus);
+        UI_SetText(hud.simple.InfoPanelIconValue, "%s", value);
+        SetUpgradeLevel(hud.simple.InfoPanelIconLevel, weapon_upgrade, ent);
+        UI_WriteFrame(&hud.attack1);
+        UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelIconDamage, &hud.attack1);
+    }
+    if (has_attack2) {
+        SetTypedInfoPanelIcon(hud.attack2_icon_backdrop, "Damage", weapons->attack2.attackType,
+                              weapon_upgrade != 0);
+        FormatAttackDamageValue(value, sizeof(value), min_damage2, max_damage2,
+                                ent->unit_state->attack2.temporaryDamageBonus);
+        UI_SetText(hud.attack2_icon_value, "%s", value);
+        SetUpgradeLevel(hud.attack2_icon_level, weapon_upgrade, ent);
+        UI_WriteFrame(&hud.attack2);
+        UI_WriteFrameWithChildren(hud.attack2_icon, &hud.attack2);
+    }
+
+    SetTypedInfoPanelIcon(hud.simple.InfoPanelIconBackdrop_2, "Armor", ent->data.UnitBalance->defenseType,
+                          armor_upgrade != 0);
+    if (G_UnitHasFlag(ent, UNIT_FLAG_INVULNERABLE)) UI_SetText(hud.simple.InfoPanelIconValue_2, "%s", "|cffff0000Invulnerable|r");
+    else {
+        snprintf(value, sizeof(value), "%d", (int)(G_UnitArmorValue(ent) + 0.5f));
+        UI_SetText(hud.simple.InfoPanelIconValue_2, "%s", value);
+    }
+    SetUpgradeLevel(hud.simple.InfoPanelIconLevel_2, armor_upgrade, ent);
+    UI_WriteFrame(&hud.armor);
+    UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelIconArmor, &hud.armor);
+
+    if (ent->resources > 0) {
+        cstring_t const gold_art = "InfoPanelIconGold";
+        if (!gold_art || !*gold_art) {
+            fprintf(stderr, "WriteSelectedUnitStatusFrames: missing war3skins InfoPanelIconGold\n");
+        } else {
+            UI_SetTexture(hud.simple.InfoPanelIconBackdrop_5, gold_art, false);
+        }
+        UI_SetText(hud.simple.InfoPanelIconLevel_5, "%s", "");
+        UI_SetHidden(hud.simple.InfoPanelIconLevel_5, true);
+        UI_SetText(hud.simple.InfoPanelIconValue_5, "%u", (unsigned)ent->resources);
+        UI_WriteFrame(&hud.gold);
+        UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelIconGold, &hud.gold);
+    } else if (ent->data.UnitBalance->foodMade > 0) {
+        cstring_t const food_art = "InfoPanelIconFood";
+        if (!food_art || !*food_art) {
+            fprintf(stderr, "WriteSelectedUnitStatusFrames: missing war3skins InfoPanelIconFood\n");
+        } else {
+            UI_SetTexture(hud.simple.InfoPanelIconBackdrop_4, food_art, false);
+        }
+        UI_SetText(hud.simple.InfoPanelIconLevel_4, "%s", "");
+        UI_SetHidden(hud.simple.InfoPanelIconLevel_4, true);
+        UI_SetText(hud.simple.InfoPanelIconValue_4, "%ld", (long)ent->data.UnitBalance->foodMade);
+        UI_WriteFrame(&hud.food);
+        UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelIconFood, &hud.food);
+    }
+
+    if (is_hero) {
+        SetHeroPrimaryAttributeIcon(ent->data.UnitBalance->primaryAttribute);
+        UI_SetText(hud.simple.InfoPanelIconHeroStrengthValue, "%lu", (unsigned long)ent->unit_state->hero.str);
+        UI_SetText(hud.simple.InfoPanelIconHeroAgilityValue, "%lu", (unsigned long)ent->unit_state->hero.agi);
+        UI_SetText(hud.simple.InfoPanelIconHeroIntellectValue, "%lu", (unsigned long)ent->unit_state->hero.intel);
+        UI_WriteFrame(&hud.hero);
+        UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelIconHero, &hud.hero);
+    }
+
+    WriteBuffStatusFrames(ent);
+}
+
+static float HeroLevelProgress(edict_t *ent) {
+    uint32_t level;
+    uint32_t have;
+    uint32_t need;
+
+    if (!ent) return 0.0f;
+    level = MAX(1u, ent->unit_state->hero.level);
+    have = G_HeroXPForLevel(level);
+    need = G_HeroXPForLevel(level + 1);
+    if (need <= have) return 1.0f;
+    if (ent->unit_state->hero.xp <= have) return 0.0f;
+    return MIN(1.0f, (float)(ent->unit_state->hero.xp - have) / (float)(need - have));
+}
+
+static void WriteHeroLevelBar(frameDef_t *bar, edict_t *ent) {
+    char tooltip[64];
+    uint32_t const level = MAX(1u, ent->unit_state->hero.level);
+    uint32_t const have = G_HeroXPForLevel(level);
+    uint32_t const need = G_HeroXPForLevel(level + 1);
+    uint32_t const span = need > have ? need - have : 0;
+    uint32_t const earned = span && ent->unit_state->hero.xp > have
+        ? MIN(ent->unit_state->hero.xp - have, span) : 0;
+    cstring_t const old_tip = bar->Tip;
+    cstring_t const old_ubertip = bar->Ubertip;
+
+    snprintf(tooltip, sizeof(tooltip), "XP: %lu / %lu",
+             (unsigned long)earned, (unsigned long)span);
+    bar->Tip = tooltip;
+    bar->Ubertip = NULL;
+    UI_WriteFrameValue(bar, HeroLevelProgress(ent));
+    bar->Tip = old_tip;
+    bar->Ubertip = old_ubertip;
+}
+
+#ifdef BZ_TESTS
+void UI_TestWriteHeroLevelBar(frameDef_t *bar, edict_t *ent) {
+    WriteHeroLevelBar(bar, ent);
+}
+#endif
+
+static void WriteSimpleUnitHeader(edict_t *ent, cstring_t display_name, bool is_hero, gameClient_t *viewer) {
+    char class_text[128], carrier_text[256];
+    frameDef_t *unit_action_label;
+    heroabilitystatus_t const *timed_status = NULL;
+    cstring_t timed_label = NULL;
+    cstring_t unit_name;
+    cstring_t class_format;
+    bool old_hero_hidden;
+
+    if (!hud.simple.SimpleInfoPanelUnitDetail) return;
+    /* SimpleInfoPanel.fdf supplies a building-action placeholder on this
+     * shared unit tree. Ordinary units do not use it; clear it before the
+     * tree is serialized so the retail placeholder cannot leak into the HUD. */
+    unit_action_label = UI_FindChildFrame(hud.simple.SimpleInfoPanelUnitDetail,
+                                          "SimpleBuildingActionLabel");
+    if (unit_action_label) {
+        UI_SetText(unit_action_label, "%s", "");
+        UI_SetHidden(unit_action_label, true);
+    }
+    cstring_t old_name_tip=hud.simple.SimpleNameValue->Tip;
+    UI_SetText(hud.simple.SimpleNameValue, "%s", display_name ? display_name : "");
+    if (S_CarrierStatusLabel(ent,carrier_text,sizeof(carrier_text))) {
+        hud.simple.SimpleNameValue->Tip=carrier_text;
+        /* The owner sees the air group and active mission without hovering. */
+        if (unit_action_label && viewer && ent->s.player == viewer->ps.number) {
+            UI_SetText(unit_action_label, "%s", carrier_text);
+            UI_SetHidden(unit_action_label, false);
+        }
+    }
+    unit_name = G_UnitName(ent->class_id);
+
+    /* Warsmash shows this timer only for a single unit owned by the local
+     * player. UI_SendInfoPanel already guarantees single-selection here; keep
+     * ownership explicit rather than leaking an enemy/allied timer. */
+    if (viewer && ent->s.player == viewer->ps.number) {
+        timed_status = unit_findtimedbarstatus(ent);
+        timed_label = TimedStatusLabel(timed_status);
+    }
+
+    if (timed_status_debug_level() >= 1) {
+        char code[5] = { 0 };
+        timed_status_debug_dump(ent, viewer, "write_header");
+        if (timed_status) memcpy(code, &timed_status->code, 4);
+        fprintf(stderr,
+                "WC3_TIMED_STATUS server header unit=%u owned=%u selected_status=%s label=\"%s\" frame=%s type=%u hidden=%u parent=%s size=(%.4f,%.4f) texture=%u border=%u\n",
+                (unsigned)ent->s.number,
+                (unsigned)(viewer && ent->s.player == viewer->ps.number),
+                timed_status ? code : "<none>", timed_label ? timed_label : "<null>",
+                hud.simple.SimpleProgressIndicator->Name,
+                (unsigned)hud.simple.SimpleProgressIndicator->Type,
+                (unsigned)hud.simple.SimpleProgressIndicator->hidden,
+                hud.simple.SimpleProgressIndicator->Parent ? hud.simple.SimpleProgressIndicator->Parent->Name : "<none>",
+                hud.simple.SimpleProgressIndicator->Width,
+                hud.simple.SimpleProgressIndicator->Height,
+                (unsigned)hud.simple.SimpleProgressIndicator->Texture.Image,
+                (unsigned)hud.simple.SimpleProgressIndicator->Texture.Image2);
+    }
+
+    if (timed_status) {
+        UI_SetText(hud.simple.SimpleClassValue, "%s", timed_label ? timed_label : "");
+        UI_SetHidden(hud.simple.SimpleClassValue, false);
+        hud.simple.SimpleProgressIndicator->Stat = UI_STAT_SELECTION_TIMED_STATUS;
+        UI_SetHidden(hud.simple.SimpleProgressIndicator, false);
+    } else {
+        if (is_hero) {
+            class_format = UI_GetString("INFOPANEL_LEVEL_CLASS");
+            snprintf(class_text, sizeof(class_text), class_format,
+                     (unsigned)MAX(1u, ent->unit_state->hero.level), unit_name);
+            UI_SetText(hud.simple.SimpleClassValue, "%s", class_text);
+            UI_SetHidden(hud.simple.SimpleClassValue, false);
+        } else {
+            UI_SetText(hud.simple.SimpleClassValue, "%s", "");
+            UI_SetHidden(hud.simple.SimpleClassValue, true);
+        }
+        hud.simple.SimpleProgressIndicator->Stat = 0;
+        UI_SetHidden(hud.simple.SimpleProgressIndicator, true);
+    }
+
+    if (timed_status_debug_level() >= 1) {
+        fprintf(stderr,
+                "WC3_TIMED_STATUS server frame_ready unit=%u status=%u hidden=%u stat=%u label_hidden=%u\n",
+                (unsigned)ent->s.number, (unsigned)(timed_status != NULL),
+                (unsigned)hud.simple.SimpleProgressIndicator->hidden,
+                (unsigned)hud.simple.SimpleProgressIndicator->Stat,
+                (unsigned)hud.simple.SimpleClassValue->hidden);
+    }
+
+    old_hero_hidden = hud.simple.SimpleHeroLevelBar->hidden;
+    UI_SetHidden(hud.simple.SimpleHeroLevelBar, true);
+    UI_WriteFrame(&hud.bottom);
+    UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelUnitDetail, &hud.bottom);
+    UI_SetHidden(hud.simple.SimpleHeroLevelBar, old_hero_hidden);
+    hud.simple.SimpleNameValue->Tip=old_name_tip;
+
+    if (is_hero) {
+        UI_SetHidden(hud.simple.SimpleHeroLevelBar, false);
+        WriteHeroLevelBar(hud.simple.SimpleHeroLevelBar, ent);
+    } else {
+        UI_SetHidden(hud.simple.SimpleHeroLevelBar, true);
+    }
+}
+
+uint32_t UI_WriteBuildingQueueShell(edict_t *ent, cstring_t action_key, bool show_queue_slots) {
+    cstring_t name;
+
+    if (!ent) return 0;
+    if (!hud.simple.SimpleInfoPanelUnitDetail) return 0;
+
+    name = G_UnitName(ent->class_id);
+    UI_SetText(hud.simple.SimpleBuildingNameValue, "%s", name);
+    UI_SetText(hud.simple.SimpleBuildingDescriptionValue, "%s", "");
+    UI_SetHidden(hud.simple.SimpleBuildingDescriptionValue, true);
+    UI_SetText(hud.simple.SimpleBuildingActionLabel, "%s", UI_GetString(action_key ? action_key : "TRAINING"));
+    UI_SetHidden(hud.simple.SimpleBuildTimeIndicator, false);
+    UI_SetHidden(hud.simple.SimpleBuildQueueBackdrop, !show_queue_slots);
+
+    UI_WriteFrame(&hud.bottom);
+    UI_WriteFrameWithChildren(hud.simple.SimpleInfoPanelBuildingDetail, &hud.bottom);
+    return UI_GetWrittenFrameNumber(hud.simple.SimpleBuildTimeIndicator);
+}
+
+void UI_WriteSingleInfo(edict_t *ent, gameClient_t *viewer) {
+    UnitBalance_t const *balance = ent->data.UnitBalance;
+    UnitWeapons_t const *weapons = ent->data.UnitWeapons;
+    cstring_t name = G_LevelString(G_UnitProfile(ent->class_id)->properNames);
+    cstring_t unit_name = G_UnitName(ent->class_id);
+    bool const is_hero = balance->strength > 0 || balance->agility > 0 || balance->intelligence > 0;
+    uint32_t level = is_hero && ent->unit_state->hero.level > 0 ? ent->unit_state->hero.level
+                                                 : MAX(1, balance->level);
+    int32_t dice = ent->unit_state->attack1.numberOfDice;
+    bool has_attack1 = dice > 0;
+    int32_t min_damage = has_attack1 ? MAX(0, (int32_t)(ent->unit_state->attack1.damageBase + dice)) : 0;
+    int32_t max_damage = has_attack1 ? MAX(0, (int32_t)(ent->unit_state->attack1.damageBase + dice * ent->unit_state->attack1.sidesPerDie)) : 0;
+    int32_t dice2 = ent->unit_state->attack2.numberOfDice;
+    bool has_attack2 = UI_HasSecondAttack(weapons) && dice2 > 0;
+    int32_t min_damage2 = has_attack2 ? MAX(0, (int32_t)(ent->unit_state->attack2.damageBase + dice2)) : 0;
+    int32_t max_damage2 = has_attack2 ? MAX(0, (int32_t)(ent->unit_state->attack2.damageBase + dice2 * ent->unit_state->attack2.sidesPerDie)) : 0;
+
+    if (!name || !*name) name = unit_name;
+
+    if (hud.simple.SimpleInfoPanelUnitDetail) {
+        /* SimpleNameValue owns the Warcraft title font/anchors. Ordinary units
+         * have no synthetic "Level N <type>" line; Heroes use the XP bar in
+         * that slot instead of a duplicate level/class label. */
+        HideLegacyUnitStats();
+        WriteSimpleUnitHeader(ent, is_hero ? name : unit_name, is_hero, viewer);
+
+        /* Warsmash replaces the ordinary damage/armor/stat presentation with
+         * transport slots whenever a cargo holder contains units.  Capacity
+         * comes from the holder ability (Abun is four in standard data), so
+         * custom maps can author a different number of visible slots. The
+         * stock FDF has no slot frame definitions, so these native proxy
+         * frames use inline authored values as permitted for native controls. */
+        if (ent->cargo && ent->cargo->count > 0 && S_CargoCapacity(ent) > 0) {
+            uint32_t const capacity = S_CargoCapacity(ent);
+            bool const carrier_deck = S_CarrierAircraftCount(ent) > 0;
+            cstring_t const slot_art = Theme_String("CargoBackdrop", NULL);
+            uint32_t slot_image;
+
+            if (!slot_art || !*slot_art) {
+                fprintf(stderr, "UI_WC3: missing CargoBackdrop texture for cargo panel\n");
+                return;
+            }
+            slot_image = gi.ImageIndex(slot_art);
+            if (!slot_image) {
+                fprintf(stderr, "UI_WC3: failed to load CargoBackdrop texture \"%s\"\n", slot_art);
+                return;
+            }
+
+            FOR_LOOP(i, capacity) {
+                /* Four columns keep eight-slot transports inside the details panel;
+                 * 0.034 canvas units gives a 47-point target on the 11-inch iPad. */
+                float const x = 0.310f + (float)(i % 4) * 0.040f;
+                float const y = 0.5000390625f + (float)(i / 4) * 0.042f;
+                edict_t *occupant = S_CargoUnitAt(ent, i);
+                uiFrame_t backdrop = { .flags = { .type = FT_TEXTURE }, .tex = { .index = slot_image },
+                                       .color = COLOR32_WHITE };
+
+                UI_SetFrameRect(&backdrop, x, y, 0.034f, 0.034f);
+                UI_WriteProxyFrame(&backdrop, NULL, 0);
+                if (occupant) {
+                    uiFrame_t frame;
+                    char command[64];
+                    cstring_t art = FindConfigValue(GetClassName(occupant->class_id), STR_ART);
+                    cstring_t tip = G_UnitName(occupant->class_id);
+
+                    if (!art || !*art) {
+                        fprintf(stderr, "UI_WC3: missing cargo art for unit %s\n", GetClassName(occupant->class_id));
+                        continue;
+                    }
+                    /* A direct path is already authoritative; Theme_String returns it unchanged when no skin key
+                     * applies. */
+                    art = Theme_String(art, art);
+                    if (!art || !*art) {
+                        fprintf(stderr, "UI_WC3: unresolved cargo art key for unit %s\n",
+                                GetClassName(occupant->class_id));
+                        continue;
+                    }
+
+                    memset(&frame, 0, sizeof(frame));
+                    frame.flags.type = FT_COMMANDBUTTON;
+                    frame.color = COLOR32_WHITE;
+                    frame.tex.index = gi.ImageIndex(art);
+                    if (!frame.tex.index) {
+                        fprintf(stderr, "UI_WC3: failed to load cargo art \"%s\" for unit %s\n", art,
+                                GetClassName(occupant->class_id));
+                        continue;
+                    }
+                    frame.tooltip = tip && *tip ? tip : GetClassName(occupant->class_id);
+                    snprintf(command, sizeof(command), "cargounload %u", (unsigned)i);
+                    frame.onclick = carrier_deck ? NULL : command;
+                    if (carrier_deck) {
+                        frame.flags.type = FT_TEXTURE;
+                        frame.tooltip = "Aircraft on deck. Use Launch fighter or Launch bomber.";
+                    }
+                    UI_SetFrameRect(&frame, x, y, 0.034f, 0.034f);
+                    UI_WriteProxyFrame(&frame, NULL, 0);
+                }
+            }
+            return;
+        }
+    } else {
+        char buffer[128];
+        UI_SetText(hud.unit.NameValue, "%s", name);
+        snprintf(buffer, sizeof(buffer), "Level %lu %s", (unsigned long)level, unit_name ? unit_name : "");
+        UI_SetText(hud.unit.ClassValue, "%s", buffer);
+        WriteLegacyUnitStats(ent, weapons, has_attack2, min_damage, max_damage,
+                             min_damage2, max_damage2, is_hero, level);
+        UI_WriteFrame(&hud.bottom);
+        UI_WriteFrameWithChildren(hud.unit.InfoPanelUnitDetail, &hud.bottom);
+    }
+
+    WriteSelectedUnitStatusFrames(ent, weapons, has_attack1, has_attack2,
+                                  min_damage, max_damage, min_damage2, max_damage2,
+                                  is_hero);
+}
+
+#define WC3_MULTISELECT_CLASSIC_CAPACITY 12 // units; the original 6x2 icon grid, larger selections need the 8x3 compact grid
+
+void UI_WriteMultiselect(edict_t * *ents, uint32_t count, gameClient_t *viewer) {
+    edict_t *focused = viewer ? G_GetMainSelectedUnit(viewer) : NULL;
+    cstring_t highlight = Theme_String("SelectedSubgroupHighlight", NULL);
+
+    if (count > G_SelectionLimit()) count = G_SelectionLimit();
+    uint32_t size = sizeof(uiMultiselect_t) + sizeof(uiMultiselectItem_t) * count;
+    uint8_t *buffer = gi.MemAlloc(size);
+    uiMultiselect_t *multi = (uiMultiselect_t *)buffer;
+    uiFrame_t frame;
+
+    memset(buffer, 0, size);
+    multi->hp_bar = gi.ImageIndex("SimpleHpBarConsole");
+    multi->mana_bar = gi.ImageIndex("SimpleManaBarConsole");
+    multi->focus_highlight = highlight && *highlight ? gi.ImageIndex(highlight) : 0;
+    /* The 8x3 Reforged-style layout fits inside the existing info panel.
+     * Keep original spacing at the classic capacity to preserve the classic HUD. */
+    bool const compact = count > WC3_MULTISELECT_CLASSIC_CAPACITY;
+    multi->offset = compact ? MAKE(vec2_t, 0.022f, 0.038f) : MAKE(vec2_t, 0.031f, 0.050f);
+    multi->numcolumns = compact ? 8 : 6;
+    multi->numitems = count;
+    FOR_LOOP(i, count) {
+        multi->items[i].entity = ents[i]->s.number;
+        multi->items[i].image = gi.ImageIndex(FindConfigValue(GetClassName(ents[i]->class_id), STR_ART));
+        /* Warsmash highlights the whole selected subgroup: units group by
+         * unit type, even though clicking one icon chooses a concrete focus. */
+        if (focused && ents[i]->class_id == focused->class_id)
+            multi->items[i].flags |= UI_MULTISELECT_ITEM_FOCUSED;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_MULTISELECT;
+    frame.color = COLOR32_WHITE;
+    UI_SetFrameRect(&frame, 0.314f, 0.500f, compact ? 0.019f : 0.025f,
+                    compact ? 0.019f : 0.025f);
+    UI_WriteProxyFrame(&frame, buffer, size);
+    gi.MemFree(buffer);
+}
+
+static bool UI_UsesBuildingQueuePanel(gameClient_t *viewer, edict_t *unit) {
+    if (!viewer || !unit || !G_UnitIsBuilding(unit->class_id))
+        return false;
+    if (!G_UnitCanControl(viewer, unit))
+        return false;
+    return unit->construction || G_BuildingUpgradeActive(unit) || unit->build != NULL;
+}
+
+#ifdef BZ_TESTS
+bool UI_TestUsesBuildingQueuePanel(gameClient_t *viewer, edict_t *unit) {
+    return UI_UsesBuildingQueuePanel(viewer, unit);
+}
+#endif
+
+void UI_SeedInfoPanelCache(edict_t *ent, edict_t * *selected, uint32_t count) {
+    if (!ent->client) return;
+    if (count == 1 && !UI_UsesBuildingQueuePanel(ent->client, selected[0])) {
+        ent->client->infopanel.entity = selected[0]->s.number;
+        ent->client->infopanel.count = 0;
+        ent->client->infopanel.xp = (int32_t)(selected[0]->unit_state ? selected[0]->unit_state->hero.xp : 0);
+    } else {
+        ent->client->infopanel.entity = 0;
+        /* HP/mana no longer drive the live portrait bars. Reuse hp as the
+         * non-single selection-count cache so async removals (death/fog/hide)
+         * can invalidate a still-multiselect info panel. -1 distinguishes
+         * the building queue from an empty selection. */
+        ent->client->infopanel.count = count == 1 ? -1 : (int32_t)count;
+        ent->client->infopanel.xp = 0;
+    }
+}
+
+void UI_SendInfoPanel(edict_t *ent, edict_t * *selected, uint32_t count) {
+    UI_WriteStart(LAYER_INFOPANEL);
+    if (count == 1) {
+        bool const queue_panel = UI_UsesBuildingQueuePanel(ent->client, selected[0]);
+        if (queue_panel) {
+            UI_WriteBuildQueue(selected[0], ent->client);
+        } else {
+            UI_WriteSingleInfo(selected[0], ent->client);
+        }
+        /* Tooltip-bearing status icons and cargo buttons live in the info-panel
+         * layer.  The client draws FT_TOOLTIPTEXT only from the layer that owns
+         * the hovered source, so keep one shared presenter in this layer rather
+         * than special-casing individual info-panel modes. */
+        UI_WriteTooltipFrame();
+    } else if (count > 1) {
+        UI_WriteMultiselect(selected, count, ent->client);
+    }
+    UI_WriteEnd(ent);
+    UI_SeedInfoPanelCache(ent, selected, count);
+}
+
+static uint32_t SelectedUnits(gameClient_t *client, edict_t * *out, uint32_t max_out) {
+    return G_GetOrderedSelectedUnits(client, out, max_out);
+}
+
+void Get_Commands_f(edict_t *ent) {
+    edict_t *selected = ent && ent->client ? G_GetMainSelectedUnit(ent->client) : NULL;
+    gameClient_t *previous_ui_client;
+    gameCommandButton_t buttons[12];
+    gameCommandButton_t unit_buttons[12];
+    uint8_t count;
+
+    if (!ent || !ent->client) return;
+    G_UpdateRallyIndicator(ent->client);
+    ent->client->commands_dirty = false;
+    /* A command-card rebuild replaces server-owned build targeting. Clear the
+     * cursor through the build subsystem before the generic menu reset loses
+     * the callback that identifies the active placement mode. */
+    G_ClearBuildPlacementMode(ent);
+    /* The command bar can also be rebuilt while item-owned building
+     * targeting is active (selection change, Escape, interrupted order). */
+    if (ent->client->menu.on_location_selected || ent->client->menu.on_entity_selected) {
+        S_AbilityTargetModeExit(ent);
+        gi.Write(PF_BYTE, &(int32_t){svc_cursor});
+        gi.Write(PF_ENTITY, &(entityState_t){0});
+        gi.unicast(ent);
+    }
+    S_SpellCursorSplat(ent,0);
+    memset(&ent->client->menu, 0, sizeof(ent->client->menu));
+    if (!selected || (!G_UnitCanControl(ent->client, selected) &&
+                      !G_CanUseItemShop(ent->client, selected) &&
+                      !G_CanUseUnitShop(ent->client, selected))) {
+        UI_ClearLayer(ent, LAYER_COMMANDBAR);
+        return;
+    }
+
+    /* Command tooltip formatting is player-sensitive for research because the
+     * next upgrade level determines gold/lumber cost. Keep the same current-
+     * client contract used by UI_WRITE_LAYER while this manually-authored
+     * command-bar layer is serialized. */
+    previous_ui_client = ui_current_client;
+    UI_SetCurrentClient(ent->client);
+    UI_WriteStart(LAYER_COMMANDBAR);
+    if (G_CanUseItemShop(ent->client, selected) || G_CanUseUnitShop(ent->client, selected)) {
+        uint8_t const shop_count = G_GetShopButtons(&(shopItemButtonsParams_t){
+            .client = ent->client, .shop = selected, .buttons = buttons, .max_buttons = 12 });
+        uint8_t const unit_count = G_GetCommandButtons(selected, unit_buttons,
+                                                        (uint8_t)(12 - shop_count));
+        count = shop_count;
+        FOR_LOOP(i, unit_count) {
+            buttons[count] = unit_buttons[i];
+            count++;
+        }
+    } else {
+        count = G_GetCommandButtons(selected, buttons, 12);
+    }
+    /* Resource-consuming buttons must agree with the authoritative advanced-
+     * sharing check. Ordinary orders and hero skill points remain usable with
+     * basic control; production, research, upgrades, revival and the Build
+     * submenu (ui_builds is gated the same way) do not. */
+    if (!G_UnitCanSpendResources(ent->client, selected)) {
+        UnitProfile_t const *profile = G_UnitProfile(selected->class_id);
+        FOR_LOOP(i, count) {
+            bool production = buttons[i].building_upgrade != 0 ||
+                              !strncmp(buttons[i].command, "revive:", 7) ||
+                              !strcmp(buttons[i].command, STR_CmdCancelBuild) ||
+                              !strcmp(buttons[i].command, STR_CmdBuild) ||
+                              (!strcmp(buttons[i].command, STR_CmdCancel) &&
+                               selected->build && selected->build->revival &&
+                               selected->build->revival->reviving);
+            if (profile && strlen(buttons[i].command) == 4) {
+                cstring_t const lists[] = {profile->trains, profile->researches,
+                                          profile->upgrade};
+                FOR_LOOP(j, 3) {
+                    if (!lists[j]) continue;
+                    PARSE_LIST(lists[j], item, parse_segment) {
+                        if (strlen(item) == 4 && !memcmp(item, buttons[i].command, 4)) {
+                            production = true;
+                            break;
+                        }
+                    }
+                    if (production) break;
+                }
+            }
+            if (production) buttons[i].disabled = 1;
+        }
+    }
+    uint32_t producers=0,queued_total=0,flights=0,decks=0;
+    FOR_CONTROLLABLE_SELECTED_UNITS(ent->client, factory) {
+        if (G_UnitIsBuilding(factory->class_id) || G_UnitAbilityLevel(factory,MAKEFOURCC('F','c','a','p'))) {
+            producers++;
+            gameQueueItem_t queue[MAX_BUILD_QUEUE];
+            queued_total+=G_GetBuildQueue(factory,queue,MAX_BUILD_QUEUE);
+            flights+=S_CarrierAircraftCount(factory);
+            decks+=factory->cargo ? factory->cargo->count : 0;
+        }
+    }
+    FOR_LOOP(i, count) {
+        if (!strcmp(buttons[i].command,"Fcov")) buttons[i].engaged=G_UnitAbilityLevel(selected,MAKEFOURCC('F','c','a','p'))==1;
+        if (!strcmp(buttons[i].command,"Fpro")) {
+            bool all_protected=true;
+            FOR_CONTROLLABLE_SELECTED_UNITS(ent->client, carrier)
+                if (G_UnitAbilityLevel(carrier,MAKEFOURCC('F','p','r','o'))==1 && G_UnitCanSpendResources(ent->client,carrier)) all_protected=false;
+            if (all_protected) {
+                buttons[i].disabled=buttons[i].engaged=1;
+                strlcpy(buttons[i].tooltip,"Reinforced protection installed",sizeof(buttons[i].tooltip));
+            }
+        }
+        if (!buttons[i].research && !buttons[i].building_upgrade && strlen(buttons[i].command)==4 &&
+            !FindAbilityForCommand(buttons[i].command)) {
+            FOR_CONTROLLABLE_SELECTED_UNITS(ent->client, factory) {
+                char reason[128];
+                buildCommandState_t state=G_GetTrainCommandState(ent->client,factory,FS_SLKKey(buttons[i].command),reason,sizeof(reason));
+                if (G_UnitCanSpendResources(ent->client,factory) &&
+                    (state==BUILD_COMMAND_AVAILABLE || state==BUILD_COMMAND_UNAFFORDABLE)) {buttons[i].disabled=0;break;}
+            }
+        }
+        if (producers>1) {
+            char summary[128];
+            snprintf(summary,sizeof(summary),"\n%u selected producers; %u queued; %u aircraft (%u deck). Shift: 5 orders per producer.",producers,queued_total,flights,decks);
+            strlcat(buttons[i].ubertip,summary,sizeof(buttons[i].ubertip));
+        }
+        UI_WriteCommandButtonFrame(&buttons[i]);
+    }
+    /* Add formation control to an unused command cell for mobile selections. */
+    if (selected->data.UnitBalance->speed > 0) {
+        bool added=false;
+        bool occupied[12]={0};
+        FOR_LOOP(i,count) if (buttons[i].x<4 && buttons[i].y<3) occupied[buttons[i].y*4+buttons[i].x]=true;
+        FOR_LOOP(cell,12) if (!occupied[cell]) {
+            gameCommandButton_t form={0};
+            static cstring_t names[]={"Normal","Line","Column","Wedge","Defensive"};
+            snprintf(form.art,sizeof(form.art),"%s",FindConfigValue(STR_CmdMove,STR_ART));
+            snprintf(form.command,sizeof(form.command),"formation");
+            snprintf(form.alternate,sizeof(form.alternate),"formationspacing");
+            snprintf(form.tooltip,sizeof(form.tooltip),"Formation: %s / spacing %.0f (0=auto)",names[S_GetFormation(ent->client)],S_GetFormationSpacing(ent->client));
+            snprintf(form.ubertip,sizeof(form.ubertip),"Left-click cycles shapes; right-click cycles spacing. Alt+1..4 selects a shape. Console: formation line 180.");
+            form.x=cell%4;form.y=cell/4;
+            UI_WriteCommandButtonFrame(&form);
+            added=true;
+            break;
+        }
+        if (!added) {
+            uiFrame_t form={0};
+            form.flags.type=FT_COMMANDBUTTON;form.color=COLOR32_WHITE;
+            form.tex.index=gi.ImageIndex(FindConfigValue(STR_CmdMove,STR_ART));
+            form.onclick="formation";form.text="formationspacing";form.tooltip="Cycle formation: Normal / Line / Column / Wedge / Defensive (Alt+1..4)";
+            UI_SetFrameRect(&form,.6175f,.422f,.039f,.039f);
+            uiCommandButton_t state={0};UI_WriteProxyFrame(&form,&state,sizeof(state));
+        }
+    }
+    if (count) UI_WriteTooltipFrame();
+    UI_WriteEnd(ent);
+    UI_SetCurrentClient(previous_ui_client);
+}
+
+static void WritePortraitFrame(edict_t *ent) {
+    uiFrame_t frame;
+    char command[64];
+
+    if (!ent || !ent->s.model) return;
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_PORTRAIT;
+    frame.color = COLOR32_WHITE;
+    frame.tex.index = ent->s.model;
+    frame.stat = G_GetUnitTeamColor(ent);
+    frame.text = G_UnitResponseTalking(ent) ? "Portrait Talk" : "Portrait";
+    snprintf(command, sizeof(command), "+portraitcamera %u", (unsigned)ent->s.number);
+    frame.onclick = command;
+    UI_SetFrameRect(&frame, WC3_HUD_PORTRAIT_X, WC3_HUD_PORTRAIT_Y,
+                    WC3_HUD_PORTRAIT_WIDTH, WC3_HUD_PORTRAIT_HEIGHT);
+    UI_WriteProxyFrame(&frame, NULL, 0);
+}
+
+static color32_t PortraitHealthColor(edict_t *ent) {
+    float ratio;
+    float red;
+    float green;
+
+    if (!ent || ent->health.max_value <= 0.0f) return MAKE(color32_t, 255, 0, 0, 255);
+    ratio = MAX(0.0f, MIN(1.0f, ent->health.value / ent->health.max_value));
+    red = MIN(1.0f, 2.0f - ratio * 2.0f);
+    green = MIN(1.0f, ratio * 2.0f);
+    return MAKE(color32_t,
+                (uint8_t)(red * 255.0f + 0.5f),
+                (uint8_t)(green * 255.0f + 0.5f),
+                0, 255);
+}
+
+static void WritePortraitText(cstring_t text, color32_t color, float bottom, uint32_t stat) {
+    uiFrame_t frame;
+    uiLabel_t label;
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&label, 0, sizeof(label));
+    frame.flags.type = FT_STRING;
+    frame.text = text && *text ? text : " ";
+    frame.color = color;
+    frame.stat = stat;
+    frame.textLength = 20; /* Warsmash UnitPortraitTextTemplate */
+    frame.size.width = 0.0835f; /* Keep 9999 / 9999 inside the portrait width. */
+    frame.size.height = 0.01640625f;
+    label.font = gi.FontIndex(Theme_String("MasterFont", "Fonts\\FRIZQT__.TTF"), HUD_FONT_SIZE);
+    label.textalignx = FONT_JUSTIFYCENTER;
+    label.textaligny = FONT_JUSTIFYBOTTOM;
+    /* The string has natural text width. Anchor its midpoint to the portrait
+     * midpoint and its bottom edge to the Warsmash UnitPortrait offsets. */
+    UI_SetFramePoint(&frame.points.x[FPP_MID], FPP_MIN, 0, 0.25275f, false);
+    UI_SetFramePoint(&frame.points.y[FPP_MAX], FPP_MIN, 0, bottom, true);
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+static void WritePortraitStats(edict_t *ent) {
+    char health[32];
+    char mana[32];
+    int32_t hp;
+    int32_t max_hp;
+    int32_t mp;
+    int32_t max_mp;
+
+    if (!ent) return;
+    hp = (int32_t)MAX(0.0f, ent->health.value);
+    max_hp = (int32_t)MAX(0.0f, ent->health.max_value);
+    mp = (int32_t)MAX(0.0f, ent->mana.value);
+    max_mp = (int32_t)MAX(0.0f, ent->mana.max_value);
+
+    snprintf(health, sizeof(health), "%ld / %ld", (long)hp, (long)max_hp);
+    if (max_mp > 0)
+        snprintf(mana, sizeof(mana), "%ld / %ld", (long)mp, (long)max_mp);
+    else
+        mana[0] = '\0';
+
+    /* Warsmash's UnitPortrait places the stat strings in the 0.029-high strip
+     * below the model: HP at BOTTOM + 0.014 and mana at BOTTOM - 0.0005.
+     * OpenRealm keeps the portrait runtime-authored because SmashUI is not a
+     * retail MPQ FDF, but uses the same final WC3-space geometry. */
+    /* Move both baselines up by roughly two pixels while preserving their gap. */
+    if (!G_UnitHasFlag(ent, UNIT_FLAG_INVULNERABLE))
+        WritePortraitText(health, PortraitHealthColor(ent), 0.584f, UI_STAT_SELECTION_HEALTH_TEXT);
+    WritePortraitText(mana, COLOR32_WHITE, 0.5985f, UI_STAT_SELECTION_MANA_TEXT);
+}
+
+void UI_WriteSelectedPortraitLayer(edict_t *ent) {
+    edict_t *selected[MAX_SELECTED_ENTITIES];
+    edict_t *focused;
+    uint32_t count;
+
+    if (!ent || !ent->client) return;
+    count = SelectedUnits(ent->client, selected, MAX_SELECTED_ENTITIES);
+    focused = count ? G_GetMainSelectedUnit(ent->client) : NULL;
+    if (!focused && count) focused = selected[0];
+
+    UI_WriteStart(LAYER_PORTRAIT);
+    if (focused) {
+        WritePortraitFrame(focused);
+        WritePortraitStats(focused);
+    }
+    UI_WriteEnd(ent);
+}
+
+static void WriteInventoryCharge(float x, float y, float w, float h, uint32_t charges) {
+    uiFrame_t frame;
+    uiLabel_t label;
+    char text[16];
+
+    if (!charges) return;
+    memset(&frame, 0, sizeof(frame)); memset(&label, 0, sizeof(label));
+    snprintf(text, sizeof(text), "%u", (unsigned)charges);
+    frame.flags.type = FT_STRING; frame.text = text; frame.color = COLOR32_WHITE;
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", INVENTORY_CHARGE_FONT_SIZE);
+    label.textalignx = FONT_JUSTIFYRIGHT; label.textaligny = FONT_JUSTIFYBOTTOM;
+    UI_SetFrameRect(&frame, x + 0.001f, y + 0.001f, w - 0.002f, h - 0.002f);
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+/* WC3's classic inventory cover has no usable ROC FDF definition, so construct
+ * the native frame directly and send its symbolic war3skins key to the client. */
+static void WriteInventoryCover(edict_t *player) {
+    static FRAMEDEF frame;
+    cstring_t art = "ConsoleInventoryCoverTexture";
+
+    if (!art || !*art) {
+        fprintf(stderr, "WriteInventoryCover: missing ConsoleInventoryCoverTexture for player skin\n");
+        return;
+    }
+    UI_InitFrame(&frame, FT_TEXTURE);
+    UI_SetSize(&frame, 0.128f, 0.175f);
+    /* Native WC3 anchor is BOTTOMRIGHT at (0.600, 0.000) in bottom-left coordinates.
+     * Relative to OpenRealm's top-left scene origin that is x=0.600, y=0.600. */
+    UI_SetPoint(&frame, FRAMEPOINT_BOTTOMRIGHT, NULL, FRAMEPOINT_TOPLEFT, 0.600f, -0.600f);
+    frame.AlphaMode = BLEND_MODE_ALPHAKEY;
+    frame.Texture.TexCoord.min.y = 0.380859375f;
+    frame.Texture.Image = gi.ImageIndex(art);
+    UI_WriteFrame(&frame);
+}
+
+static void WriteInventoryNoCapacitySlot(uint8_t slot, cstring_t art) {
+    float bx = UI_BASE_WIDTH * 0.5f + 0.1315f + (float)(slot % 2) * 0.0394f;
+    float by = UI_BASE_HEIGHT - 0.0971f + (float)(slot / 2) * 0.0384f;
+    UI_WriteTextureFrame(bx - 0.0165f, by - 0.0165f, 0.033f, 0.033f, art);
+}
+
+static void WriteInventoryTitle(void) {
+    uiFrame_t frame = { 0 };
+    uiLabel_t label = { 0 };
+
+    frame.flags.type = FT_STRING;
+    frame.text = UI_GetString("INVENTORY");
+    frame.color = MAKE(color32_t, 252, 222, 18, 255);
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 11);
+    label.textalignx = FONT_JUSTIFYCENTER;
+    label.textaligny = FONT_JUSTIFYMIDDLE;
+    UI_SetFrameRect(&frame, 0.516f, 0.4684375f, 0.071f, 0.01125f);
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+static void WriteInventory(edict_t *player, edict_t *ent) {
+    gameInventoryItem_t items[MAX_INVENTORY];
+    uint32_t capacity = G_InventoryCapacity(ent);
+    uint8_t count;
+
+    if (!capacity) { WriteInventoryCover(player); return; }
+    WriteInventoryTitle();
+    if (capacity < MAX_INVENTORY) {
+        cstring_t art = "ConsoleInventoryNoCapacity";
+        if (!art || !*art) {
+            fprintf(stderr, "WriteInventory: missing ConsoleInventoryNoCapacity for player skin\n");
+            return;
+        }
+        for (uint32_t slot = capacity; slot < MAX_INVENTORY; slot++) WriteInventoryNoCapacitySlot((uint8_t)slot, art);
+    }
+
+    count = G_GetInventory(ent, items, MAX_INVENTORY);
+    FOR_LOOP(i, count) {
+        float bx = UI_BASE_WIDTH * 0.5f + 0.1315f + (float)(items[i].slot % 2) * 0.0394f;
+        float by = UI_BASE_HEIGHT - 0.0971f + (float)(items[i].slot / 2) * 0.0384f;
+        uiFrame_t frame;
+        char onclick[128];
+        char onrightclick[128];
+        char tooltip[1024];
+        memset(&frame, 0, sizeof(frame));
+        frame.flags.type = FT_COMMANDBUTTON;
+        frame.color = COLOR32_WHITE;
+        frame.tex.index = gi.ImageIndex(items[i].art);
+        UI_FormatTooltip("", items[i].tooltip, items[i].ubertip, 0, tooltip, sizeof(tooltip));
+        frame.tooltip = tooltip;
+        snprintf(onclick, sizeof(onclick), "inventory %u", (unsigned)items[i].slot);
+        snprintf(onrightclick, sizeof(onrightclick), "itemdrag %u", (unsigned)items[i].slot);
+        frame.onclick = onclick;
+        /* Command-button text is the existing secondary/right-click command
+         * channel (also used by autocast). Inventory items use it to begin the
+         * Warsmash-style hold-item cursor interaction. */
+        frame.text = onrightclick;
+        UI_SetFrameRect(&frame, bx - 0.0165f, by - 0.0165f, 0.033f, 0.033f);
+        UI_WriteProxyFrame(&frame, NULL, 0);
+        WriteInventoryCharge(bx - 0.0165f, by - 0.0165f, 0.033f, 0.033f, items[i].charges);
+    }
+    if (count) UI_WriteTooltipFrame();
+}
+
+static void UI_SendInventoryLayer(edict_t *ent, edict_t * *selected, uint32_t count) {
+    edict_t *focused = count > 0 && ent && ent->client ? G_GetMainSelectedUnit(ent->client) : NULL;
+
+    (void)selected;
+    /* Neutral shops borrow the selected patron's inventory presentation while
+     * the building itself remains the world selection, matching Warcraft's
+     * shop flow without granting command authority over the neutral unit. */
+    if (focused && G_CanUseItemShop(ent->client, focused)) {
+        focused = G_FindShopPatron(ent->client, focused);
+    }
+    UI_WriteStart(LAYER_INVENTORY);
+    if (focused) WriteInventory(ent, focused);
+    UI_WriteEnd(ent);
+}
+
+void G_RefreshInventoryLayer(edict_t *ent) {
+    edict_t *selected[MAX_SELECTED_ENTITIES];
+    uint32_t count;
+
+    if (!ent || !ent->client) return;
+    count = SelectedUnits(ent->client, selected, MAX_SELECTED_ENTITIES);
+    UI_SendInventoryLayer(ent, selected, count);
+}
+
+void Get_Portrait_f(edict_t *ent) {
+    edict_t *selected[MAX_SELECTED_ENTITIES];
+    uint32_t count;
+
+    if (!ent || !ent->client) return;
+    count = SelectedUnits(ent->client, selected, MAX_SELECTED_ENTITIES);
+
+    /* A normal-game transmission temporarily owns LAYER_PORTRAIT. Selection
+     * still updates the info/inventory panels, but the talking head remains
+     * authoritative until the transmission ends. */
+    UI_WriteDialoguePresentation(ent);
+
+    UI_SendInfoPanel(ent, selected, count);
+    UI_SendInventoryLayer(ent, selected, count);
+}
+
+void G_InvalidateUnitInfoPanel(edict_t *unit) {
+    if (!unit) return;
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        if (client->connected && G_IsEntitySelected(client, unit)) {
+            /* -1 means the queue layer was already serialized. Preserve the
+             * existing cache representation, but make that queue panel dirty
+             * so an upgrade/construction state change is sent next frame. */
+            if (client->infopanel.count == -1) {
+                client->infopanel.count = 0;
+            } else if (client->infopanel.entity == unit->s.number) {
+                /* UINT32_MAX is outside the entity-number range. Reuse the
+                 * entity cache key to invalidate only a currently displayed
+                 * single-unit panel without changing the save layout. */
+                client->infopanel.entity = UINT32_MAX;
+            }
+        }
+    }
+}
+
+/* The portrait layer is authored separately from the info panel and is not
+ * rebuilt by G_UpdateClientInfoPanels(). In-place type changes therefore have
+ * to dirty the selected-unit presentation explicitly so G_RunClients() emits
+ * the new model on the next server frame. Keep this deferred rather than
+ * writing svc_layout from inside gameplay state mutation. */
+void G_InvalidateUnitPortrait(edict_t *unit) {
+    if (!unit) return;
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        if (client->connected && G_IsEntitySelected(client, unit))
+            client->presentation_dirty = true;
+    }
+}
+
+static uint16_t SelectedPortraitStat(float value) {
+    int32_t whole = (int32_t)MAX(0.0f, value); /* Warsmash FastNumberFormat truncates */
+    return (uint16_t)MIN(whole, USHRT_MAX);
+}
+
+static uint16_t SelectedTimedStatusStat(gameClient_t *client, edict_t *selected) {
+    heroabilitystatus_t const *status;
+    float fraction;
+
+    if (!client || !selected || selected->s.player != client->ps.number) return 0;
+    status = unit_findtimedbarstatus(selected);
+    if (!status) return 0;
+    fraction = unit_statusremainingfraction(status);
+    return (uint16_t)MIN((uint32_t)(fraction * (float)USHRT_MAX + 0.5f), (uint32_t)USHRT_MAX);
+}
+
+#ifdef BZ_TESTS
+uint16_t UI_TestSelectedTimedStatusStat(gameClient_t *client, edict_t *selected) {
+    return SelectedTimedStatusStat(client, selected);
+}
+#endif
+
+static void UpdateSelectedLiveStats(gameClient_t *client, edict_t *selected) {
+    uint16_t old_timed;
+    uint16_t new_timed;
+    int debug;
+
+    if (!client) return;
+    old_timed = client->ps.stats[UI_PLAYERSTAT_SELECTION_TIMED_STATUS];
+    debug = timed_status_debug_level();
+    if (!selected) {
+        client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH] = 0;
+        client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_HEALTH] = 0;
+        client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA] = 0;
+        client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_MANA] = 0;
+        client->ps.stats[UI_PLAYERSTAT_SELECTION_TIMED_STATUS] = 0;
+        if (debug >= 2 && old_timed) {
+            fprintf(stderr,
+                    "WC3_TIMED_STATUS server publish player=%u unit=<none> old=%u new=0\n",
+                    (unsigned)client->ps.number, (unsigned)old_timed);
+        }
+        return;
+    }
+    client->ps.stats[UI_PLAYERSTAT_SELECTION_HEALTH] = SelectedPortraitStat(selected->health.value);
+    client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_HEALTH] = SelectedPortraitStat(selected->health.max_value);
+    client->ps.stats[UI_PLAYERSTAT_SELECTION_MANA] = SelectedPortraitStat(selected->mana.value);
+    client->ps.stats[UI_PLAYERSTAT_SELECTION_MAX_MANA] = SelectedPortraitStat(selected->mana.max_value);
+    new_timed = SelectedTimedStatusStat(client, selected);
+    client->ps.stats[UI_PLAYERSTAT_SELECTION_TIMED_STATUS] = new_timed;
+    if (debug >= 2 && old_timed != new_timed) {
+        uint32_t const old_bucket = ((uint32_t)old_timed * 10u) / USHRT_MAX;
+        uint32_t const new_bucket = ((uint32_t)new_timed * 10u) / USHRT_MAX;
+        if (debug >= 3 || old_timed == 0 || new_timed == 0 || old_bucket != new_bucket) {
+            fprintf(stderr,
+                    "WC3_TIMED_STATUS server publish player=%u unit=%u old=%u new=%u fraction=%.4f\n",
+                    (unsigned)client->ps.number, (unsigned)selected->s.number,
+                    (unsigned)old_timed, (unsigned)new_timed,
+                    new_timed / (float)USHRT_MAX);
+        }
+    }
+}
+
+/* Keep selected-unit HP/mana and the normalized timed-status fraction in
+ * playerState so live bars/text update through ordinary snapshots instead of
+ * forcing a whole FDF layer resend every server frame. Re-send LAYER_INFOPANEL
+ * only when its static presentation (selection, timer eligibility/label, XP) changes. */
+void G_RefreshInfoPanel(edict_t *ent) {
+    edict_t *selected[MAX_SELECTED_ENTITIES];
+    uint32_t count;
+    bool queue_panel;
+
+    if (!ent || !ent->client) return;
+    count = SelectedUnits(ent->client, selected, MAX_SELECTED_ENTITIES);
+    UpdateSelectedLiveStats(ent->client, count ? G_GetMainSelectedUnit(ent->client) : NULL);
+    if (count != 1) {
+        if (ent->client->infopanel.entity == 0 &&
+            ent->client->infopanel.count == (int32_t)count) {
+            return;
+        }
+        UI_SendInfoPanel(ent, selected, count);
+        return;
+    }
+
+    queue_panel = UI_UsesBuildingQueuePanel(ent->client, selected[0]);
+    if (queue_panel) {
+        /* A selected building can enter construction or an in-place upgrade
+         * without a new selection event. The queue-panel cache is 0/-1 only
+         * after its layer has actually been serialized; any other cache state
+         * needs the transition payload before the live queue timer can update. */
+        /* The client-side queue timer advances from its serialized timestamps.
+         * Rebuild them while Unsummon owns the building so a paused training
+         * queue remains visually paused instead of continuing on the client. */
+        if (G_BuildingIsUnsummoning(selected[0]) ||
+            ent->client->infopanel.entity != 0 || ent->client->infopanel.count != -1) {
+            UI_SendInfoPanel(ent, selected, count);
+        }
+        return;
+    }
+    /* HP/mana/timed-status progress are live player-state bindings, so changing
+     * their values must not force LAYER_INFOPANEL/FDF reserialization every frame. */
+    if (selected[0]->s.number == ent->client->infopanel.entity &&
+        (int32_t)(selected[0]->unit_state ? selected[0]->unit_state->hero.xp : 0) == ent->client->infopanel.xp) {
+        return;
+    }
+    UI_SendInfoPanel(ent, selected, count);
+}
+
+/* Once per server frame, keep every connected player's info panel in sync.
+ * Client edicts live in the reserved [0, max_clients) range and are not normal
+ * in-use world entities, so do not gate this on edict->inuse. */
+void G_UpdateClientInfoPanels(void) {
+    FOR_LOOP(i, game.max_clients) {
+        gameClient_t *client = game.clients + i;
+        edict_t *ent;
+
+        if (!client->connected) continue;
+        ent = G_GetPlayerEntityByNumber(client->ps.number);
+        if (ent && ent->client == client) G_RefreshInfoPanel(ent);
+    }
+}
+
+/* Re-send LAYER_CONSOLE only when resource display/tooltip state changed. */
+void G_RefreshResourceBar(edict_t *ent) {
+    player_t *ps;
+    int32_t gold, lumber, food_u, food_c, gold_rate, lumber_rate;
+
+    if (!ent || !ent->client) return;
+    ps          = &ent->client->ps;
+    gold        = (int32_t)ps->stats[PLAYERSTATE_RESOURCE_GOLD];
+    lumber      = (int32_t)ps->stats[PLAYERSTATE_RESOURCE_LUMBER];
+    food_u      = (int32_t)ps->stats[PLAYERSTATE_RESOURCE_FOOD_USED];
+    food_c      = G_GetEffectiveFoodCap(ent->client);
+    gold_rate   = (int32_t)ps->stats[PLAYERSTATE_GOLD_UPKEEP_RATE];
+    lumber_rate = (int32_t)ps->stats[PLAYERSTATE_LUMBER_UPKEEP_RATE];
+
+    if (ent->client->quest_until <= level.time) ent->client->quest_until = 0;
+    if (ent->client->quest_until == ent->client->resourcebar.quest_until &&
+        ent->client->canvas == ent->client->resourcebar.canvas &&
+        gold        == ent->client->resourcebar.gold        &&
+        lumber      == ent->client->resourcebar.lumber      &&
+        food_u      == ent->client->resourcebar.food_used   &&
+        food_c      == ent->client->resourcebar.food_cap    &&
+        gold_rate   == ent->client->resourcebar.gold_rate   &&
+        lumber_rate == ent->client->resourcebar.lumber_rate)
+        return;
+
+    /* Allied Team Resources reads this player's economy; refresh eligible
+     * viewers on real changes, not on every frame.  Computer and departed
+     * owners have no console to redraw, but their cached values still feed
+     * the panels of allies holding advanced control. */
+    G_MarkMultiboardPlayerDirty(ps->number);
+
+    if (ent->client->connected) {
+        UI_WriteStart(LAYER_CONSOLE);
+        UI_WriteConsoleBackdrop(ent->client, food_u, food_c);
+        UI_WriteMinimapFrame();
+        UI_WriteEnd(ent);
+    }
+
+    ent->client->resourcebar.quest_until = ent->client->quest_until;
+    ent->client->resourcebar.canvas      = ent->client->canvas;
+    ent->client->resourcebar.gold        = gold;
+    ent->client->resourcebar.lumber      = lumber;
+    ent->client->resourcebar.food_used   = food_u;
+    ent->client->resourcebar.food_cap    = food_c;
+    ent->client->resourcebar.gold_rate   = gold_rate;
+    ent->client->resourcebar.lumber_rate = lumber_rate;
+}
+
+/* Reserved player edicts are connected clients, not inuse world units. */
+/* Every player slot, not only connected clients: the compare pass is what
+ * notices a computer ally's spending for Team Resources. */
+void G_UpdateClientResourceBars(void) {
+    FOR_LOOP(i, game.max_clients)
+        G_RefreshResourceBar(G_GetPlayerEntityByNumber(game.clients[i].ps.number));
+}

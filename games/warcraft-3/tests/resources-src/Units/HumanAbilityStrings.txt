@@ -1,0 +1,15 @@
+[Ahar]
+Tip=Gather
+Ubertip=Gather resources from a Gold Mine or tree.
+Untip=Return Resources
+Unubertip=Return carried resources to a compatible drop-off.
+
+[Arep]
+Tip=Repair
+Ubertip=Repairs a damaged structure.
+
+[Amic]
+Tip=Call to Arms
+Ubertip=Order nearby Peasants to become Militia.
+Untip=Back to Work
+Unubertip=Order nearby Militia to return to work.

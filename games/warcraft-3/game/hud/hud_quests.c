@@ -1,0 +1,428 @@
+/*
+ * hud_quests.c — Quest dialog UI.
+ *
+ * Draws the quest log overlay: backdrop, title, clickable quest list,
+ * per-quest description/objective detail, and close button on
+ * LAYER_QUESTDIALOG.
+ */
+
+#include "hud_local.h"
+#include "hud_utils.h"
+
+#define QUEST_FRAME_ROWS_SCROLL "FRAME_ROWS"
+#define QUEST_VISIBLE_ROWS 3
+#define QUEST_SCROLLBAR_WIDTH 0.015f
+#define QUEST_LIST_WIDTH_REDUCTION 0.025f
+#define QUEST_TITLE_RAISE -0.005f
+
+static bool QuestIsListVisible(quest_t const *quest);
+
+static void QuestPrepareScrollableList(frameDef_t *container, cstring_t scrollbar_name) {
+    frameDef_t *scrollbar;
+    if (!container || !scrollbar_name) return;
+    container->Type = FT_LISTBOX;
+    container->ListBox.Border = 0.0f;
+    strlcpy(container->ListBox.FetchCommand, QUEST_FRAME_ROWS_SCROLL,
+            sizeof(container->ListBox.FetchCommand));
+    strlcpy(container->ListBox.ScrollBar, scrollbar_name,
+            sizeof(container->ListBox.ScrollBar));
+    scrollbar = UI_FindFrameNear(container, scrollbar_name);
+    if (!scrollbar) {
+        scrollbar = UI_Spawn(FT_SCROLLBAR, container);
+        if (!scrollbar) return;
+        strlcpy(scrollbar->Name, scrollbar_name, sizeof(scrollbar->Name));
+        scrollbar->Slider.MinValue = 0.0f;
+        scrollbar->Slider.MaxValue = 1.0f;
+        scrollbar->Width = QUEST_SCROLLBAR_WIDTH;
+        UI_SetPoint(scrollbar, FRAMEPOINT_TOPRIGHT, container, FRAMEPOINT_TOPRIGHT, 0.0f, 0.0f);
+        UI_SetPoint(scrollbar, FRAMEPOINT_BOTTOMRIGHT, container, FRAMEPOINT_BOTTOMRIGHT, 0.0f, 0.0f);
+    }
+    if (hud.quest_row && hud.quest_row->Height > 0.0f) {
+        container->Height = hud.quest_row->Height * QUEST_VISIBLE_ROWS;
+        container->Font.Size = hud.quest_row->Height / 1.33f;
+    }
+    if (container == hud.quest.QuestMainContainer)
+        hud.quest_main_list_width = container->Width;
+    else if (container == hud.quest.QuestOptionalContainer)
+        hud.quest_optional_list_width = container->Width;
+}
+
+static uint32_t QuestCountListRows(bool required) {
+    uint32_t rows = 0;
+    FOR_EACH_QUEST(quest) {
+        if (QuestIsListVisible(quest) && quest->required == required) rows++;
+    }
+    return rows;
+}
+
+static void QuestUpdateListLayout(frameDef_t *container, bool required, uint32_t rows) {
+    frameDef_t *scrollbar;
+    float width;
+    if (!container) return;
+
+    width = required ? hud.quest_main_list_width : hud.quest_optional_list_width;
+    if (rows > QUEST_VISIBLE_ROWS) width -= QUEST_LIST_WIDTH_REDUCTION;
+    if (width > 0.0f) container->Width = width;
+
+    scrollbar = UI_FindFrameNear(container, container->ListBox.ScrollBar);
+    if (scrollbar) UI_SetHidden(scrollbar, rows <= QUEST_VISIBLE_ROWS);
+}
+
+/* QuestDialog.fdf owns both repeated row schemas in addition to the dialog root. */
+void UI_LoadHudQuests(void) {
+    if (hud.quest.QuestDialog) return;
+    if (!QuestDialog_Load(&hud.quest)) return;
+    UI_CenterFrame(hud.quest.QuestDialog);
+    hud.quest_row = UI_FindFrame("QuestListItem");
+    hud.quest_item = UI_FindFrame("QuestItemListItem");
+    QuestPrepareScrollableList(hud.quest.QuestMainContainer, "QuestMainScrollBar");
+    QuestPrepareScrollableList(hud.quest.QuestOptionalContainer, "QuestOptionalScrollBar");
+    /* The authored optional list follows the main container's right edge.
+     * Since the main viewport is narrowed to make room for its scrollbar,
+     * anchor the optional list to its heading so its icon column stays aligned. */
+    if (hud.quest.QuestOptionalContainer && hud.quest.QuestOptionalTitle) {
+        memset(&hud.quest.QuestOptionalContainer->Points, 0,
+               sizeof(hud.quest.QuestOptionalContainer->Points));
+        hud.quest.QuestOptionalContainer->AnyPointsSet = true;
+        UI_SetPoint(hud.quest.QuestOptionalContainer, FRAMEPOINT_TOPLEFT,
+                    hud.quest.QuestOptionalTitle, FRAMEPOINT_BOTTOMLEFT, -0.003f, -0.002f);
+    }
+    if (!hud.quest_row) BZ_FDF_REPORT_MISSING("QuestListItem");
+    if (!hud.quest_item) BZ_FDF_REPORT_MISSING("QuestItemListItem");
+}
+
+
+static bool QuestDebugEnabled(void) {
+    return atoi(gi.CvarString("wc3_quest_debug", "0")) != 0;
+}
+
+static void QuestDebugQuoted(string_t out, uint32_t out_size, cstring_t text) {
+    uint32_t used = 0;
+
+    if (!out || !out_size) return;
+    if (!text) text = "";
+    for (; *text && used + 1 < out_size; text++) {
+        cstring_t escaped = NULL;
+        switch (*text) {
+            case '\n': escaped = "\\n"; break;
+            case '\r': escaped = "\\r"; break;
+            case '\t': escaped = "\\t"; break;
+            case '"': escaped = "\\\""; break;
+            case '\\': escaped = "\\\\"; break;
+            default: break;
+        }
+        if (escaped) {
+            while (*escaped && used + 1 < out_size) out[used++] = *escaped++;
+        } else {
+            out[used++] = *text;
+        }
+    }
+    out[used] = '\0';
+}
+
+static void QuestDebugText(uint32_t quest_index, cstring_t field, cstring_t raw, cstring_t resolved) {
+    char raw_text[768], resolved_text[768];
+
+    if (!QuestDebugEnabled()) return;
+    QuestDebugQuoted(raw_text, sizeof(raw_text), raw);
+    QuestDebugQuoted(resolved_text, sizeof(resolved_text), resolved);
+    fprintf(stderr, "WC3_QUEST_TEXT quest=%u field=%s raw=\"%s\" resolved=\"%s\"\n",
+            (unsigned)quest_index, field ? field : "?", raw_text, resolved_text);
+}
+
+/* Retail lists enabled undiscovered quests as placeholders; only discovered
+ * quests can be selected into the detail pane. */
+static bool QuestIsListVisible(quest_t const *quest) {
+    return quest && quest->enabled;
+}
+
+static bool QuestIsVisibleMember(quest_t const *quest) {
+    if (!quest) return false;
+    FOR_EACH_QUEST(q) {
+        if (q == quest) return QuestIsVisible(q);
+    }
+    return false;
+}
+
+uint32_t UI_QuestIndex(quest_t const *quest) {
+    uint32_t index = 0;
+    FOR_EACH_QUEST(q) {
+        if (q == quest) return index;
+        index++;
+    }
+    return index;
+}
+
+
+static void ResetRowsForParent(frameDef_t * *rows, uint32_t *count, frameDef_t *parent) {
+    if (!rows || !count || !*count) return;
+    if (!rows[0] || !rows[0]->inuse || rows[0]->Parent != parent) {
+        memset(rows, 0, sizeof(frameDef_t *) * MAX_UI_CLASSES);
+        *count = 0;
+    }
+}
+
+static frameDef_t *QuestRowAt(frameDef_t * *rows, uint32_t *count, frameDef_t *container, uint32_t row,
+                             frameDef_t const *row_template) {
+    frameDef_t *frame;
+
+    if (!rows || !count || !container || !row_template || row >= MAX_UI_CLASSES) return NULL;
+    frame = rows[row];
+    if (!frame || !frame->inuse || frame->Parent != container) {
+        frame = UI_CloneStackedRow(row_template, container, row);
+        rows[row] = frame;
+    } else {
+        UI_SetPoint(frame, FRAMEPOINT_TOPLEFT, container, FRAMEPOINT_TOPLEFT,
+                    0.0f, -(float)row * frame->Height);
+    }
+    if (!frame) return NULL;
+    /* QuestListItemButton is anchored to the row's trailing edge; give the
+     * row the authored list width so that anchor resolves to the container. */
+    frame->Width = container->Width;
+    UI_SetHidden(frame, false);
+    if (*count <= row) *count = row + 1;
+    return frame;
+}
+
+static void HideUnusedRows(frameDef_t * *rows, uint32_t count, uint32_t used) {
+    for (uint32_t i = used; i < count; i++) {
+        if (rows[i] && rows[i]->inuse) UI_SetHidden(rows[i], true);
+    }
+}
+
+static void PopulateQuestList(frameDef_t *container, bool required, quest_t const *selected) {
+    frameDef_t * *rows = required ? hud.required_rows : hud.optional_rows;
+    uint32_t *row_count = required ? &hud.required_row_count : &hud.optional_row_count;
+    uint32_t row = 0, total_rows;
+
+    if (!container) return;
+    total_rows = QuestCountListRows(required);
+    QuestUpdateListLayout(container, required, total_rows);
+    ResetRowsForParent(rows, row_count, container);
+    for (uint32_t completed_pass = 0; completed_pass < 2; completed_pass++) {
+      FOR_EACH_QUEST(quest) {
+        char text[256];
+        char command[64];
+        frameDef_t *row_frame, *button, *title, *icon_container;
+        frameDef_t *template_button, *template_title;
+        frameDef_t *selected_highlight, *completed_highlight, *failed_highlight, *complete;
+        cstring_t title_text, icon_path;
+        uint32_t quest_index;
+        bool authored_selection;
+
+        if (!QuestIsListVisible(quest) || quest->required != required ||
+            quest->completed != (completed_pass != 0)) continue;
+
+        row_frame = QuestRowAt(rows, row_count, container, row, hud.quest_row);
+        button = row_frame ? UI_FindChildFrame(row_frame, "QuestListItemButton") : NULL;
+        title = row_frame ? UI_FindChildFrame(row_frame, "QuestListItemTitle") : NULL;
+        template_button = UI_FindChildFrame(hud.quest_row, "QuestListItemButton");
+        template_title = UI_FindChildFrame(hud.quest_row, "QuestListItemTitle");
+        if (!row_frame) {
+            fprintf(stderr, "WC3 HUD: failed to clone QuestListItem row %u\n", (unsigned)row);
+            return;
+        }
+        if (!button || !title) {
+            BZ_FDF_REPORT_MISSING(!button ? "QuestListItemButton" : "QuestListItemTitle");
+            return;
+        }
+
+        selected_highlight = UI_FindChildFrame(row_frame, "QuestListItemSelectedHighlight");
+        completed_highlight = UI_FindChildFrame(row_frame, "QuestListItemCompletedHighlight");
+        failed_highlight = UI_FindChildFrame(row_frame, "QuestListItemFailedHighlight");
+        complete = UI_FindChildFrame(row_frame, "QuestListItemComplete");
+        icon_container = UI_FindChildFrame(row_frame, "QuestListItemIconContainer");
+        authored_selection = selected_highlight != NULL;
+
+        /* The retail selected highlight is authored with SetAllPoints on the
+         * clickable quest button (QuestListItemButton).  Reassert that relation
+         * after cloning so the selected art covers exactly the button area.
+         * The button is anchor-sized (TOPLEFT→icon TOPRIGHT, BOTTOMRIGHT→row
+         * BOTTOMRIGHT) so it does not include the icon container. */
+        if (selected_highlight) {
+            memset(&selected_highlight->Points, 0, sizeof(selected_highlight->Points));
+            selected_highlight->AnyPointsSet = true;
+            UI_SetPoint(selected_highlight, FRAMEPOINT_TOPLEFT,
+                        button, FRAMEPOINT_TOPLEFT, 0.0f, 0.0f);
+            UI_SetPoint(selected_highlight, FRAMEPOINT_BOTTOMRIGHT,
+                        button, FRAMEPOINT_BOTTOMRIGHT, 0.0f, 0.0f);
+        }
+
+        UI_SetHidden(selected_highlight, quest != selected);
+        UI_SetHidden(failed_highlight, !quest->failed);
+        UI_SetHidden(completed_highlight, !quest->completed || quest->failed);
+        UI_SetHidden(complete, !quest->completed || quest->failed);
+        if (complete && quest->completed && !quest->failed)
+            UI_SetText(complete, "(%s)", UI_GetString("QUESTCOMPLETED"));
+        if (complete) complete->Font.Color = MAKE(color32_t, 252, 210, 18, 255);
+
+        quest_index = UI_QuestIndex(quest);
+        title_text = quest->discovered ? UI_LevelStringSafe(quest->title) : UI_GetString("UNDISCOVERED_QUEST");
+        icon_path = quest->discovered && quest->iconPath && *quest->iconPath ? G_LevelString(quest->iconPath) : NULL;
+        snprintf(text, sizeof(text), "%s%s", !authored_selection && quest == selected ? "> " : "", title_text);
+        snprintf(command, sizeof(command), "quest %u", (unsigned)quest_index);
+
+        UI_SetText(title, "%s", text);
+        if (template_title)
+            title->Font.Justification.Offset.y = template_title->Font.Justification.Offset.y + QUEST_TITLE_RAISE;
+        /* Reuse the actual disabled control backdrop used by the F10 Help
+         * button. Choosing it as the normal art preserves the button's click
+         * handling while giving completed quests the retail gray background. */
+        if (template_button) {
+            strlcpy(button->Control.Backdrop.Normal,
+                    quest->completed && !quest->failed && template_button->Control.Backdrop.Disabled[0]
+                        ? template_button->Control.Backdrop.Disabled
+                        : template_button->Control.Backdrop.Normal,
+                    sizeof(button->Control.Backdrop.Normal));
+            if (quest->completed && !quest->failed) {
+                frameDef_t *disabled_backdrop = UI_FindChildFrame(button, "ButtonDisabledBackdropTemplate");
+                /* QuestButtonDisabledBackdropTemplate uses the same 0.128
+                 * texture scale as the normal quest art but omits the tile
+                 * flag. Enable tiling so wider quest buttons retain its grain. */
+                if (disabled_backdrop && disabled_backdrop->Type == FT_BACKDROP)
+                    disabled_backdrop->Backdrop.TileBackground = true;
+            }
+        }
+        if (icon_container && icon_container->Type == FT_BACKDROP) {
+            icon_container->Backdrop.Background = icon_path && *icon_path
+                ? UI_LoadTexture(icon_path, false) : UI_LoadTexture("UndiscoveredQuestIcon", true);
+        }
+        QuestDebugText(quest_index, "list_title", quest->title, title_text);
+        if (QuestDebugEnabled()) {
+            char icon_raw[512], icon_resolved[512];
+            QuestDebugQuoted(icon_raw, sizeof(icon_raw), quest->iconPath);
+            QuestDebugQuoted(icon_resolved, sizeof(icon_resolved), icon_path);
+            fprintf(stderr,
+                    "WC3_QUEST_STATE quest=%u required=%d discovered=%d enabled=%d completed=%d failed=%d "
+                    "iconRaw=\"%s\" iconResolved=\"%s\" iconFrame=%s iconImage=%u\n",
+                    (unsigned)quest_index, quest->required, quest->discovered, quest->enabled,
+                    quest->completed, quest->failed, icon_raw, icon_resolved,
+                    icon_container ? "yes" : "no",
+                    (unsigned)(icon_container && icon_container->Type == FT_BACKDROP
+                        ? icon_container->Backdrop.Background : 0));
+        }
+        UI_SetOnClick(button, "%s", command);
+        title->Font.Color = quest->completed ? COLOR32_WHITE :
+            (!authored_selection && quest == selected ? MAKE(color32_t, 252, 210, 18, 255) : COLOR32_WHITE);
+        row++;
+      }
+    }
+    HideUnusedRows(rows, *row_count, row);
+}
+
+static void PopulateQuestItems(frameDef_t *container, quest_t const *quest) {
+    uint32_t row = 0;
+
+    if (!container) return;
+    ResetRowsForParent(hud.quest_item_rows, &hud.quest_item_row_count, container);
+    if (!quest) { HideUnusedRows(hud.quest_item_rows, hud.quest_item_row_count, 0); return; }
+    FOR_EACH_QUESTITEM(quest, item) {
+        char text[512];
+        frameDef_t *item_frame, *title;
+
+        snprintf(text, sizeof(text), "%s %s",
+                 item->completed ? "- |cff80ff80" : "-",
+                 UI_LevelStringSafe(item->description));
+
+        item_frame = QuestRowAt(hud.quest_item_rows, &hud.quest_item_row_count,
+                                container, row, hud.quest_item);
+        title = item_frame ? UI_FindChildFrame(item_frame, "QuestItemListItemTitle") : NULL;
+        if (!item_frame) {
+            fprintf(stderr, "WC3 HUD: failed to clone QuestItemListItem row %u\n", (unsigned)row);
+            return;
+        }
+        if (!title) {
+            BZ_FDF_REPORT_MISSING("QuestItemListItemTitle");
+            return;
+        }
+        UI_SetText(title, "%s", text);
+        title->Font.Color = COLOR32_WHITE;
+        if (QuestDebugEnabled()) {
+            char field[64];
+            snprintf(field, sizeof(field), "item[%u]%s", (unsigned)row, item->completed ? ".completed" : "");
+            QuestDebugText(UI_QuestIndex(quest), field, item->description, UI_LevelStringSafe(item->description));
+        }
+        row++;
+    }
+    HideUnusedRows(hud.quest_item_rows, hud.quest_item_row_count, row);
+}
+
+void UI_ShowQuest(edict_t *ent, quest_t const *quest) {
+    cstring_t title, description, subtitle;
+
+    if (!ent || !ent->client || (quest && !QuestIsVisibleMember(quest))) return;
+    UI_SetCurrentClient(ent->client);
+    if (!hud.quest.QuestDialog || !hud.quest_row || !hud.quest_item) {
+        UI_SetCurrentClient(NULL);
+        return;
+    }
+
+    title = quest ? UI_LevelStringSafe(quest->title) : " ";
+    description = quest ? UI_LevelStringSafe(quest->description) : " ";
+    UI_SetText(hud.quest.QuestTitleValue, "%s", title);
+    hud.quest.QuestTitleValue->Font.Color = MAKE(color32_t, 252, 210, 18, 255);
+    UI_SetTextPointer(hud.quest.QuestDisplay, description);
+    if (hud.quest.QuestDetailsTitle)
+        UI_SetText(hud.quest.QuestDetailsTitle, "%s", quest ? UI_GetString("QUESTDESCRIPTION") : " ");
+
+    subtitle = level.mapinfo ? UI_LevelStringSafe(level.mapinfo->loadingScreenTitle) : NULL;
+    if (subtitle && *subtitle) {
+        UI_SetText(hud.quest.QuestSubtitleValue, "%s", subtitle);
+    } else {
+        UI_SetText(hud.quest.QuestSubtitleValue, " ");
+        subtitle = " ";
+    }
+
+    if (quest) {
+        QuestDebugText(UI_QuestIndex(quest), "title", quest->title, title);
+        QuestDebugText(UI_QuestIndex(quest), "description", quest->description, description);
+    }
+    if (quest) QuestDebugText(UI_QuestIndex(quest), "subtitle",
+                   level.mapinfo ? level.mapinfo->loadingScreenTitle : NULL, subtitle);
+    if (quest && QuestDebugEnabled()) {
+        QuestDebugText(UI_QuestIndex(quest), "required_heading",
+                       hud.quest.QuestMainTitle ? hud.quest.QuestMainTitle->Text : NULL,
+                       hud.quest.QuestMainTitle ? hud.quest.QuestMainTitle->Text : NULL);
+        QuestDebugText(UI_QuestIndex(quest), "optional_heading",
+                       hud.quest.QuestOptionalTitle ? hud.quest.QuestOptionalTitle->Text : NULL,
+                       hud.quest.QuestOptionalTitle ? hud.quest.QuestOptionalTitle->Text : NULL);
+        QuestDebugText(UI_QuestIndex(quest), "details_heading",
+                       hud.quest.QuestDetailsTitle ? hud.quest.QuestDetailsTitle->Text : NULL,
+                       hud.quest.QuestDetailsTitle ? hud.quest.QuestDetailsTitle->Text : NULL);
+        QuestDebugText(UI_QuestIndex(quest), "done_button",
+                       hud.quest.QuestAcceptButtonText ? hud.quest.QuestAcceptButtonText->Text : NULL,
+                       hud.quest.QuestAcceptButtonText ? hud.quest.QuestAcceptButtonText->Text : NULL);
+    }
+
+    /* Done is presentation-only: let the client close this window without a round trip. */
+    UI_SetOnClick(hud.quest.QuestAcceptButton, UI_WINDOW_CLOSE_NOTIFY_ACTION);
+
+    PopulateQuestList(hud.quest.QuestMainContainer, true, quest);
+    PopulateQuestList(hud.quest.QuestOptionalContainer, false, quest);
+    PopulateQuestItems(hud.quest.QuestItemListContainer, quest);
+
+    if (ent->client->connected)
+        UI_WriteWindow(ent, hud.quest.QuestDialog, &MAKE(uiWindowDef_t,
+            .id = BZ_WC3_WINDOW_QUEST, .class_id = BZ_WC3_WINDOW_QUEST,
+            .flags = UI_WINDOW_MOVABLE | UI_WINDOW_MODAL | UI_WINDOW_UNIQUE));
+    UI_SetCurrentClient(NULL);
+}
+
+void UI_ShowQuests(edict_t *ent) {
+    quest_t const *quest = NULL, *placeholder = NULL;
+
+    if (!ent || !ent->client) return;
+    ent->client->quest_until = 0;
+    FOR_EACH_QUEST(q) {
+        if (!placeholder && q->enabled) placeholder = q;
+        if (q->required && QuestIsVisible(q)) { quest = q; break; }
+    }
+    if (!quest) {
+        FOR_EACH_QUEST(q) {
+            if (QuestIsVisible(q)) { quest = q; break; }
+        }
+    }
+    if (quest) {
+        UI_ShowQuest(ent, quest);
+    } else if (placeholder) UI_ShowQuest(ent, NULL);
+}

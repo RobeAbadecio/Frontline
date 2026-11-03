@@ -1,0 +1,297 @@
+#ifdef BZ_TESTS
+/*
+ * A walking Hero must restore origin, learned skills, runtime abilities, and
+ * inventory through WriteGame/ReadGame. The live campaign sweep is a local
+ * diagnostic; this is the CI contract that does not need retail maps.
+ */
+#include <string.h>
+#include "shared/test.h"
+#include "../g_local.h"
+
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void setup_test_world(void);
+void reset_entities(void);
+void setup_test_pathmap(uint32_t width, uint32_t height, uint8_t const *cells);
+void CM_SetupTestWorldBounds(box2_t const *bounds);
+void CM_ProcessPathJobs(uint32_t work_budget);
+
+static edict_t *make_walk_hero(float x, float y) {
+    edict_t *hero = alloc_test_unit(MAKEFOURCC('H', 'p', 'a', 'l'), x, y);
+    hero->s.player = 0;
+    hero->svflags |= SVF_MONSTER;
+    hero->movetype = MOVETYPE_STEP;
+    hero->collision = 0.0f;
+    hero->unitinfo.MoveSpeed = 270.0f;
+    hero->stand = unit_stand;
+    hero->birth = unit_birth;
+    hero->die = unit_die;
+    hero->think = monster_think;
+    unit_stand(hero);
+    gi.LinkEntity(hero);
+    return hero;
+}
+
+static edict_t *give_item(edict_t *hero, uint32_t class_id, uint32_t slot, uint32_t charges) {
+    edict_t *item = alloc_test_unit(class_id, hero->s.origin2.x + 32.0f, hero->s.origin2.y);
+    item->targtype = TARG_ITEM;
+    if (!item->item) item->item = G_AllocItem();
+    assert(item->item);
+    item->item->in_world = true;
+    item->item->inventory_slot = -1;
+    T_ASSERT(G_AddItemToSlot(hero, item, slot));
+    G_SetItemCharges(item, charges);
+    return item;
+}
+
+static void step_walk(edict_t *hero, uint32_t frames) {
+    uint32_t i;
+    for (i = 0; i < frames; i++) {
+        if (!hero->currentmove || !hero->currentmove->think) break;
+        hero->currentmove->think(hero);
+        level.time += FRAMETIME;
+    }
+}
+
+static cstring_t hero_audit_cvar(cstring_t name, cstring_t fallback) {
+    return !strcmp(name, "wc3_hero_saveload_audit") ? "1" : fallback;
+}
+
+static void step_hero_audit(uint32_t frames) {
+    uint32_t i;
+    for (i = 0; i < frames; i++) {
+        G_RunEntities();
+        CM_ProcessPathJobs(65536);
+        G_HeroSaveLoadAuditFrame();
+        level.time += FRAMETIME;
+    }
+}
+
+static void arm_hero_audit(cstring_t map) {
+    strlcpy(level.map_path, map, sizeof(level.map_path));
+    level.started = true;
+    ((mapInfo_t *)level.mapinfo)->fileFormat = 24;
+    ((mapInfo_t *)level.mapinfo)->players[0].used = 1;
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+}
+
+TEST(wc3_save, walking_hero_round_trips_abilities_inventory_origin) {
+    cstring_t path = Test_TempPath("wc3-hero-saveload.bin");
+    edict_t *hero, *item0, *item1;
+    vec3_t saved_origin;
+    uint32_t saved_holy, saved_shield, saved_added, saved_item0, saved_item1, saved_charges0, saved_charges1, saved_drop_id, index;
+    char saved_move[32], snap[512];
+    vec2_t dest = { 80.0f, 0.0f };
+
+    reset_entities();
+    setup_test_world();
+    ((mapInfo_t *)level.mapinfo)->fileFormat = 24;
+    hero = make_walk_hero(0.0f, 0.0f);
+    T_ASSERT(G_UnitIsHero(hero));
+    T_ASSERT(G_InventoryCapacity(hero) >= 2);
+    unit_learnability(hero, MAKEFOURCC('A', 'H', 'h', 'b'));
+    unit_learnability(hero, MAKEFOURCC('A', 'H', 'd', 's'));
+    hero->unit_state->overrides.added[0] = MAKEFOURCC('A', 'C', 'n', 'r');
+    ARRAY_COUNT(hero->unit_state->overrides.added) = 1;
+    item0 = give_item(hero, MAKEFOURCC('s', 'p', 'r', 'o'), 0, 3);
+    item1 = give_item(hero, MAKEFOURCC('r', 'a', 't', 'f'), 1, 1);
+    T_ASSERT(unit_issueorder(hero, "move", &dest));
+    T_NOT_NULL(hero->currentmove);
+    T_STREQ(hero->currentmove->animation, "walk");
+    /* MoveSpeed 270 → ~27 units/frame; two steps stay mid-walk on an 80-unit order. */
+    step_walk(hero, 2);
+    T_ASSERT(hero->s.origin.x > 1.0f);
+    T_STREQ(hero->currentmove->animation, "walk");
+    saved_origin = hero->s.origin;
+    saved_holy = hero->unit_state->ranks[0].code;
+    saved_shield = hero->unit_state->ranks[1].code;
+    saved_added = hero->unit_state->overrides.added[0];
+    saved_item0 = item0->class_id;
+    saved_item1 = item1->class_id;
+    saved_charges0 = item0->item->charges;
+    saved_charges1 = item1->item->charges;
+    if (!item0->item) item0->item = G_AllocItem();
+    assert(item0->item);
+    item0->item->drop_id = saved_drop_id = MAKEFOURCC('h','f','o','o');
+    strlcpy(saved_move, hero->currentmove->animation, sizeof(saved_move));
+    index = hero->s.number;
+    G_FormatHeroSaveSnap(hero, snap, sizeof(snap));
+    T_ASSERT(strstr(snap, "AHhb:1") != NULL);
+    T_ASSERT(strstr(snap, "spro:3") != NULL);
+    T_ASSERT(WriteGame(path));
+    hero->s.origin = (vec3_t){ 0 };
+    hero->unit_state->ranks[0].code = hero->unit_state->ranks[1].code = 0;
+    hero->unit_state->ranks[0].level = hero->unit_state->ranks[1].level = 0;
+    ARRAY_COUNT(hero->unit_state->overrides.added) = 0;
+    hero->inventory->slots[0] = NULL; hero->inventory->slots[1] = NULL;
+    T_ASSERT(ReadGame(path));
+    hero = g_edicts + index;
+    T_FEQ(hero->s.origin.x, saved_origin.x, 0.01f);
+    T_FEQ(hero->s.origin.y, saved_origin.y, 0.01f);
+    T_EQ(hero->unit_state->ranks[0].code, saved_holy);
+    T_EQ(hero->unit_state->ranks[0].level, 1);
+    T_EQ(hero->unit_state->ranks[1].code, saved_shield);
+    T_EQ(hero->unit_state->ranks[1].level, 1);
+    T_EQ(ARRAY_COUNT(hero->unit_state->overrides.added), 1);
+    T_EQ(hero->unit_state->overrides.added[0], saved_added);
+    T_NOT_NULL(G_InventoryItem(hero, 0));
+    T_NOT_NULL(G_InventoryItem(hero, 1));
+    T_EQ(G_InventoryItem(hero, 0)->class_id, saved_item0);
+    T_EQ(G_InventoryItem(hero, 1)->class_id, saved_item1);
+    T_EQ(G_InventoryItem(hero, 0)->item->charges, saved_charges0);
+    T_EQ(G_InventoryItem(hero, 1)->item->charges, saved_charges1);
+    T_EQ(G_InventoryItem(hero, 0)->item->drop_id, saved_drop_id);
+    T_NOT_NULL(hero->currentmove);
+    T_STREQ(hero->currentmove->animation, saved_move);
+    T_EQ(hero->think, monster_think);
+    {
+        float x = hero->s.origin.x;
+        step_walk(hero, 1);
+        T_ASSERT(hero->s.origin.x > x);
+    }
+    remove(path);
+}
+
+TEST(wc3_save, hero_dump_formats_empty_hero) {
+    char snap[64];
+    G_FormatHeroSaveSnap(NULL, snap, sizeof(snap));
+    T_STREQ(snap, "unit=none");
+}
+
+/* Hidden cinematic stand-ins (HumanX06Finale N000) must not lock the walker. */
+TEST(wc3_save, hero_audit_skips_hidden_first_hero) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    edict_t *hidden, *visible;
+    float hidden_x, visible_x;
+    FILE *save;
+
+    reset_entities();
+    setup_test_world();
+    hidden = make_walk_hero(0.0f, 0.0f);
+    hidden->s.renderfx |= RF_HIDDEN;
+    visible = make_walk_hero(200.0f, 0.0f);
+    hidden_x = hidden->s.origin.x;
+    visible_x = visible->s.origin.x;
+    arm_hero_audit("Maps\\Campaign\\HeroAuditHidden.w3m");
+    gi.CvarString = hero_audit_cvar;
+    step_hero_audit(12);
+    gi.CvarString = old_cvar;
+    T_FEQ(hidden->s.origin.x, hidden_x, 0.01f);
+    T_ASSERT(visible->s.origin.x > visible_x + 1.0f);
+    /* The audit reloads its fixed slot name mid-test. Through the shared per-user
+     * saves directory a parallel shard's hero_audit_* save replaced it between
+     * WriteGame and ReadGame, restoring that process's walking Hero over `hidden`. */
+    save = fopen(Test_TempPath("hero-saveload-audit"), "rb");
+    T_NOT_NULL(save);
+    if (save) fclose(save);
+}
+
+/* PauseAllUnitsBJ during intro; walk only after cleanup unpauses. */
+TEST(wc3_save, hero_audit_waits_while_paused_then_walks) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    edict_t *hero;
+    float start_x;
+
+    reset_entities();
+    setup_test_world();
+    hero = make_walk_hero(0.0f, 0.0f);
+    G_SetUnitFlag(hero, UNIT_FLAG_PAUSED, true);
+    start_x = hero->s.origin.x;
+    arm_hero_audit("Maps\\Campaign\\HeroAuditPaused.w3m");
+    gi.CvarString = hero_audit_cvar;
+    step_hero_audit(5);
+    T_FEQ(hero->s.origin.x, start_x, 0.01f);
+    G_SetUnitFlag(hero, UNIT_FLAG_PAUSED, false);
+    step_hero_audit(12);
+    gi.CvarString = old_cvar;
+    T_ASSERT(hero->s.origin.x > start_x + 1.0f);
+}
+
+/* CinematicModeBJ(true) holds the walker until gameplay UI returns. */
+TEST(wc3_save, hero_audit_waits_while_cinematic_then_walks) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    edict_t *hero;
+    float start_x;
+
+    reset_entities();
+    setup_test_world();
+    hero = make_walk_hero(0.0f, 0.0f);
+    game.clients[0].ps.client_ui_state = CLIENT_UI_CINEMATIC;
+    start_x = hero->s.origin.x;
+    arm_hero_audit("Maps\\Campaign\\HeroAuditCinematic.w3m");
+    gi.CvarString = hero_audit_cvar;
+    step_hero_audit(5);
+    T_FEQ(hero->s.origin.x, start_x, 0.01f);
+    game.clients[0].ps.client_ui_state = CLIENT_UI_GAME;
+    step_hero_audit(12);
+    gi.CvarString = old_cvar;
+    T_ASSERT(hero->s.origin.x > start_x + 1.0f);
+}
+
+/* HumanX06Finale stays cinematic; after the wait budget the visible Hero still walks. */
+TEST(wc3_save, hero_audit_walks_after_wait_timeout_while_cinematic) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    edict_t *hero;
+    float start_x;
+
+    reset_entities();
+    setup_test_world();
+    hero = make_walk_hero(0.0f, 0.0f);
+    game.clients[0].ps.client_ui_state = CLIENT_UI_CINEMATIC;
+    start_x = hero->s.origin.x;
+    arm_hero_audit("Maps\\Campaign\\HeroAuditFinale.w3m");
+    gi.CvarString = hero_audit_cvar;
+    step_hero_audit(5);
+    T_FEQ(hero->s.origin.x, start_x, 0.01f);
+    step_hero_audit(160);
+    gi.CvarString = old_cvar;
+    T_ASSERT(hero->s.origin.x > start_x + 1.0f);
+}
+
+/* +80 X snaps home on a blocked cell; the walker must retry another open axis. */
+TEST(wc3_save, hero_audit_retries_when_80_unit_dest_snaps_home) {
+    cstring_t (*old_cvar)(cstring_t, cstring_t) = gi.CvarString;
+    uint8_t cells[64 * 64];
+    edict_t *hero;
+    float start_x, start_y;
+
+    reset_entities();
+    setup_test_world();
+    memset(cells, 0, sizeof(cells));
+    FOR_LOOP(y, 64)
+        FOR_LOOP(x, 64)
+            if (x >= 33 && x <= 39) cells[y * 64 + x] = CM_PATHING_UNWALKABLE;
+    setup_test_pathmap(64, 64, cells);
+    CM_SetupTestWorldBounds(&MAKE(box2_t, .min = {-1024.0f, -1024.0f}, .max = {1024.0f, 1024.0f}));
+    hero = make_walk_hero(16.0f, 16.0f);
+    start_x = hero->s.origin.x;
+    start_y = hero->s.origin.y;
+    arm_hero_audit("Maps\\Campaign\\HeroAuditSnap.w3m");
+    gi.CvarString = hero_audit_cvar;
+    step_hero_audit(16);
+    gi.CvarString = old_cvar;
+    T_ASSERT(hero->s.origin.x < start_x - 1.0f || hero->s.origin.y > start_y + 1.0f || hero->s.origin.y < start_y - 1.0f);
+}
+
+TEST(wc3_cursor, save_discards_transient_held_item) {
+    cstring_t path = Test_TempPath("cursor-save.bin");
+    reset_entities(); setup_test_world();
+    edict_t *hero = make_walk_hero(0, 0);
+    edict_t *item = give_item(hero, MAKEFOURCC('s','p','r','o'), 0, 1);
+    gameClient_t *client = &game.clients[0];
+    client->menu.dragged_item = item;
+    client->menu.dragged_item_spawn_time = item->spawn_time;
+    client->ps.stats[UI_PLAYERSTAT_CURSOR_INTERACTION] = 2;
+    client->ps.stats[UI_PLAYERSTAT_CURSOR_IMAGE] = 117;
+    client->cursor_signal = true;
+    client->ps.stats[UI_PLAYERSTAT_CURSOR_FLAGS] = CURSOR_INPUT_MINIMAP_POINT;
+    T_ASSERT(WriteGame(path));
+    T_ASSERT(ReadGame(path));
+    T_ASSERT(!game.clients[0].cursor_signal);
+    T_EQ(game.clients[0].ps.stats[UI_PLAYERSTAT_CURSOR_FLAGS], 0);
+    T_NULL(game.clients[0].menu.dragged_item);
+    T_EQ(game.clients[0].menu.dragged_item_spawn_time, 0);
+    T_EQ(game.clients[0].ps.stats[UI_PLAYERSTAT_CURSOR_INTERACTION], 0);
+    T_EQ(game.clients[0].ps.stats[UI_PLAYERSTAT_CURSOR_IMAGE], 0);
+    remove(path);
+}
+#endif

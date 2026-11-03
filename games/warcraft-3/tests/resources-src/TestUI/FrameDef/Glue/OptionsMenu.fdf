@@ -1,0 +1,90 @@
+Frame "FRAME" "OptionsMenu" {
+    Width 0.8,
+    Height 0.6,
+
+    Frame "FRAME" "OptionsControlLayer" {
+        SetAllPoints,
+		Frame "BACKDROP" "GameplayBackdrop" INHERITS "StandardMenuButtonBaseBackdrop" {
+			SetPoint TOPRIGHT,"OptionsMenu",TOPRIGHT, -0.015, -0.110625,
+
+			Frame "GLUETEXTBUTTON" "GameplayButton" INHERITS WITHCHILDREN "StandardButtonTemplate" {
+				SetPoint TOPRIGHT,"GameplayBackdrop",TOPRIGHT, -0.012, -0.0165,
+				ControlShortcutKey "G",
+				TabFocusDefault,
+				TabFocusNext "VideoButton",
+
+				ButtonText "GameplayButtonText",
+				Frame "TEXT" "GameplayButtonText" INHERITS "StandardButtonTextTemplate" {
+					Text "KEY_GAMEPLAY",
+				}
+			}
+		}
+
+		Frame "BACKDROP" "VideoBackdrop" INHERITS "StandardMenuButtonBaseBackdrop" {
+			SetPoint TOPRIGHT,"GameplayBackdrop",BOTTOMRIGHT,0, 0.005,
+
+			Frame "GLUETEXTBUTTON" "VideoButton" INHERITS WITHCHILDREN "StandardButtonTemplate" {
+				SetPoint TOPRIGHT,"VideoBackdrop",TOPRIGHT, -0.012, -0.0165,
+				ControlShortcutKey "V",
+				TabFocusNext "SoundButton",
+
+				ButtonText "VideoButtonText",
+				Frame "TEXT" "VideoButtonText" INHERITS "StandardButtonTextTemplate" {
+					Text "KEY_VIDEO",
+				}
+			}
+		}
+
+
+
+        Frame "FRAME" "GameplayPanel" {
+            SetAllPoints,
+
+            Frame "EDITBOX" "GamePortEditBox" {
+                Width 0.1,
+                Height 0.04,
+                SetPoint TOPLEFT, "GameplayPanel", TOPLEFT, 0.1, -0.1,
+                EditTextFrame "GamePortEditBoxText",
+
+                Frame "TEXT" "GamePortEditBoxText" {
+                    SetAllPoints,
+                }
+            }
+        }
+
+        Frame "FRAME" "VideoPanel" {
+            Frame "BACKDROP" "ResolutionBackdrop" {
+                Frame "POPUPMENU" "ResolutionMenu" {
+                    PopupTitleFrame "ResolutionPopupMenuTitle",
+                    PopupMenuFrame "ResolutionPopupMenuMenu",
+
+                    Frame "TEXT" "ResolutionPopupMenuTitle" {
+                        Frame "TEXT" "StandardPopupMenuTitleTextTemplate" {}
+                    }
+                    Frame "MENU" "ResolutionPopupMenuMenu" {}
+                }
+            }
+        }
+
+        Frame "FRAME" "SoundPanel" {
+            Frame "CHECKBOX" "SoundCheckBox" {
+            }
+            Frame "SLIDER" "SoundVolumeSlider" {
+                SliderMinValue 0,
+                SliderMaxValue 10,
+                SliderInitialValue 10,
+                SliderStepSize 0.5,
+                SliderLayoutHorizontal,
+            }
+            Frame "CHECKBOX" "MusicCheckBox" {
+            }
+            Frame "SLIDER" "MusicVolumeSlider" {
+                SliderMinValue 0,
+                SliderMaxValue 10,
+                SliderInitialValue 10,
+                SliderStepSize 0.5,
+                SliderLayoutHorizontal,
+            }
+        }
+    }
+}

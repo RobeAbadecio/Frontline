@@ -1,0 +1,2572 @@
+#include "g_local.h"
+#include "common/stb_slk.h"
+#include "g_unitrow.h"
+
+cstring_t config_files[] = {
+    "UI\\WorldEditGameStrings.txt",
+#if BZ_COMPAT_WORKAROUNDS
+    /* RoC 1.0 stores destructable WESTRING_DOOD_* labels here rather than in
+     * the WorldEditGameStrings file loaded above. */
+    "UI\\WorldEditStrings.txt",
+#endif
+    "Units\\OrcAbilityStrings.txt",
+    "Units\\HumanUnitFunc.txt",
+    "Units\\OrcUpgradeFunc.txt",
+    "Units\\CommandFunc.txt",
+    "Units\\UndeadUpgradeFunc.txt",
+    "Units\\CommonAbilityStrings.txt",
+    "Units\\CommandStrings.txt",
+    "Units\\UndeadUnitFunc.txt",
+    "Units\\OrcUpgradeStrings.txt",
+    "Units\\CommonAbilityFunc.txt",
+    "Units\\CampaignUnitStrings.txt",
+    "Units\\HumanAbilityFunc.txt",
+    "Units\\ItemFunc.txt",
+    "Units\\NeutralAbilityFunc.txt",
+    "Units\\Telemetry.txt",
+    "Units\\ItemStrings.txt",
+    "Units\\NightElfUnitStrings.txt",
+    "Units\\UnitGlobalStrings.txt",
+    "Units\\UndeadAbilityFunc.txt",
+    "Units\\ItemAbilityFunc.txt",
+    "Units\\HumanUpgradeFunc.txt",
+    "Units\\CampaignUnitFunc.txt",
+    "Units\\NeutralUnitStrings.txt",
+    "Units\\NeutralAbilityStrings.txt",
+    "Units\\UndeadAbilityStrings.txt",
+    "Units\\OrcUnitStrings.txt",
+    "Units\\NightElfUpgradeStrings.txt",
+    "Units\\OrcUnitFunc.txt",
+    "Units\\NightElfUnitFunc.txt",
+    "Units\\HumanUpgradeStrings.txt",
+    "Units\\ItemAbilityStrings.txt",
+    "Units\\HumanUnitStrings.txt",
+    "Units\\NightElfUpgradeFunc.txt",
+    "Units\\NeutralUnitFunc.txt",
+    "Units\\HumanAbilityStrings.txt",
+    "Units\\OrcAbilityFunc.txt",
+    "Units\\NightElfAbilityStrings.txt",
+    "Units\\UndeadUnitStrings.txt",
+    "Units\\NightElfAbilityFunc.txt",
+    "Units\\CampaignAbilityFunc.txt",
+    "Units\\CampaignAbilityStrings.txt",
+    "Units\\MiscData.txt",
+    "Units\\UndeadUpgradeStrings.txt",
+    NULL
+};
+
+cstring_t profile_files[] = {
+    "Units\\CampaignUnitFunc.txt",
+    "Units\\CampaignUnitStrings.txt",
+    "Units\\HumanUnitFunc.txt",
+    "Units\\HumanUnitStrings.txt",
+    "Units\\NeutralUnitFunc.txt",
+    "Units\\NeutralUnitStrings.txt",
+    "Units\\NightElfUnitFunc.txt",
+    "Units\\NightElfUnitStrings.txt",
+    "Units\\OrcUnitFunc.txt",
+    "Units\\OrcUnitStrings.txt",
+    "Units\\UndeadUnitFunc.txt",
+    "Units\\UndeadUnitStrings.txt",
+    // optionals
+    "Units\\UnitSkin.txt",
+    "Units\\UnitWeaponsFunc.txt",
+    "Units\\UnitWeaponsSkin.txt",
+    NULL
+};
+
+static stbIniCache_t abilityConfigTables[64];
+static stbIniCache_t *commandFuncConfig;
+static stbIniCache_t *commandStringsConfig;
+static uint32_t abilityConfigTableCount = 0;
+
+static unitMeta_t const *G_FindMetaData(unitMeta_t const *metadatas, uint32_t id) {
+    for (unitMeta_t const *d = metadatas; d->id; d++) {
+        uint32_t key;
+        memcpy(&key, d->id, sizeof(uint32_t));
+        if (key == id) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* A field code that no metadata entry maps is a programming error, not missing
+ * unit data: the accessor silently resolves to NULL/0. That is how stat bugs
+ * hid for so long ("umpc" mana, "udfc" armor, "uinc"/"ustc"/"uagc" attributes).
+ * Warn once per code so any such gap surfaces the first time it is read. */
+static void warn_unregistered_field(uint32_t id) {
+    static uint32_t seen[64];
+    static uint32_t count;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (seen[i] == id) {
+            return;
+        }
+    }
+    if (count < 64) { seen[count++] = id; }
+    else return; /* table full; suppress further spam */
+    fprintf(stderr, "WARNING: unit-data field code '%.4s' has no DDX metadata entry\n", (cstring_t)&id);
+}
+
+/* =========================================================================
+ * DDX schemas — one entry per SLK column consumed at runtime.
+ * =========================================================================*/
+static slkField_t const profile_schema[] = {
+    { "",              offsetof(UnitProfile_t, id),                STB_SLK_FOURCC },
+    { "Name",          offsetof(UnitProfile_t, name),              STB_SLK_STR,   "unam" },
+    { "Propernames",   offsetof(UnitProfile_t, properNames),       STB_SLK_STR,   "upro" },
+    { "Builds",        offsetof(UnitProfile_t, builds),            STB_SLK_STR,   "ubui" },
+    { "Trains",        offsetof(UnitProfile_t, trains),            STB_SLK_STR,   "utra" },
+    { "animProps",     offsetof(UnitProfile_t, animProps),         STB_SLK_STR,   "uani" },
+    { "Art",           offsetof(UnitProfile_t, art),               STB_SLK_STR,   "uico" },
+    { "Art",           offsetof(UnitProfile_t, itemArt),           STB_SLK_STR,   "iico" },
+    { "Attachmentanimprops", offsetof(UnitProfile_t, attachmentAnimProps), STB_SLK_STR, "uaap" },
+    { "Attachmentlinkprops", offsetof(UnitProfile_t, attachmentLinkProps), STB_SLK_STR, "ualp" },
+    { "Awakentip",     offsetof(UnitProfile_t, awakenTip),         STB_SLK_STR,   "uawt" },
+    { "Boneprops",     offsetof(UnitProfile_t, boneProps),         STB_SLK_STR,   "ubpr" },
+    { "BuildingSoundLabel", offsetof(UnitProfile_t, buildingSoundLabel), STB_SLK_STR, "ubsl" },
+    { "Buttonpos",     offsetof(UnitProfile_t, buttonPosX),        STB_SLK_STR,   "ubpx" },
+    { "Buttonpos",     offsetof(UnitProfile_t, buttonPosY),        STB_SLK_STR,   "ubpy" },
+    { "Casterupgradeart", offsetof(UnitProfile_t, casterUpgradeArt), STB_SLK_STR, "ucua" },
+    { "Casterupgradename", offsetof(UnitProfile_t, casterUpgradeName), STB_SLK_STR, "ucun" },
+    { "Casterupgradetip", offsetof(UnitProfile_t, casterUpgradeTip), STB_SLK_STR, "ucut" },
+    { "DependencyOr",  offsetof(UnitProfile_t, dependencyOr),      STB_SLK_STR,   "udep" },
+    { "Description",   offsetof(UnitProfile_t, description),       STB_SLK_STR,   "ides" },
+    { "EditorSuffix",  offsetof(UnitProfile_t, editorSuffix),      STB_SLK_STR,   "unsf" },
+    { "Hotkey",        offsetof(UnitProfile_t, hotkey),            STB_SLK_STR,   "uhot" },
+    { "LoopingSoundFadeIn", offsetof(UnitProfile_t, loopingSoundFadeIn), STB_SLK_STR, "ulfi" },
+    { "LoopingSoundFadeOut", offsetof(UnitProfile_t, loopingSoundFadeOut), STB_SLK_STR, "ulfo" },
+    { "Makeitems",     offsetof(UnitProfile_t, makeItems),         STB_SLK_STR,   "umki" },
+    { "Missileart",    offsetof(UnitProfile_t, attack[0].art),     STB_SLK_STR,   "ua1m", .list = 1 },
+    { "Missilearc",    offsetof(UnitProfile_t, attack[0].arc),     STB_SLK_FLOAT, "uma1", .list = 1 },
+    { "Missilespeed",  offsetof(UnitProfile_t, attack[0].speed),   STB_SLK_FLOAT, "ua1z", .list = 1 },
+    { "MissileHoming", offsetof(UnitProfile_t, attack[0].homing),  STB_SLK_BOOL,  "umh1", .list = 1 },
+    { "Missileart",    offsetof(UnitProfile_t, attack[1].art),     STB_SLK_STR,   "ua2m", .list = 2 },
+    { "Missilearc",    offsetof(UnitProfile_t, attack[1].arc),     STB_SLK_FLOAT, "uma2", .list = 2 },
+    { "Missilespeed",  offsetof(UnitProfile_t, attack[1].speed),   STB_SLK_FLOAT, "ua2z", .list = 2 },
+    { "MissileHoming", offsetof(UnitProfile_t, attack[1].homing),  STB_SLK_BOOL,  "umh2", .list = 2 },
+    { "MovementSoundLabel", offsetof(UnitProfile_t, movementSoundLabel), STB_SLK_STR, "umsl" },
+    { "RandomSoundLabel", offsetof(UnitProfile_t, randomSoundLabel), STB_SLK_STR, "ursl" },
+    { "Requirescount", offsetof(UnitProfile_t, requiresCount),     STB_SLK_STR,   "urqc" },
+    { "Requires",      offsetof(UnitProfile_t, requires),          STB_SLK_STR,   "ureq" },
+    { "Requires1",     offsetof(UnitProfile_t, requiresLevel[0]),  STB_SLK_STR,   "urq1" },
+    { "Requires2",     offsetof(UnitProfile_t, requiresLevel[1]),  STB_SLK_STR,   "urq2" },
+    { "Requires3",     offsetof(UnitProfile_t, requiresLevel[2]),  STB_SLK_STR,   "urq3" },
+    { "Requires4",     offsetof(UnitProfile_t, requiresLevel[3]),  STB_SLK_STR,   "urq4" },
+    { "Requires5",     offsetof(UnitProfile_t, requiresLevel[4]),  STB_SLK_STR,   "urq5" },
+    { "Requires6",     offsetof(UnitProfile_t, requiresLevel[5]),  STB_SLK_STR,   "urq6" },
+    { "Requires7",     offsetof(UnitProfile_t, requiresLevel[6]),  STB_SLK_STR,   "urq7" },
+    { "Requires8",     offsetof(UnitProfile_t, requiresLevel[7]),  STB_SLK_STR,   "urq8" },
+    { "Requiresamount", offsetof(UnitProfile_t, requiresAmount),   STB_SLK_STR,   "urqa" },
+    { "Researches",    offsetof(UnitProfile_t, researches),       STB_SLK_STR,   "ures" },
+    { "Revive",        offsetof(UnitProfile_t, revive),           STB_SLK_STR,   "urev" },
+    { "Revivetip",     offsetof(UnitProfile_t, reviveTip),        STB_SLK_STR,   "utpr" },
+    { "ScoreScreenIcon", offsetof(UnitProfile_t, scoreScreenIcon), STB_SLK_STR, "ussi" },
+    { "Sellitems",     offsetof(UnitProfile_t, sellItems),        STB_SLK_STR,   "usei" },
+    { "Sellunits",     offsetof(UnitProfile_t, sellUnits),        STB_SLK_STR,   "useu" },
+    { "Specialart",    offsetof(UnitProfile_t, specialArt),       STB_SLK_STR,   "uspa" },
+    { "Targetart",     offsetof(UnitProfile_t, targetArt),        STB_SLK_STR,   "utaa" },
+    { "Tip",           offsetof(UnitProfile_t, tip),              STB_SLK_STR,   "utip" },
+    { "Reviveat",      offsetof(UnitProfile_t, reviveAt),         STB_SLK_STR,   "urva" },
+    { "Ubertip",       offsetof(UnitProfile_t, uberTip),          STB_SLK_STR,   "utub" },
+    { "Upgrade",       offsetof(UnitProfile_t, upgrade),          STB_SLK_STR,   "uupt" },
+    { NULL, 0, 0, 0 }
+};
+
+static slkField_t const balance_schema[] = {
+    { "",                 offsetof(UnitBalance_t, id),              STB_SLK_FOURCC },
+    { "sortBalance",      offsetof(UnitBalance_t, sortBalance),     STB_SLK_STR   },
+    { "sort2",            offsetof(UnitBalance_t, sort2),           STB_SLK_STR   },
+    { "comment(s)",       offsetof(UnitBalance_t, comments),        STB_SLK_STR   },
+    { "abilTest",         offsetof(UnitBalance_t, abilTest),        STB_SLK_BOOL  },
+    { "InBeta",           offsetof(UnitBalance_t, InBeta),          STB_SLK_BOOL  },
+    { "level",            offsetof(UnitBalance_t, level),           STB_SLK_INT   },
+    { "goldcost",         offsetof(UnitBalance_t, goldCost),        STB_SLK_INT   },
+    { "lumbercost",       offsetof(UnitBalance_t, lumberCost),      STB_SLK_INT   },
+    { "goldRep",          offsetof(UnitBalance_t, goldRep),         STB_SLK_INT   },
+    { "lumberRep",        offsetof(UnitBalance_t, lumberRep),       STB_SLK_INT   },
+    { "fmade",            offsetof(UnitBalance_t, foodMade),        STB_SLK_INT   },
+    { "fused",            offsetof(UnitBalance_t, foodUsed),        STB_SLK_INT   },
+    { "bountydice",       offsetof(UnitBalance_t, goldBountyDice),  STB_SLK_INT   },
+    { "bountysides",      offsetof(UnitBalance_t, goldBountySides), STB_SLK_INT   },
+    { "bountyplus",       offsetof(UnitBalance_t, goldBountyBase),  STB_SLK_INT   },
+    { "lumberbountydice", offsetof(UnitBalance_t, lumberBountyDice),STB_SLK_INT   }, /* TFT */
+    { "lumberbountysides",offsetof(UnitBalance_t, lumberBountySides),STB_SLK_INT  }, /* TFT */
+    { "lumberbountyplus", offsetof(UnitBalance_t, lumberBountyBase),STB_SLK_INT   }, /* TFT */
+    { "stockMax",         offsetof(UnitBalance_t, stockMax),        STB_SLK_INT   },
+    { "stockRegen",       offsetof(UnitBalance_t, stockRegen),      STB_SLK_INT   },
+    { "stockStart",       offsetof(UnitBalance_t, stockStart),      STB_SLK_INT   },
+    { "HP",               offsetof(UnitBalance_t, baseHealth),      STB_SLK_INT   },
+    { "realHP",           offsetof(UnitBalance_t, maxHealth),       STB_SLK_FLOAT },
+    { "regenHP",          offsetof(UnitBalance_t, healthRegen),     STB_SLK_FLOAT },
+    { "regenType",        offsetof(UnitBalance_t, healthRegenType), STB_SLK_STR   },
+    { "manaN",            offsetof(UnitBalance_t, baseMana),        STB_SLK_INT   },
+    { "realM",            offsetof(UnitBalance_t, maxMana),         STB_SLK_FLOAT },
+    { "mana0",            offsetof(UnitBalance_t, initialMana),     STB_SLK_FLOAT },
+    { "regenMana",        offsetof(UnitBalance_t, manaRegen),       STB_SLK_FLOAT },
+    { "def",              offsetof(UnitBalance_t, baseArmor),       STB_SLK_INT   },
+    { "defUp",            offsetof(UnitBalance_t, armorPerUpgrade), STB_SLK_INT   },
+    { "realdef",          offsetof(UnitBalance_t, armor),           STB_SLK_FLOAT },
+    { "defType",          offsetof(UnitBalance_t, defenseType),     STB_SLK_STR   },
+    { "spd",              offsetof(UnitBalance_t, speed),           STB_SLK_FLOAT },
+    { "maxSpd",           offsetof(UnitBalance_t, maxSpeed),        STB_SLK_FLOAT }, /* TFT */
+    { "minSpd",           offsetof(UnitBalance_t, minSpeed),        STB_SLK_FLOAT }, /* TFT */
+    { "bldtm",            offsetof(UnitBalance_t, buildTime),       STB_SLK_INT   },
+    { "sight",            offsetof(UnitBalance_t, sightRadius),     STB_SLK_FLOAT },
+    { "nsight",           offsetof(UnitBalance_t, nightSightRadius),STB_SLK_FLOAT },
+    { "STR",              offsetof(UnitBalance_t, strength),        STB_SLK_INT   },
+    { "INT",              offsetof(UnitBalance_t, intelligence),    STB_SLK_INT   },
+    { "AGI",              offsetof(UnitBalance_t, agility),         STB_SLK_INT   },
+    { "STRplus",          offsetof(UnitBalance_t, strengthPerLevel),STB_SLK_FLOAT },
+    { "INTplus",          offsetof(UnitBalance_t, intelligencePerLevel), STB_SLK_FLOAT },
+    { "AGIplus",          offsetof(UnitBalance_t, agilityPerLevel), STB_SLK_FLOAT },
+    { "Primary",          offsetof(UnitBalance_t, primaryAttribute),STB_SLK_STR   },
+    { "upgrades",         offsetof(UnitBalance_t, upgrades),        STB_SLK_STR   },
+    { "collision",        offsetof(UnitBalance_t, collision),       STB_SLK_FLOAT }, /* TFT */
+    { "isbldg",           offsetof(UnitBalance_t, isBuilding),      STB_SLK_BOOL  }, /* TFT */
+    { "nbrandom",         offsetof(UnitBalance_t, nbrandom),        STB_SLK_INT   }, /* TFT */
+    { "preventPlace",     offsetof(UnitBalance_t, preventPlace),    STB_SLK_STR   }, /* TFT */
+    { "reptm",            offsetof(UnitBalance_t, reptm),           STB_SLK_INT   }, /* TFT */
+    { "repulse",          offsetof(UnitBalance_t, repulse),         STB_SLK_INT   }, /* TFT */
+    { "repulseGroup",     offsetof(UnitBalance_t, repulseGroup),    STB_SLK_INT   }, /* TFT */
+    { "repulseParam",     offsetof(UnitBalance_t, repulseParam),    STB_SLK_FLOAT }, /* TFT */
+    { "repulsePrio",      offsetof(UnitBalance_t, repulsePrio),     STB_SLK_INT   }, /* TFT */
+    { "requirePlace",     offsetof(UnitBalance_t, requirePlace),    STB_SLK_STR   }, /* TFT */
+    { "tilesets",         offsetof(UnitBalance_t, tilesets),        STB_SLK_STR   }, /* TFT */
+    { "type",             offsetof(UnitBalance_t, type),            STB_SLK_STR   }, /* TFT */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const data_schema[] = {
+    { "",                   offsetof(UnitData_t, id),               STB_SLK_FOURCC },
+    { "sort",               offsetof(UnitData_t, sort),             STB_SLK_STR   },
+    { "comment(s)",         offsetof(UnitData_t, comments),         STB_SLK_STR   },
+    { "version",            offsetof(UnitData_t, version),          STB_SLK_INT   },
+    { "valid",              offsetof(UnitData_t, valid),            STB_SLK_BOOL  },
+    { "InBeta",             offsetof(UnitData_t, InBeta),           STB_SLK_BOOL  },
+    { "buffRadius",         offsetof(UnitData_t, buffRadius),       STB_SLK_FLOAT },
+    { "buffType",           offsetof(UnitData_t, buffType),         STB_SLK_STR   },
+    { "targType",           offsetof(UnitData_t, targetType),       STB_SLK_STR   },
+    { "canSleep",           offsetof(UnitData_t, canSleep),         STB_SLK_BOOL  },
+    { "canFlee",            offsetof(UnitData_t, canFlee),          STB_SLK_BOOL  }, /* TFT */
+    { "canBuildOn",         offsetof(UnitData_t, canBuildOn),       STB_SLK_BOOL  }, /* TFT */
+    { "isBuildOn",          offsetof(UnitData_t, isBuildOn),        STB_SLK_BOOL  }, /* TFT */
+    { "cargoSize",          offsetof(UnitData_t, cargoSize),        STB_SLK_INT   },
+    { "death",              offsetof(UnitData_t, death),            STB_SLK_FLOAT },
+    { "deathType",          offsetof(UnitData_t, deathType),        STB_SLK_INT   },
+    { "fatLOS",             offsetof(UnitData_t, useExtendedLineOfSight), STB_SLK_BOOL  },
+    { "formation",          offsetof(UnitData_t, formationRank),    STB_SLK_INT   },
+    { "moveFloor",          offsetof(UnitData_t, moveFloor),        STB_SLK_FLOAT },
+    { "moveHeight",         offsetof(UnitData_t, moveHeight),       STB_SLK_FLOAT },
+    { "movetp",             offsetof(UnitData_t, moveTypeName),     STB_SLK_STR   },
+    { "turnRate",           offsetof(UnitData_t, turnRate),         STB_SLK_FLOAT },
+    { "nameCount",          offsetof(UnitData_t, nameCount),        STB_SLK_INT   },
+    { "orientInterp",       offsetof(UnitData_t, orientationInterpolation), STB_SLK_INT   },
+    { "pathTex",            offsetof(UnitData_t, pathingTexture),   STB_SLK_STR   },
+    { "points",             offsetof(UnitData_t, points),           STB_SLK_INT   },
+    { "prio",               offsetof(UnitData_t, priority),         STB_SLK_INT   },
+    { "propWin",            offsetof(UnitData_t, propWin),          STB_SLK_FLOAT },
+    { "race",               offsetof(UnitData_t, race),             STB_SLK_STR   },
+    { "requireWaterRadius", offsetof(UnitData_t, requireWaterRadius),STB_SLK_FLOAT}, /* TFT */
+    { "threat",             offsetof(UnitData_t, threat),           STB_SLK_INT   },
+    { "castbsw",            offsetof(UnitData_t, castBackSwing),    STB_SLK_FLOAT }, /* ROC */
+    { "castpt",             offsetof(UnitData_t, castPoint),        STB_SLK_FLOAT }, /* ROC */
+    { "collision",          offsetof(UnitData_t, collision),        STB_SLK_FLOAT }, /* ROC */
+    { "impactZ",            offsetof(UnitData_t, impactHeight),     STB_SLK_FLOAT }, /* ROC */
+    { "launchX",            offsetof(UnitData_t, launchOffsetX),    STB_SLK_FLOAT }, /* ROC */
+    { "launchY",            offsetof(UnitData_t, launchOffsetY),    STB_SLK_FLOAT }, /* ROC */
+    { "launchZ",            offsetof(UnitData_t, launchOffsetZ),    STB_SLK_FLOAT }, /* ROC */
+    { "type",               offsetof(UnitData_t, unitClassification), STB_SLK_STR  }, /* ROC */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const ui_schema[] = {
+    { "",                 offsetof(UnitUI_t, id),               STB_SLK_FOURCC },
+    { "sortUI",           offsetof(UnitUI_t, sortUI),           STB_SLK_STR   },
+    { "InBeta",           offsetof(UnitUI_t, InBeta),           STB_SLK_BOOL  },
+    { "file",             offsetof(UnitUI_t, modelFile),        STB_SLK_STR   },
+    { "modelScale",       offsetof(UnitUI_t, modelScale),       STB_SLK_FLOAT },
+    { "blend",            offsetof(UnitUI_t, blend),            STB_SLK_FLOAT },
+    { "red",              offsetof(UnitUI_t, tintRed),          STB_SLK_INT,  NULL, "255" },
+    { "green",            offsetof(UnitUI_t, tintGreen),        STB_SLK_INT,  NULL, "255" },
+    { "blue",             offsetof(UnitUI_t, tintBlue),         STB_SLK_INT,  NULL, "255" },
+    { "teamColor",        offsetof(UnitUI_t, teamColor),        STB_SLK_INT   },
+    { "customTeamColor",  offsetof(UnitUI_t, customTeamColor),  STB_SLK_BOOL  },
+    { "hostilePal",       offsetof(UnitUI_t, hostilePal),       STB_SLK_BOOL  },
+    { "scale",            offsetof(UnitUI_t, selectionScale),   STB_SLK_FLOAT },
+    { "selZ",             offsetof(UnitUI_t, selectionCircleHeight), STB_SLK_FLOAT },
+    { "shadowH",          offsetof(UnitUI_t, shadowHeight),     STB_SLK_FLOAT },
+    { "shadowW",          offsetof(UnitUI_t, shadowWidth),      STB_SLK_FLOAT },
+    { "shadowX",          offsetof(UnitUI_t, shadowCenterX),    STB_SLK_FLOAT },
+    { "shadowY",          offsetof(UnitUI_t, shadowCenterY),    STB_SLK_FLOAT },
+    { "unitShadow",       offsetof(UnitUI_t, unitShadowTexture), STB_SLK_STR  },
+    { "selCircOnWater",   offsetof(UnitUI_t, selectionCircleOnWater), STB_SLK_BOOL  }, /* TFT */
+    { "shadowOnWater",    offsetof(UnitUI_t, waterShadow),      STB_SLK_BOOL  }, /* TFT */
+    { "scaleBull",        offsetof(UnitUI_t, scaleProjectiles), STB_SLK_BOOL  },
+    { "elevPts",          offsetof(UnitUI_t, elevationSamplePoints), STB_SLK_INT   },
+    { "elevRad",          offsetof(UnitUI_t, elevationSampleRadius), STB_SLK_FLOAT },
+    { "fogRad",           offsetof(UnitUI_t, fogOfWarSampleRadius), STB_SLK_FLOAT },
+    { "occH",             offsetof(UnitUI_t, occluderHeight),   STB_SLK_FLOAT },
+    { "run",              offsetof(UnitUI_t, animationRunSpeed), STB_SLK_FLOAT },
+    { "walk",             offsetof(UnitUI_t, animationWalkSpeed), STB_SLK_FLOAT },
+    { "maxPitch",         offsetof(UnitUI_t, maxPitchDegrees),   STB_SLK_FLOAT },
+    { "maxRoll",          offsetof(UnitUI_t, maxRollDegrees),    STB_SLK_FLOAT },
+    { "unitSound",        offsetof(UnitUI_t, soundLabel),       STB_SLK_STR   },
+    { "name",             offsetof(UnitUI_t, name),             STB_SLK_STR   },
+    { "uberSplat",        offsetof(UnitUI_t, groundTexture),    STB_SLK_STR   },
+    { "buildingShadow",   offsetof(UnitUI_t, buildingShadowTexture), STB_SLK_STR   },
+    { "special",          offsetof(UnitUI_t, special),          STB_SLK_STR   },
+    { "armor",            offsetof(UnitUI_t, armorSoundType),   STB_SLK_STR   },
+    { "armor",            offsetof(UnitUI_t, armorType),        STB_SLK_INT   },
+    { "unitClass",        offsetof(UnitUI_t, unitClass),        STB_SLK_INT   },
+    { "nbmmIcon",         offsetof(UnitUI_t, neutralBuildingMinimapIcon), STB_SLK_BOOL  },
+    { "inEditor",         offsetof(UnitUI_t, inEditor),         STB_SLK_BOOL  },
+    { "hiddenInEditor",   offsetof(UnitUI_t, hiddenInEditor),   STB_SLK_BOOL  },
+    { "dropItems",        offsetof(UnitUI_t, dropItems),        STB_SLK_BOOL  },
+    { "useClickHelper",   offsetof(UnitUI_t, useClickHelper),   STB_SLK_BOOL  },
+    { "campaign",         offsetof(UnitUI_t, campaign),         STB_SLK_BOOL  }, /* TFT */
+    { "fileVerFlags",     offsetof(UnitUI_t, fileVerFlags),     STB_SLK_INT   }, /* TFT */
+    { "hideHeroBar",      offsetof(UnitUI_t, hideHeroBar),      STB_SLK_BOOL  }, /* TFT */
+    { "hideHeroDeathMsg", offsetof(UnitUI_t, hideHeroDeathMsg), STB_SLK_BOOL  }, /* TFT */
+    { "hideHeroMinimap",  offsetof(UnitUI_t, hideHeroMinimap),  STB_SLK_BOOL  }, /* TFT */
+    { "hideOnMinimap",    offsetof(UnitUI_t, hideOnMinimap),    STB_SLK_BOOL  }, /* TFT */
+    { "tilesetSpecific",  offsetof(UnitUI_t, tilesetSpecific),  STB_SLK_BOOL  },
+    { "requirePlace",     offsetof(UnitUI_t, requirePlace),     STB_SLK_STR   }, /* ROC */
+    { "preventPlace",     offsetof(UnitUI_t, preventPlace),     STB_SLK_STR   }, /* ROC */
+    { "tilesets",         offsetof(UnitUI_t, tilesets),         STB_SLK_STR   }, /* ROC */
+    { "nbrandom",         offsetof(UnitUI_t, nbrandom),         STB_SLK_INT   }, /* ROC */
+    { "weap1",            offsetof(UnitUI_t, weaponSlot1),      STB_SLK_INT   },
+    { "weap2",            offsetof(UnitUI_t, weaponSlot2),      STB_SLK_INT   },
+    { "isbldg",           offsetof(UnitUI_t, isBuilding),       STB_SLK_BOOL  }, /* ROC */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const weapons_schema[] = {
+    { "",              offsetof(UnitWeapons_t, id),            STB_SLK_FOURCC },
+    { "sortWeap",       offsetof(UnitWeapons_t, sortWeap),      STB_SLK_STR   },
+    { "sort2",          offsetof(UnitWeapons_t, sort2),         STB_SLK_STR   },
+    { "comment(s)",     offsetof(UnitWeapons_t, comments),      STB_SLK_STR   },
+    { "InBeta",         offsetof(UnitWeapons_t, InBeta),        STB_SLK_BOOL  },
+    { "acquire",       offsetof(UnitWeapons_t, acquisitionRange), STB_SLK_FLOAT },
+    { "atkType1",      offsetof(UnitWeapons_t, attack1.attackType), STB_SLK_STR   },
+    { "dice1",         offsetof(UnitWeapons_t, attack1.damageDice), STB_SLK_INT   },
+    { "sides1",        offsetof(UnitWeapons_t, attack1.damageSides), STB_SLK_INT   },
+    { "dmgplus1",      offsetof(UnitWeapons_t, attack1.damageBase), STB_SLK_INT   },
+    { "dmgpt1",        offsetof(UnitWeapons_t, attack1.damagePoint), STB_SLK_FLOAT },
+    { "backSw1",       offsetof(UnitWeapons_t, attack1.backswingPoint), STB_SLK_FLOAT },
+    { "cool1",         offsetof(UnitWeapons_t, attack1.cooldown), STB_SLK_FLOAT },
+    { "mincool1",      offsetof(UnitWeapons_t, attack1.minCooldown), STB_SLK_FLOAT },
+    { "mindmg1",       offsetof(UnitWeapons_t, attack1.minDamage), STB_SLK_FLOAT },
+    { "avgdmg1",       offsetof(UnitWeapons_t, attack1.averageDamage), STB_SLK_FLOAT },
+    { "maxdmg1",       offsetof(UnitWeapons_t, attack1.maxDamage), STB_SLK_FLOAT },
+    { "RngTst",        offsetof(UnitWeapons_t, attack1.rangeTest), STB_SLK_STR   },
+    { "DmgUpg",        offsetof(UnitWeapons_t, attack1.damageUpgrade), STB_SLK_STR   },
+    { "dmod1",         offsetof(UnitWeapons_t, attack1.damageModifier), STB_SLK_STR   },
+    { "DPS",           offsetof(UnitWeapons_t, attack1.damagePerSecond), STB_SLK_FLOAT },
+    { "dmgUp1",        offsetof(UnitWeapons_t, attack1.damageUpgradeAmount), STB_SLK_INT   },
+    { "damageLoss1",   offsetof(UnitWeapons_t, attack1.damageLossFactor), STB_SLK_FLOAT },
+    { "rangeN1",       offsetof(UnitWeapons_t, attack1.range), STB_SLK_FLOAT },
+    { "RngBuff1",      offsetof(UnitWeapons_t, attack1.rangeBuffer), STB_SLK_FLOAT },
+    { "Farea1",        offsetof(UnitWeapons_t, attack1.areaFull), STB_SLK_FLOAT },
+    { "Harea1",        offsetof(UnitWeapons_t, attack1.areaMedium), STB_SLK_FLOAT },
+    { "Qarea1",        offsetof(UnitWeapons_t, attack1.areaSmall), STB_SLK_FLOAT },
+    { "Hfact1",        offsetof(UnitWeapons_t, attack1.factorMedium), STB_SLK_FLOAT },
+    { "Qfact1",        offsetof(UnitWeapons_t, attack1.factorSmall), STB_SLK_FLOAT },
+    { "spillDist1",    offsetof(UnitWeapons_t, attack1.spillDistance), STB_SLK_FLOAT },
+    { "spillRadius1",  offsetof(UnitWeapons_t, attack1.spillRadius), STB_SLK_FLOAT },
+    { "splashTargs1",  offsetof(UnitWeapons_t, attack1.areaTargets), STB_SLK_INT   },
+    { "targCount1",    offsetof(UnitWeapons_t, attack1.maxTargets), STB_SLK_INT   },
+    { "targs1",        offsetof(UnitWeapons_t, attack1.targetsAllowedText), STB_SLK_STR   },
+    { "weapTp1",       offsetof(UnitWeapons_t, attack1.weaponType), STB_SLK_STR   },
+    { "weapType1",     offsetof(UnitWeapons_t, attack1.weaponSound), STB_SLK_STR   },
+    { "showUI1",       offsetof(UnitWeapons_t, attack1.showUI), STB_SLK_BOOL  }, /* TFT */
+    { "atkType2",      offsetof(UnitWeapons_t, attack2.attackType), STB_SLK_STR   },
+    { "dice2",         offsetof(UnitWeapons_t, attack2.damageDice), STB_SLK_INT   },
+    { "sides2",        offsetof(UnitWeapons_t, attack2.damageSides), STB_SLK_INT   },
+    { "dmgplus2",      offsetof(UnitWeapons_t, attack2.damageBase), STB_SLK_INT   },
+    { "dmgpt2",        offsetof(UnitWeapons_t, attack2.damagePoint), STB_SLK_FLOAT },
+    { "backSw2",       offsetof(UnitWeapons_t, attack2.backswingPoint), STB_SLK_FLOAT },
+    { "cool2",         offsetof(UnitWeapons_t, attack2.cooldown), STB_SLK_FLOAT },
+    { "mincool2",      offsetof(UnitWeapons_t, attack2.minCooldown), STB_SLK_FLOAT },
+    { "mindmg2",       offsetof(UnitWeapons_t, attack2.minDamage), STB_SLK_FLOAT },
+    { "avgdmg2",       offsetof(UnitWeapons_t, attack2.averageDamage), STB_SLK_FLOAT },
+    { "maxdmg2",       offsetof(UnitWeapons_t, attack2.maxDamage), STB_SLK_FLOAT },
+    { "RngTst2",       offsetof(UnitWeapons_t, attack2.rangeTest), STB_SLK_STR   },
+    { "dmgUp2",        offsetof(UnitWeapons_t, attack2.damageUpgradeAmount), STB_SLK_INT   },
+    { "damageLoss2",   offsetof(UnitWeapons_t, attack2.damageLossFactor), STB_SLK_FLOAT },
+    { "rangeN2",       offsetof(UnitWeapons_t, attack2.range), STB_SLK_FLOAT },
+    { "RngBuff2",      offsetof(UnitWeapons_t, attack2.rangeBuffer), STB_SLK_FLOAT },
+    { "Farea2",        offsetof(UnitWeapons_t, attack2.areaFull), STB_SLK_FLOAT },
+    { "Harea2",        offsetof(UnitWeapons_t, attack2.areaMedium), STB_SLK_FLOAT },
+    { "Qarea2",        offsetof(UnitWeapons_t, attack2.areaSmall), STB_SLK_FLOAT },
+    { "Hfact2",        offsetof(UnitWeapons_t, attack2.factorMedium), STB_SLK_FLOAT },
+    { "Qfact2",        offsetof(UnitWeapons_t, attack2.factorSmall), STB_SLK_FLOAT },
+    { "spillDist2",    offsetof(UnitWeapons_t, attack2.spillDistance), STB_SLK_FLOAT },
+    { "spillRadius2",  offsetof(UnitWeapons_t, attack2.spillRadius), STB_SLK_FLOAT },
+    { "splashTargs2",  offsetof(UnitWeapons_t, attack2.areaTargets), STB_SLK_INT   },
+    { "targCount2",    offsetof(UnitWeapons_t, attack2.maxTargets), STB_SLK_INT   },
+    { "targs2",        offsetof(UnitWeapons_t, attack2.targetsAllowedText), STB_SLK_STR   },
+    { "weapTp2",       offsetof(UnitWeapons_t, attack2.weaponType), STB_SLK_STR   },
+    { "weapType2",     offsetof(UnitWeapons_t, attack2.weaponSound), STB_SLK_STR   },
+    { "showUI2",       offsetof(UnitWeapons_t, attack2.showUI), STB_SLK_BOOL  }, /* TFT */
+    { "weapsOn",       offsetof(UnitWeapons_t, attacksEnabled), STB_SLK_INT   },
+    { "minRange",      offsetof(UnitWeapons_t, minimumAttackRange), STB_SLK_FLOAT },
+    { "castbsw",       offsetof(UnitWeapons_t, castBackSwing), STB_SLK_FLOAT }, /* TFT */
+    { "castpt",        offsetof(UnitWeapons_t, castPoint), STB_SLK_FLOAT }, /* TFT */
+    { "impactSwimZ",   offsetof(UnitWeapons_t, impactSwimZ),  STB_SLK_FLOAT }, /* TFT */
+    { "impactZ",       offsetof(UnitWeapons_t, impactHeight),  STB_SLK_FLOAT }, /* TFT */
+    { "launchSwimZ",   offsetof(UnitWeapons_t, launchSwimZ),  STB_SLK_FLOAT }, /* TFT */
+    { "launchX",       offsetof(UnitWeapons_t, attackLaunchX), STB_SLK_FLOAT }, /* TFT */
+    { "launchY",       offsetof(UnitWeapons_t, attackLaunchY), STB_SLK_FLOAT }, /* TFT */
+    { "launchZ",       offsetof(UnitWeapons_t, attackLaunchZ), STB_SLK_FLOAT }, /* TFT */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const abil_schema[] = {
+    { "",             offsetof(UnitAbilities_t, id),          STB_SLK_FOURCC },
+    { "sortAbil",     offsetof(UnitAbilities_t, sortAbil),     STB_SLK_STR  },
+    { "comment(s)",   offsetof(UnitAbilities_t, comments),     STB_SLK_STR  },
+    { "abilList",     offsetof(UnitAbilities_t, abilList),     STB_SLK_STR  },
+    { "heroAbilList", offsetof(UnitAbilities_t, heroAbilList), STB_SLK_STR  },
+    { "auto",         offsetof(UnitAbilities_t, defaultActiveAbility), STB_SLK_FOURCC },
+    { "InBeta",       offsetof(UnitAbilities_t, InBeta),       STB_SLK_BOOL },
+    { NULL, 0, 0 }
+};
+
+typedef struct {
+    uint32_t id;
+    cstring_t field, useSpecific;
+    int32_t data;
+} abilityMetaData_t;
+
+static slkField_t const ability_meta_schema[] = {
+    { "",            offsetof(abilityMetaData_t, id),          STB_SLK_FOURCC },
+    { "field",       offsetof(abilityMetaData_t, field),       STB_SLK_STR    },
+    { "data",        offsetof(abilityMetaData_t, data),        STB_SLK_INT    },
+    { "useSpecific", offsetof(abilityMetaData_t, useSpecific), STB_SLK_STR    },
+    { NULL, 0, 0 }
+};
+
+#define AB_F(NAME, FIELD, LEVEL, TYPE) { NAME, offsetof(AbilityData_t, level[LEVEL].FIELD), TYPE }
+#define AB_D(NAME, LEVEL, SLOT) { NAME, offsetof(AbilityData_t, level[LEVEL].data[SLOT].number), STB_SLK_FLOAT }
+#define AB_ID(NAME, LEVEL, SLOT) { NAME, offsetof(AbilityData_t, level[LEVEL].data[SLOT].id), STB_SLK_FOURCC }
+#define AB_F_LEVELS(NAME, FIELD, TYPE) \
+    AB_F(NAME "1", FIELD, 0, TYPE), AB_F(NAME "2", FIELD, 1, TYPE), \
+    AB_F(NAME "3", FIELD, 2, TYPE), AB_F(NAME "4", FIELD, 3, TYPE)
+#define AB_D_LEVELS(NAME, SLOT) \
+    AB_D(NAME "1", 0, SLOT), AB_D(NAME "2", 1, SLOT), \
+    AB_D(NAME "3", 2, SLOT), AB_D(NAME "4", 3, SLOT)
+#define AB_ID_LEVELS(NAME, SLOT) \
+    AB_ID(NAME "1", 0, SLOT), AB_ID(NAME "2", 1, SLOT), \
+    AB_ID(NAME "3", 2, SLOT), AB_ID(NAME "4", 3, SLOT)
+#define BZ_AB_ROW(NAME, LEVEL, FIELD) \
+    FIELD(NAME "1", LEVEL, 0), FIELD(NAME "2", LEVEL, 1), \
+    FIELD(NAME "3", LEVEL, 2), FIELD(NAME "4", LEVEL, 3)
+static slkField_t const ability_schema[] = {
+    { "",            offsetof(AbilityData_t, id),          STB_SLK_FOURCC },
+    { "code",        offsetof(AbilityData_t, code),        STB_SLK_FOURCC },
+    { "uberAlias",   offsetof(AbilityData_t, uberAlias),   STB_SLK_FOURCC }, /* ROC */
+    { "comments",    offsetof(AbilityData_t, comments),    STB_SLK_STR    },
+    { "version",     offsetof(AbilityData_t, version),     STB_SLK_INT    }, /* TFT */
+    { "useInEditor", offsetof(AbilityData_t, useInEditor), STB_SLK_BOOL   },
+    { "hero",        offsetof(AbilityData_t, hero),        STB_SLK_BOOL   },
+    { "item",        offsetof(AbilityData_t, item),        STB_SLK_BOOL   },
+    { "sort",        offsetof(AbilityData_t, sort),        STB_SLK_STR    },
+    { "race",        offsetof(AbilityData_t, race),        STB_SLK_STR    }, /* TFT */
+    { "checkDep",    offsetof(AbilityData_t, checkDep),    STB_SLK_BOOL   },
+    { "levels",      offsetof(AbilityData_t, levels),      STB_SLK_INT    },
+    { "reqLevel",    offsetof(AbilityData_t, reqLevel),    STB_SLK_INT    },
+    { "levelSkip",   offsetof(AbilityData_t, levelSkip),   STB_SLK_INT    }, /* TFT */
+    { "priority",    offsetof(AbilityData_t, priority),    STB_SLK_INT    }, /* TFT */
+    /* RoC's single targs column applies to every rank.  TFT's targsN columns
+     * below override these values when the per-rank fields are present. */
+    AB_F("targs", targs, 0, STB_SLK_STR), AB_F("targs", targs, 1, STB_SLK_STR),
+    AB_F("targs", targs, 2, STB_SLK_STR), AB_F("targs", targs, 3, STB_SLK_STR),
+    AB_F_LEVELS("targs", targs, STB_SLK_STR),
+    AB_F_LEVELS("Cast", cast, STB_SLK_FLOAT),
+    AB_F_LEVELS("Dur", dur, STB_SLK_FLOAT),
+    AB_F_LEVELS("HeroDur", heroDur, STB_SLK_FLOAT),
+    AB_F_LEVELS("Cool", cool, STB_SLK_FLOAT),
+    AB_F_LEVELS("Cost", cost, STB_SLK_FLOAT),
+    AB_F_LEVELS("Area", area, STB_SLK_FLOAT),
+    AB_F_LEVELS("Rng", range, STB_SLK_FLOAT),
+    BZ_AB_ROW("Data1", 0, AB_D),
+    BZ_AB_ROW("Data2", 1, AB_D),
+    BZ_AB_ROW("Data3", 2, AB_D),
+    AB_D_LEVELS("DataA", 0), AB_D_LEVELS("DataB", 1), AB_D_LEVELS("DataC", 2),
+    AB_D_LEVELS("DataD", 3), AB_D_LEVELS("DataE", 4), AB_D_LEVELS("DataF", 5),
+    AB_D_LEVELS("DataG", 6), AB_D_LEVELS("DataH", 7), AB_D_LEVELS("DataI", 8),
+    /* Some Warcraft abilities store raw object IDs in the generic Data slots.
+     * Keep a parallel FOURCC view so gameplay can consume those fields without
+     * changing the existing numeric Data parser used by other abilities/tooltips. */
+    /* ROC Data11..Data34 need the same object-ID view as TFT DataA1..DataD3; numeric-only parsing lost morph endpoints. */
+    BZ_AB_ROW("Data1", 0, AB_ID),
+    BZ_AB_ROW("Data2", 1, AB_ID),
+    BZ_AB_ROW("Data3", 2, AB_ID),
+    AB_ID_LEVELS("DataA", 0), AB_ID_LEVELS("DataB", 1), AB_ID_LEVELS("DataC", 2),
+    AB_ID_LEVELS("DataD", 3), AB_ID_LEVELS("DataE", 4), AB_ID_LEVELS("DataF", 5),
+    AB_ID_LEVELS("DataG", 6), AB_ID_LEVELS("DataH", 7), AB_ID_LEVELS("DataI", 8),
+    AB_F_LEVELS("UnitID", unitID, STB_SLK_FOURCC),
+    AB_F_LEVELS("BuffID", buffID, STB_SLK_STR),
+    AB_F_LEVELS("EfctID", efctID, STB_SLK_STR),
+    { "CastCheck",    offsetof(AbilityData_t, castCheck),    STB_SLK_STR }, /* ROC */
+    { "DurCheck",     offsetof(AbilityData_t, durCheck),     STB_SLK_STR }, /* ROC */
+    { "HeroDurCheck", offsetof(AbilityData_t, heroDurCheck), STB_SLK_STR }, /* ROC */
+    { "CoolCheck",    offsetof(AbilityData_t, coolCheck),    STB_SLK_STR }, /* ROC */
+    { "CostCheck",    offsetof(AbilityData_t, costCheck),    STB_SLK_STR }, /* ROC */
+    { "AreaCheck",    offsetof(AbilityData_t, areaCheck),    STB_SLK_STR }, /* ROC */
+    { "RngCheck",     offsetof(AbilityData_t, rangeCheck),   STB_SLK_STR }, /* ROC */
+    { "InBeta",       offsetof(AbilityData_t, InBeta),       STB_SLK_BOOL }, /* TFT */
+    { NULL, 0, 0 }
+};
+#undef AB_ID
+#undef AB_D
+#undef AB_F
+#undef AB_ID_LEVELS
+#undef AB_D_LEVELS
+#undef BZ_AB_ROW
+#undef AB_F_LEVELS
+
+static slkField_t const ability_buff_schema[] = {
+    { "",            offsetof(AbilityBuffData_t, id),          STB_SLK_FOURCC },
+    { "code",        offsetof(AbilityBuffData_t, code),        STB_SLK_FOURCC },
+    { "comments",    offsetof(AbilityBuffData_t, comments),    STB_SLK_STR    },
+    { "isEffect",    offsetof(AbilityBuffData_t, isEffect),    STB_SLK_BOOL   },
+    { "version",     offsetof(AbilityBuffData_t, version),     STB_SLK_INT    },
+    { "useInEditor", offsetof(AbilityBuffData_t, useInEditor), STB_SLK_BOOL   },
+    { "sort",        offsetof(AbilityBuffData_t, sort),        STB_SLK_STR    },
+    { "race",        offsetof(AbilityBuffData_t, race),        STB_SLK_STR    },
+    { "Buffart",     offsetof(AbilityBuffData_t, buffArt),     STB_SLK_STR    },
+    { "Bufftip",     offsetof(AbilityBuffData_t, buffTip),     STB_SLK_STR    },
+    { "Buffubertip", offsetof(AbilityBuffData_t, buffUberTip), STB_SLK_STR    },
+    { "TargetArt",   offsetof(AbilityBuffData_t, targetArt),   STB_SLK_STR    },
+    { "SpecialArt",  offsetof(AbilityBuffData_t, specialArt),  STB_SLK_STR    },
+    { "EffectArt",   offsetof(AbilityBuffData_t, effectArt),   STB_SLK_STR    },
+    { "Missileart",  offsetof(AbilityBuffData_t, missileArt),  STB_SLK_STR    },
+    { "Effectsound", offsetof(AbilityBuffData_t, effectSound), STB_SLK_STR    },
+    { "Effectsoundlooped", offsetof(AbilityBuffData_t, effectSoundLooped), STB_SLK_STR },
+    { NULL, 0, 0 }
+};
+
+#define DOOD_VERT(NAME, vertex_t, CHANNEL) { NAME, offsetof(Doodads_t, vert[vertex_t][CHANNEL]), STB_SLK_INT }
+static slkField_t const doodad_schema[] = {
+    { "",                  offsetof(Doodads_t, id),                STB_SLK_FOURCC },
+    { "category",          offsetof(Doodads_t, category),          STB_SLK_STR   },
+    { "tilesets",          offsetof(Doodads_t, tilesets),          STB_SLK_STR   },
+    { "tilesetSpecific",   offsetof(Doodads_t, tilesetSpecific),   STB_SLK_BOOL  },
+    { "dir",               offsetof(Doodads_t, dir),               STB_SLK_STR   }, /* ROC */
+    { "file",              offsetof(Doodads_t, file),              STB_SLK_STR   },
+    { "comment",           offsetof(Doodads_t, comment),           STB_SLK_STR   },
+    { "name",              offsetof(Doodads_t, Name),              STB_SLK_STR   }, /* ROC */
+    { "Name",              offsetof(Doodads_t, Name),              STB_SLK_STR   }, /* TFT */
+    { "doodClass",         offsetof(Doodads_t, doodClass),         STB_SLK_STR   },
+    { "soundLoop",         offsetof(Doodads_t, soundLoop),         STB_SLK_STR   },
+    { "selSize",           offsetof(Doodads_t, selSize),           STB_SLK_FLOAT },
+    { "defScale",          offsetof(Doodads_t, defScale),          STB_SLK_FLOAT },
+    { "minScale",          offsetof(Doodads_t, minScale),          STB_SLK_FLOAT },
+    { "maxScale",          offsetof(Doodads_t, maxScale),          STB_SLK_FLOAT },
+    { "canPlaceRandScale", offsetof(Doodads_t, canPlaceRandScale), STB_SLK_BOOL  },
+    { "useClickHelper",    offsetof(Doodads_t, useClickHelper),    STB_SLK_BOOL  },
+    { "ignoreModelClick",  offsetof(Doodads_t, ignoreModelClick),  STB_SLK_BOOL  }, /* TFT */
+    { "maxPitch",          offsetof(Doodads_t, maxPitch),          STB_SLK_FLOAT },
+    { "maxRoll",           offsetof(Doodads_t, maxRoll),           STB_SLK_FLOAT },
+    { "visRadius",         offsetof(Doodads_t, visRadius),         STB_SLK_FLOAT },
+    { "walkable",          offsetof(Doodads_t, walkable),          STB_SLK_BOOL  },
+    { "numVar",            offsetof(Doodads_t, numVar),            STB_SLK_INT   },
+    { "onCliffs",          offsetof(Doodads_t, onCliffs),          STB_SLK_BOOL  },
+    { "onWater",           offsetof(Doodads_t, onWater),           STB_SLK_BOOL  },
+    { "floats",            offsetof(Doodads_t, floats),            STB_SLK_BOOL  },
+    { "shadow",            offsetof(Doodads_t, shadow),            STB_SLK_STR   },
+    { "showInFog",         offsetof(Doodads_t, showInFog),         STB_SLK_BOOL  },
+    { "animInFog",         offsetof(Doodads_t, animInFog),         STB_SLK_BOOL  },
+    { "fixedRot",          offsetof(Doodads_t, fixedRot),          STB_SLK_FLOAT },
+    { "pathTex",           offsetof(Doodads_t, pathTex),           STB_SLK_STR   },
+    { "showInMM",          offsetof(Doodads_t, showInMM),          STB_SLK_BOOL  },
+    { "useMMColor",        offsetof(Doodads_t, useMMColor),        STB_SLK_BOOL  },
+    { "MMRed",             offsetof(Doodads_t, MMRed),             STB_SLK_INT   },
+    { "MMGreen",           offsetof(Doodads_t, MMGreen),           STB_SLK_INT   },
+    { "MMBlue",            offsetof(Doodads_t, MMBlue),            STB_SLK_INT   },
+    DOOD_VERT("vertR01", 0, 0), DOOD_VERT("vertG01", 0, 1), DOOD_VERT("vertB01", 0, 2),
+    DOOD_VERT("vertR02", 1, 0), DOOD_VERT("vertG02", 1, 1), DOOD_VERT("vertB02", 1, 2),
+    DOOD_VERT("vertR03", 2, 0), DOOD_VERT("vertG03", 2, 1), DOOD_VERT("vertB03", 2, 2),
+    DOOD_VERT("vertR04", 3, 0), DOOD_VERT("vertG04", 3, 1), DOOD_VERT("vertB04", 3, 2),
+    DOOD_VERT("vertR05", 4, 0), DOOD_VERT("vertG05", 4, 1), DOOD_VERT("vertB05", 4, 2),
+    DOOD_VERT("vertR06", 5, 0), DOOD_VERT("vertG06", 5, 1), DOOD_VERT("vertB06", 5, 2),
+    DOOD_VERT("vertR07", 6, 0), DOOD_VERT("vertG07", 6, 1), DOOD_VERT("vertB07", 6, 2),
+    DOOD_VERT("vertR08", 7, 0), DOOD_VERT("vertG08", 7, 1), DOOD_VERT("vertB08", 7, 2),
+    DOOD_VERT("vertR09", 8, 0), DOOD_VERT("vertG09", 8, 1), DOOD_VERT("vertB09", 8, 2),
+    DOOD_VERT("vertR10", 9, 0), DOOD_VERT("vertG10", 9, 1), DOOD_VERT("vertB10", 9, 2),
+    { "UserList",          offsetof(Doodads_t, UserList),          STB_SLK_STR   }, /* TFT */
+    { "InBeta",           offsetof(Doodads_t, InBeta),            STB_SLK_BOOL  },
+    { "version",          offsetof(Doodads_t, version),           STB_SLK_INT   }, /* TFT */
+    { NULL, 0, 0 }
+};
+#undef DOOD_VERT
+
+static slkField_t const water_schema[] = {
+    { "",       offsetof(WaterData_t, id),     STB_SLK_FOURCC },
+    { "height", offsetof(WaterData_t, height), STB_SLK_FLOAT  },
+    { NULL, 0, 0 },
+};
+
+static slkField_t const uber_schema[] = {
+    { "",           offsetof(UberSplatData_t, id),         STB_SLK_FOURCC },
+    { "Name",       offsetof(UberSplatData_t, Name),       STB_SLK_STR   },
+    { "comment",    offsetof(UberSplatData_t, comment),    STB_SLK_STR   },
+    { "Dir",        offsetof(UberSplatData_t, Dir),        STB_SLK_STR   },
+    { "file",       offsetof(UberSplatData_t, file),       STB_SLK_STR   },
+    { "BlendMode",  offsetof(UberSplatData_t, BlendMode),  STB_SLK_STR   },
+    { "Scale",      offsetof(UberSplatData_t, Scale),      STB_SLK_FLOAT },
+    { "BirthTime",  offsetof(UberSplatData_t, BirthTime),  STB_SLK_FLOAT },
+    { "PauseTime",  offsetof(UberSplatData_t, PauseTime),  STB_SLK_FLOAT },
+    { "Decay",      offsetof(UberSplatData_t, Decay),      STB_SLK_FLOAT },
+    { "StartR",     offsetof(UberSplatData_t, StartR),     STB_SLK_FLOAT },
+    { "StartG",     offsetof(UberSplatData_t, StartG),     STB_SLK_FLOAT },
+    { "StartB",     offsetof(UberSplatData_t, StartB),     STB_SLK_FLOAT },
+    { "StartA",     offsetof(UberSplatData_t, StartA),     STB_SLK_FLOAT },
+    { "MiddleR",    offsetof(UberSplatData_t, MiddleR),    STB_SLK_FLOAT },
+    { "MiddleG",    offsetof(UberSplatData_t, MiddleG),    STB_SLK_FLOAT },
+    { "MiddleB",    offsetof(UberSplatData_t, MiddleB),    STB_SLK_FLOAT },
+    { "MiddleA",    offsetof(UberSplatData_t, MiddleA),    STB_SLK_FLOAT },
+    { "EndR",       offsetof(UberSplatData_t, EndR),       STB_SLK_FLOAT },
+    { "EndG",       offsetof(UberSplatData_t, EndG),       STB_SLK_FLOAT },
+    { "EndB",       offsetof(UberSplatData_t, EndB),       STB_SLK_FLOAT },
+    { "EndA",       offsetof(UberSplatData_t, EndA),       STB_SLK_FLOAT },
+    { "Sound",      offsetof(UberSplatData_t, Sound),      STB_SLK_STR   },
+    { "version",    offsetof(UberSplatData_t, version),    STB_SLK_INT   }, /* TFT */
+    { "InBeta",     offsetof(UberSplatData_t, InBeta),     STB_SLK_BOOL  }, /* TFT */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const music_schema[] = {
+    { "",          offsetof(MusicData_t, name),      STB_SLK_STR },
+    { "FileNames", offsetof(MusicData_t, FileNames), STB_SLK_STR },
+    { NULL, 0, 0 }
+};
+
+static slkField_t const sound_schema[] = {
+    { "",               offsetof(UnitAckSounds_t, name),           STB_SLK_STR   },
+    { "FileNames",      offsetof(UnitAckSounds_t, FileNames),      STB_SLK_STR   },
+    { "DirectoryBase",  offsetof(UnitAckSounds_t, DirectoryBase),  STB_SLK_STR   },
+    { "Volume",         offsetof(UnitAckSounds_t, Volume),         STB_SLK_FLOAT },
+    { "Pitch",          offsetof(UnitAckSounds_t, Pitch),          STB_SLK_FLOAT },
+    { "PitchVariance",  offsetof(UnitAckSounds_t, PitchVariance),  STB_SLK_FLOAT },
+    { "Priority",       offsetof(UnitAckSounds_t, Priority),       STB_SLK_FLOAT },
+    { "Channel",        offsetof(UnitAckSounds_t, Channel),        STB_SLK_STR   },
+    { "Flags",          offsetof(UnitAckSounds_t, Flags),          STB_SLK_STR   },
+    { "MinDistance",    offsetof(UnitAckSounds_t, MinDistance),    STB_SLK_FLOAT },
+    { "MaxDistance",    offsetof(UnitAckSounds_t, MaxDistance),    STB_SLK_FLOAT },
+    { "DistanceCutoff", offsetof(UnitAckSounds_t, DistanceCutoff), STB_SLK_FLOAT },
+    { "InsideAngle",    offsetof(UnitAckSounds_t, InsideAngle),    STB_SLK_FLOAT }, /* ROC */
+    { "OutsideAngle",   offsetof(UnitAckSounds_t, OutsideAngle),   STB_SLK_FLOAT }, /* ROC */
+    { "OutsideVolume",  offsetof(UnitAckSounds_t, OutsideVolume),  STB_SLK_FLOAT }, /* ROC */
+    { "OrientationX",   offsetof(UnitAckSounds_t, OrientationX),   STB_SLK_FLOAT }, /* ROC */
+    { "OrientationY",   offsetof(UnitAckSounds_t, OrientationY),   STB_SLK_FLOAT }, /* ROC */
+    { "OrientationZ",   offsetof(UnitAckSounds_t, OrientationZ),   STB_SLK_FLOAT }, /* ROC */
+    { "EAXFlags",       offsetof(UnitAckSounds_t, EAXFlags),       STB_SLK_STR   },
+    { "InBeta",        offsetof(UnitAckSounds_t, InBeta),         STB_SLK_BOOL  }, /* TFT */
+    { "version",       offsetof(UnitAckSounds_t, version),        STB_SLK_INT   }, /* TFT */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const item_schema[] = {
+    { "",            offsetof(ItemData_t, id),          STB_SLK_FOURCC },
+    { "scriptname",  offsetof(ItemData_t, scriptname),  STB_SLK_STR   },
+    { "version",     offsetof(ItemData_t, version),     STB_SLK_INT   },
+    { "InBeta",      offsetof(ItemData_t, InBeta),      STB_SLK_BOOL  },
+    { "file",        offsetof(ItemData_t, file),        STB_SLK_STR   },
+    { "abilList",    offsetof(ItemData_t, abilList),    STB_SLK_STR   },
+    { "class",       offsetof(ItemData_t, itemClass),   STB_SLK_STR   }, /* TFT */
+    { "itemClass",   offsetof(ItemData_t, itemClass),   STB_SLK_STR   }, /* ROC alias */
+    { "armor",       offsetof(ItemData_t, armor),       STB_SLK_INT   },
+    { "goldcost",    offsetof(ItemData_t, goldcost),    STB_SLK_INT   },
+    { "lumbercost",  offsetof(ItemData_t, lumbercost),  STB_SLK_INT   },
+    { "HP",          offsetof(ItemData_t, HP),          STB_SLK_INT   },
+    { "Level",       offsetof(ItemData_t, level),       STB_SLK_INT   },
+    { "prio",        offsetof(ItemData_t, prio),        STB_SLK_INT   },
+    { "stockMax",    offsetof(ItemData_t, stockMax),    STB_SLK_INT   },
+    { "stockRegen",  offsetof(ItemData_t, stockRegen),  STB_SLK_INT   },
+    { "stockStart",  offsetof(ItemData_t, stockStart),  STB_SLK_INT   },
+    { "uses",        offsetof(ItemData_t, uses),        STB_SLK_INT   },
+    { "scale",       offsetof(ItemData_t, scale),       STB_SLK_FLOAT }, /* TFT */
+    { "selSize",     offsetof(ItemData_t, selectionSize), STB_SLK_FLOAT }, /* TFT */
+    { "droppable",   offsetof(ItemData_t, droppable),   STB_SLK_BOOL  },
+    { "drop",        offsetof(ItemData_t, drop),        STB_SLK_BOOL  },
+    { "perishable",  offsetof(ItemData_t, perishable),  STB_SLK_BOOL  },
+    { "sellable",    offsetof(ItemData_t, sellable),    STB_SLK_BOOL  }, /* TFT */
+    { "pawnable",    offsetof(ItemData_t, pawnable),    STB_SLK_BOOL  }, /* TFT */
+    { "usable",      offsetof(ItemData_t, usable),      STB_SLK_BOOL  },
+    { "pickRandom",  offsetof(ItemData_t, pickRandom),  STB_SLK_BOOL  }, /* TFT */
+    { "powerup",     offsetof(ItemData_t, powerup),     STB_SLK_BOOL  }, /* TFT */
+    { "morph",       offsetof(ItemData_t, morph),       STB_SLK_BOOL  }, /* TFT */
+    { "ignoreCD",    offsetof(ItemData_t, ignoreCD),    STB_SLK_BOOL  }, /* TFT */
+    { "cooldownID",  offsetof(ItemData_t, cooldownID),  STB_SLK_STR   }, /* TFT */
+    { "oldLevel",    offsetof(ItemData_t, oldLevel),    STB_SLK_INT   }, /* TFT */
+    { "colorR",      offsetof(ItemData_t, colorR),      STB_SLK_INT   }, /* TFT */
+    { "colorG",      offsetof(ItemData_t, colorG),      STB_SLK_INT   }, /* TFT */
+    { "colorB",      offsetof(ItemData_t, colorB),      STB_SLK_INT   }, /* TFT */
+    { "comment",     offsetof(ItemData_t, displayName), STB_SLK_STR   }, /* item display name */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const dest_schema[] = {
+    { "",                 offsetof(DestructableData_t, id),               STB_SLK_FOURCC },
+    { "category",         offsetof(DestructableData_t, category),         STB_SLK_STR   },
+    { "tilesets",         offsetof(DestructableData_t, tilesets),         STB_SLK_STR   },
+    { "comment",          offsetof(DestructableData_t, comment),          STB_SLK_STR   },
+    { "doodClass",        offsetof(DestructableData_t, doodClass),        STB_SLK_STR   },
+    { "version",          offsetof(DestructableData_t, version),          STB_SLK_INT   },
+    { "InBeta",           offsetof(DestructableData_t, InBeta),           STB_SLK_BOOL  },
+    { "file",             offsetof(DestructableData_t, file),             STB_SLK_STR   },
+    { "Name",             offsetof(DestructableData_t, displayName),      STB_SLK_STR   }, /* TFT */
+    { "name",             offsetof(DestructableData_t, displayName),      STB_SLK_STR   }, /* ROC alias */
+    { "EditorSuffix",     offsetof(DestructableData_t, EditorSuffix),     STB_SLK_STR   }, /* TFT */
+    { "texFile",          offsetof(DestructableData_t, textureFile),      STB_SLK_STR   },
+    { "texID",            offsetof(DestructableData_t, texID),            STB_SLK_STR   },
+    { "shadow",           offsetof(DestructableData_t, shadow),           STB_SLK_STR   },
+    { "pathTex",          offsetof(DestructableData_t, pathingTexture),   STB_SLK_STR   },
+    { "pathTexDeath",     offsetof(DestructableData_t, deathPathingTexture), STB_SLK_STR   },
+    { "deathSnd",         offsetof(DestructableData_t, deathSnd),         STB_SLK_STR   },
+    { "targType",         offsetof(DestructableData_t, targetType),       STB_SLK_STR   },
+    { "portraitmodel",    offsetof(DestructableData_t, portraitmodel),    STB_SLK_STR   }, /* TFT */
+    { "UserList",         offsetof(DestructableData_t, UserList),         STB_SLK_STR   }, /* TFT */
+    { "HP",               offsetof(DestructableData_t, maxHealth),        STB_SLK_INT   },
+    { "armor",            offsetof(DestructableData_t, armorSoundType),   STB_SLK_STR   },
+    { "armor",            offsetof(DestructableData_t, armor),            STB_SLK_INT   },
+    { "numVar",           offsetof(DestructableData_t, numVar),           STB_SLK_INT   },
+    { "selSize",          offsetof(DestructableData_t, selSize),          STB_SLK_FLOAT },
+    { "minScale",         offsetof(DestructableData_t, minScale),         STB_SLK_FLOAT },
+    { "maxScale",         offsetof(DestructableData_t, maxScale),         STB_SLK_FLOAT },
+    { "maxPitch",         offsetof(DestructableData_t, maxPitch),         STB_SLK_FLOAT },
+    { "maxRoll",          offsetof(DestructableData_t, maxRoll),          STB_SLK_FLOAT },
+    { "radius",           offsetof(DestructableData_t, radius),           STB_SLK_FLOAT },
+    { "fogRadius",        offsetof(DestructableData_t, fogRadius),        STB_SLK_FLOAT },
+    { "occH",             offsetof(DestructableData_t, occluderHeight),   STB_SLK_FLOAT },
+    { "flyH",             offsetof(DestructableData_t, flyHeight),        STB_SLK_FLOAT },
+    { "cliffHeight",      offsetof(DestructableData_t, cliffHeight),      STB_SLK_FLOAT },
+    { "fogVis",           offsetof(DestructableData_t, fogVisible),       STB_SLK_BOOL  },
+    { "fatLOS",           offsetof(DestructableData_t, fatLOS),           STB_SLK_BOOL  },
+    { "walkable",         offsetof(DestructableData_t, walkable),         STB_SLK_BOOL  },
+    { "onCliffs",         offsetof(DestructableData_t, onCliffs),         STB_SLK_BOOL  },
+    { "onWater",          offsetof(DestructableData_t, onWater),          STB_SLK_BOOL  },
+    { "canPlaceDead",     offsetof(DestructableData_t, canPlaceDead),     STB_SLK_BOOL  },
+    { "canPlaceRandScale",offsetof(DestructableData_t, canPlaceRandScale),STB_SLK_BOOL  },
+    { "lightweight",      offsetof(DestructableData_t, lightweight),      STB_SLK_BOOL  },
+    { "tilesetSpecific",  offsetof(DestructableData_t, tilesetSpecific),  STB_SLK_BOOL  },
+    { "useClickHelper",   offsetof(DestructableData_t, useClickHelper),   STB_SLK_BOOL  },
+    { "showInMM",         offsetof(DestructableData_t, showInMM),         STB_SLK_BOOL  },
+    { "useMMColor",       offsetof(DestructableData_t, useMMColor),       STB_SLK_BOOL  },
+    { "fixedRot",         offsetof(DestructableData_t, fixedRot),         STB_SLK_BOOL  },
+    { "selectable",       offsetof(DestructableData_t, selectable),       STB_SLK_BOOL  }, /* TFT */
+    { "MMRed",            offsetof(DestructableData_t, MMRed),            STB_SLK_INT   },
+    { "MMGreen",          offsetof(DestructableData_t, MMGreen),          STB_SLK_INT   },
+    { "MMBlue",           offsetof(DestructableData_t, MMBlue),           STB_SLK_INT   },
+    { "buildTime",        offsetof(DestructableData_t, buildTime),        STB_SLK_INT   }, /* TFT */
+    { "repairTime",       offsetof(DestructableData_t, repairTime),       STB_SLK_INT   }, /* TFT */
+    { "goldRep",          offsetof(DestructableData_t, goldRep),          STB_SLK_INT   }, /* TFT */
+    { "lumberRep",        offsetof(DestructableData_t, lumberRep),        STB_SLK_INT   }, /* TFT */
+    { "selcircsize",      offsetof(DestructableData_t, selcircsize),      STB_SLK_FLOAT }, /* TFT */
+    { "colorR",           offsetof(DestructableData_t, colorR),           STB_SLK_INT   }, /* TFT */
+    { "colorG",           offsetof(DestructableData_t, colorG),           STB_SLK_INT   }, /* TFT */
+    { "colorB",           offsetof(DestructableData_t, colorB),           STB_SLK_INT   }, /* TFT */
+    { "dir",              offsetof(DestructableData_t, dir),              STB_SLK_STR   }, /* ROC */
+    { NULL, 0, 0 }
+};
+
+static slkField_t const upgrade_schema[] = {
+    { "",          offsetof(UpgradeData_t, id),           STB_SLK_FOURCC },
+    { "comments",  offsetof(UpgradeData_t, comments),     STB_SLK_STR    },
+    { "class",     offsetof(UpgradeData_t, upgradeClass), STB_SLK_STR    },
+    { "race",      offsetof(UpgradeData_t, race),         STB_SLK_STR    },
+    { "flag",      offsetof(UpgradeData_t, flag),         STB_SLK_INT    },
+    { "used",      offsetof(UpgradeData_t, used),          STB_SLK_BOOL   },
+    { "maxlevel",  offsetof(UpgradeData_t, maxLevel),      STB_SLK_INT    },
+    { "inherit",   offsetof(UpgradeData_t, inherit),       STB_SLK_BOOL   },
+    { "goldbase",  offsetof(UpgradeData_t, goldBase),      STB_SLK_INT    },
+    { "goldmod",   offsetof(UpgradeData_t, goldMod),       STB_SLK_INT    },
+    { "lumberbase",offsetof(UpgradeData_t, lumberBase),    STB_SLK_INT    },
+    { "lumbermod", offsetof(UpgradeData_t, lumberMod),     STB_SLK_INT    },
+    { "timebase",  offsetof(UpgradeData_t, timeBase),      STB_SLK_INT    },
+    { "timemod",   offsetof(UpgradeData_t, timeMod),       STB_SLK_INT    },
+    { "effect1",   offsetof(UpgradeData_t, effect[0]),    STB_SLK_FOURCC },
+    { "base1",     offsetof(UpgradeData_t, effectBase[0]),STB_SLK_FLOAT  },
+    { "mod1",      offsetof(UpgradeData_t, effectMod[0]), STB_SLK_FLOAT  },
+    { "code1",     offsetof(UpgradeData_t, effectCode[0]),STB_SLK_FOURCC },
+    { "effect2",   offsetof(UpgradeData_t, effect[1]),    STB_SLK_FOURCC },
+    { "base2",     offsetof(UpgradeData_t, effectBase[1]),STB_SLK_FLOAT  },
+    { "mod2",      offsetof(UpgradeData_t, effectMod[1]), STB_SLK_FLOAT  },
+    { "code2",     offsetof(UpgradeData_t, effectCode[1]),STB_SLK_FOURCC },
+    { "effect3",   offsetof(UpgradeData_t, effect[2]),    STB_SLK_FOURCC },
+    { "base3",     offsetof(UpgradeData_t, effectBase[2]),STB_SLK_FLOAT  },
+    { "mod3",      offsetof(UpgradeData_t, effectMod[2]), STB_SLK_FLOAT  },
+    { "code3",     offsetof(UpgradeData_t, effectCode[2]),STB_SLK_FOURCC },
+    { "effect4",   offsetof(UpgradeData_t, effect[3]),    STB_SLK_FOURCC },
+    { "base4",     offsetof(UpgradeData_t, effectBase[3]),STB_SLK_FLOAT  },
+    { "mod4",      offsetof(UpgradeData_t, effectMod[3]), STB_SLK_FLOAT  },
+    { "code4",     offsetof(UpgradeData_t, effectCode[3]),STB_SLK_FOURCC },
+    { NULL, 0, 0 }
+};
+
+
+static uint32_t ParseWeaponTargetMask(cstring_t text) {
+    uint32_t mask = 0;
+    cstring_t p = text;
+    char *end = NULL;
+
+    while (p && (*p == ' ' || *p == '\t')) p++;
+    if (p && *p >= '0' && *p <= '9') {
+        unsigned long numeric = strtoul(p, &end, 0);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end && !*end) return (uint32_t)numeric;
+    }
+
+    while (p && *p) {
+        char token[32];
+        size_t len = 0;
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        while (*p && *p != ',' && len + 1 < sizeof(token)) token[len++] = *p++;
+        while (len && (token[len - 1] == ' ' || token[len - 1] == '\t')) len--;
+        token[len] = '\0';
+        if (!strcasecmp(token, "none"))            mask |= WC3_TARGET_FLAG_NONE;
+        else if (!strcasecmp(token, "ground"))     mask |= WC3_TARGET_FLAG_GROUND;
+        else if (!strcasecmp(token, "air"))        mask |= WC3_TARGET_FLAG_AIR;
+        else if (!strcasecmp(token, "structure"))  mask |= WC3_TARGET_FLAG_STRUCTURE;
+        else if (!strcasecmp(token, "ward"))       mask |= WC3_TARGET_FLAG_WARD;
+        else if (!strcasecmp(token, "item"))       mask |= WC3_TARGET_FLAG_ITEM;
+        else if (!strcasecmp(token, "tree"))       mask |= WC3_TARGET_FLAG_TREE;
+        else if (!strcasecmp(token, "wall"))       mask |= WC3_TARGET_FLAG_WALL;
+        else if (!strcasecmp(token, "debris"))     mask |= WC3_TARGET_FLAG_DEBRIS;
+        else if (!strcasecmp(token, "decoration")) mask |= WC3_TARGET_FLAG_DECORATION;
+        else if (!strcasecmp(token, "bridge"))     mask |= WC3_TARGET_FLAG_BRIDGE;
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    return mask;
+}
+
+static void NormalizeWeaponTargetMasks(UnitWeapons_t *rows, uint32_t count) {
+    if (!rows) return;
+    FOR_LOOP(i, count) {
+        rows[i].attack1.targetsAllowed = (int32_t)ParseWeaponTargetMask(rows[i].attack1.targetsAllowedText);
+        rows[i].attack2.targetsAllowed = (int32_t)ParseWeaponTargetMask(rows[i].attack2.targetsAllowedText);
+    }
+}
+
+/* =========================================================================
+ * Decoded row arrays and lookup indexes (allocated at InitUnitData time).
+ * =========================================================================*/
+UnitBalance_t *g_UnitBalance; uint32_t g_UnitBalanceCount; static slkIndex_t balance_idx;
+UpgradeData_t *g_UpgradeData; uint32_t g_UpgradeDataCount; static slkIndex_t upgrade_idx;
+UnitProfile_t *g_UnitProfile; uint32_t g_UnitProfileCount; static slkIndex_t profile_idx;
+UnitData_t *g_UnitData; uint32_t g_UnitDataCount; static slkIndex_t data_idx;
+UnitUI_t *g_UnitUI; uint32_t g_UnitUICount; static slkIndex_t ui_idx;
+UnitWeapons_t *g_UnitWeapons; uint32_t g_UnitWeaponsCount; static slkIndex_t weapons_idx;
+UnitAbilities_t *g_UnitAbilities; uint32_t g_UnitAbilitiesCount; static slkIndex_t abil_idx;
+AbilityData_t *g_AbilityData; uint32_t g_AbilityDataCount; static slkIndex_t ability_idx;
+static abilityMetaData_t *ability_metadata; static uint32_t ability_metadata_count; static slkIndex_t ability_meta_idx;
+AbilityBuffData_t *g_AbilityBuffData; uint32_t g_AbilityBuffDataCount; static slkIndex_t ability_buff_idx;
+Doodads_t *g_Doodads; uint32_t g_DoodadsCount; static slkIndex_t doodad_idx;
+UberSplatData_t *g_UberSplatData; uint32_t g_UberSplatDataCount; static slkIndex_t uber_idx;
+static WaterData_t *water_data; static uint32_t water_data_count; static slkIndex_t water_idx;
+UnitAckSounds_t *g_UnitAckSounds; uint32_t g_UnitAckSoundsCount;
+UnitAckSounds_t *g_UnitCombatSounds; uint32_t g_UnitCombatSoundsCount;
+UnitAckSounds_t *g_UISounds; uint32_t g_UISoundsCount;
+UnitAckSounds_t *g_AbilitySounds; uint32_t g_AbilitySoundsCount;
+UnitAckSounds_t *g_AmbienceSounds; uint32_t g_AmbienceSoundsCount;
+UnitAckSounds_t *g_AnimSounds; uint32_t g_AnimSoundsCount;
+UnitAckSounds_t *g_DialogSounds; uint32_t g_DialogSoundsCount;
+MusicData_t *g_MusicData; uint32_t g_MusicDataCount;
+ItemData_t *g_ItemData; uint32_t g_ItemDataCount; static slkIndex_t item_idx;
+DestructableData_t *g_DestructableData; uint32_t g_DestructableDataCount; static slkIndex_t dest_idx;
+
+typedef struct {
+    uint32_t id;
+    UnitBalance_t row;
+} mapUnitBalanceOverride_t;
+
+typedef struct {
+    uint32_t id;
+    UnitProfile_t row;
+} mapUnitProfileOverride_t;
+
+typedef struct {
+    uint32_t id;
+    UnitUI_t row;
+} mapUnitUIOverride_t;
+
+typedef struct {
+    uint32_t id;
+    UnitAbilities_t row;
+} mapUnitAbilitiesOverride_t;
+
+typedef struct {
+    uint32_t id;
+    UnitData_t row;
+} mapUnitDataOverride_t;
+
+typedef struct {
+    uint32_t id;
+    ItemData_t row;
+} mapItemDataOverride_t;
+
+typedef struct {
+    uint32_t id;
+    DestructableData_t row;
+} mapDestructableDataOverride_t;
+
+typedef struct {
+    uint32_t id;
+    Doodads_t row;
+} mapDoodadOverride_t;
+
+typedef struct {
+    uint32_t id, num_levels;
+    AbilityData_t row;
+    abilityLevel_t *extra_levels;
+    bool has_unit_id_override;
+} mapAbilityOverride_t;
+
+static mapUnitBalanceOverride_t *map_unit_balance_overrides;
+static uint32_t map_unit_balance_override_count;
+static mapUnitProfileOverride_t *map_unit_profile_overrides;
+static uint32_t map_unit_profile_override_count;
+static mapUnitUIOverride_t *map_unit_ui_overrides;
+static uint32_t map_unit_ui_override_count;
+static mapUnitAbilitiesOverride_t *map_unit_abilities_overrides;
+static uint32_t map_unit_abilities_override_count;
+static mapUnitDataOverride_t *map_unit_data_overrides;
+static uint32_t map_unit_data_override_count;
+static mapItemDataOverride_t *map_item_data_overrides;
+static uint32_t map_item_data_override_count;
+static mapDestructableDataOverride_t *map_destructable_data_overrides;
+static uint32_t map_destructable_data_override_count;
+static mapDoodadOverride_t *map_doodad_overrides;
+static uint32_t map_doodad_override_count;
+static mapAbilityOverride_t *map_ability_overrides;
+static uint32_t map_ability_override_count;
+static uint32_t ability_data_generation;
+
+typedef struct {
+    cstring_t name, path;
+    slkField_t const *schema;
+    size_t row_size;
+    void **rows;
+    uint32_t *count;
+    slkIndex_t *idx;
+    bool optional; /* legitimately absent in some data sets; zero rows stay silent, typed reads use the static zero */
+} slkStore_t;
+
+static slkStore_t slk_stores[] = {
+    { "UnitBalance", "Units\\UnitBalance.slk", balance_schema, sizeof(*g_UnitBalance), (void **)&g_UnitBalance, &g_UnitBalanceCount, &balance_idx },
+    { "UpgradeData", "Units\\UpgradeData.slk", upgrade_schema, sizeof(*g_UpgradeData), (void **)&g_UpgradeData, &g_UpgradeDataCount, &upgrade_idx },
+    { "UnitData", "Units\\UnitData.slk", data_schema, sizeof(*g_UnitData), (void **)&g_UnitData, &g_UnitDataCount, &data_idx },
+    { "UnitUI", "Units\\UnitUI.slk", ui_schema, sizeof(*g_UnitUI), (void **)&g_UnitUI, &g_UnitUICount, &ui_idx },
+    { "UnitWeapons", "Units\\UnitWeapons.slk", weapons_schema, sizeof(*g_UnitWeapons), (void **)&g_UnitWeapons, &g_UnitWeaponsCount, &weapons_idx },
+    { "UnitAbilities", "Units\\UnitAbilities.slk", abil_schema, sizeof(*g_UnitAbilities), (void **)&g_UnitAbilities, &g_UnitAbilitiesCount, &abil_idx },
+    { "AbilityData", "Units\\AbilityData.slk", ability_schema, sizeof(*g_AbilityData), (void **)&g_AbilityData, &g_AbilityDataCount, &ability_idx },
+    { "AbilityMetaData", "Units\\AbilityMetaData.slk", ability_meta_schema, sizeof(*ability_metadata), (void **)&ability_metadata, &ability_metadata_count, &ability_meta_idx, true },
+    /* AbilityBuffData.slk ships only in War3x.mpq; RoC hides expansion archives, so zero rows are legitimate. */
+    { "AbilityBuffData", "Units\\AbilityBuffData.slk", ability_buff_schema, sizeof(*g_AbilityBuffData), (void **)&g_AbilityBuffData, &g_AbilityBuffDataCount, &ability_buff_idx, true },
+    { "Doodads", "Doodads\\Doodads.slk", doodad_schema, sizeof(*g_Doodads), (void **)&g_Doodads, &g_DoodadsCount, &doodad_idx },
+    { "UberSplatData", "Splats\\UberSplatData.slk", uber_schema, sizeof(*g_UberSplatData), (void **)&g_UberSplatData, &g_UberSplatDataCount, &uber_idx },
+    { "WaterData", "TerrainArt\\Water.slk", water_schema, sizeof(*water_data), (void **)&water_data, &water_data_count, &water_idx },
+    { "UnitAckSounds",    "UI\\SoundInfo\\UnitAckSounds.slk",    sound_schema, sizeof(*g_UnitAckSounds),    (void **)&g_UnitAckSounds,    &g_UnitAckSoundsCount,    NULL },
+    { "UnitCombatSounds", "UI\\SoundInfo\\UnitCombatSounds.slk", sound_schema, sizeof(*g_UnitCombatSounds), (void **)&g_UnitCombatSounds, &g_UnitCombatSoundsCount, NULL },
+    { "UISounds",         "UI\\SoundInfo\\UISounds.slk",         sound_schema, sizeof(*g_UISounds),         (void **)&g_UISounds,         &g_UISoundsCount,         NULL },
+    /* Ability sound aliases referenced by AbilityFunc presentation metadata. */
+    { "AbilitySounds",    "UI\\SoundInfo\\AbilitySounds.slk",    sound_schema, sizeof(*g_AbilitySounds),    (void **)&g_AbilitySounds,    &g_AbilitySoundsCount,    NULL, true },
+    /* Warsmash merges ambience/UI/ability aliases into one keyed sound lookup. */
+    { "AmbienceSounds",   "UI\\SoundInfo\\AmbienceSounds.slk",   sound_schema, sizeof(*g_AmbienceSounds),   (void **)&g_AmbienceSounds,   &g_AmbienceSoundsCount,   NULL, true },
+    /* JASS sound labels may also reference animation/dialogue sound rows. */
+    { "AnimSounds",       "UI\\SoundInfo\\AnimSounds.slk",       sound_schema, sizeof(*g_AnimSounds),       (void **)&g_AnimSounds,       &g_AnimSoundsCount,       NULL, true },
+    { "DialogSounds",     "UI\\SoundInfo\\DialogSounds.slk",     sound_schema, sizeof(*g_DialogSounds),     (void **)&g_DialogSounds,     &g_DialogSoundsCount,     NULL, true },
+    /* Music.slk never shipped in retail MPQs; Warsmash loads it optionally and readers fall back to the raw token. */
+    { "Music",            "UI\\SoundInfo\\Music.slk",            music_schema, sizeof(*g_MusicData),        (void **)&g_MusicData,        &g_MusicDataCount,        NULL, true },
+    { "ItemData", "Units\\ItemData.slk", item_schema, sizeof(*g_ItemData), (void **)&g_ItemData, &g_ItemDataCount, &item_idx },
+    { "DestructableData", "Units\\DestructableData.slk", dest_schema, sizeof(*g_DestructableData), (void **)&g_DestructableData, &g_DestructableDataCount, &dest_idx },
+};
+
+static int32_t G_NormalizeArmorType(cstring_t value, int32_t fallback);
+
+/* Tests replace a typed table and restore its original parser-owned source. */
+#ifdef BZ_TESTS
+/* Tests assert the documented-optional contract without capturing stderr from InitUnitData. */
+bool G_SLKStoreOptional(cstring_t name) {
+    FOR_LOOP(i, sizeof(slk_stores) / sizeof(*slk_stores))
+        if (name && !strcmp(name, slk_stores[i].name)) return slk_stores[i].optional;
+    return false;
+}
+
+slkTestData_t *G_SetSLKRows(cstring_t slk, slkTestData_t *data) {
+    FOR_LOOP(i, sizeof(slk_stores) / sizeof(*slk_stores)) {
+        slkStore_t *store = slk_stores + i;
+        if (!strcmp(slk, store->name)) {
+            slkTestData_t *old = calloc(1, sizeof(*old));
+            if (!old) return NULL;
+            old->rows = *store->rows; old->count = *store->count;
+            if (!data->rows) {
+                data->count = Stb_SlkLoadBuffer(data->text, store->schema, &data->rows, store->row_size);
+                if (!data->count) { free(old); return NULL; }
+            }
+            FS_SLKFreeIndex(store->idx);
+            *store->rows = data->rows; *store->count = data->count;
+            if (!strcmp(store->name, "UnitWeapons"))
+                NormalizeWeaponTargetMasks(g_UnitWeapons, g_UnitWeaponsCount);
+            if (!strcmp(store->name, "UnitUI"))
+                FOR_LOOP(i, g_UnitUICount)
+                    g_UnitUI[i].armorType = G_NormalizeArmorType(g_UnitUI[i].armorSoundType, g_UnitUI[i].armorType);
+            if (!strcmp(store->name, "DestructableData"))
+                FOR_LOOP(i, g_DestructableDataCount)
+                    g_DestructableData[i].armor = G_NormalizeArmorType(g_DestructableData[i].armorSoundType, g_DestructableData[i].armor);
+            if (store->idx) FS_SLKBuildIndex(store->idx, *store->rows, *store->count, store->row_size);
+            if (!strcmp(store->name, "AbilityData")) ability_data_generation++;
+            data->rows = NULL; data->count = 0;
+            return old;
+        }
+    }
+    fprintf(stderr, "SLK: unknown typed table '%s'\n", slk);
+    return NULL;
+}
+
+slkTestData_t *G_SetProfileRows(slkTestData_t *data) {
+    slkTestData_t *old = calloc(1, sizeof(*old));
+    if (!old) return NULL;
+    old->rows = g_UnitProfile; old->count = g_UnitProfileCount;
+    if (!data->rows) {
+        data->count = Stb_SlkLoadBuffer(data->text, profile_schema, &data->rows, sizeof(*g_UnitProfile));
+        if (!data->count) { free(old); return NULL; }
+    }
+    FS_SLKFreeIndex(&profile_idx);
+    g_UnitProfile = data->rows; g_UnitProfileCount = data->count;
+    FS_SLKBuildIndex(&profile_idx, g_UnitProfile, g_UnitProfileCount, sizeof(*g_UnitProfile));
+    data->rows = NULL; data->count = 0;
+    return old;
+}
+#endif
+
+#define M(id,table,member,kind) \
+    { id, offsetof(edict_t, data.table), offsetof(table##_t, member), kind }
+
+unitMeta_t const UnitsMetaData[] = {
+    M("iabi",ItemData,abilList,BZ_FIELD_CSTR),
+    M("iarm",ItemData,armor,BZ_FIELD_U32),
+    M("icla",ItemData,itemClass,BZ_FIELD_CSTR),
+    M("iclb",ItemData,colorB,BZ_FIELD_U32),
+    M("iclg",ItemData,colorG,BZ_FIELD_U32),
+    M("iclr",ItemData,colorR,BZ_FIELD_U32),
+    M("icid",ItemData,cooldownID,BZ_FIELD_CSTR),
+    M("idrp",ItemData,drop,BZ_FIELD_BOOL),
+    M("idro",ItemData,droppable,BZ_FIELD_BOOL),
+    M("ifil",ItemData,file,BZ_FIELD_CSTR),
+    M("igol",ItemData,goldcost,BZ_FIELD_U32),
+    M("ihtp",ItemData,HP,BZ_FIELD_U32),
+    M("iicd",ItemData,ignoreCD,BZ_FIELD_BOOL),
+    M("ilev",ItemData,level,BZ_FIELD_U32),
+    M("ilum",ItemData,lumbercost,BZ_FIELD_U32),
+    M("imor",ItemData,morph,BZ_FIELD_BOOL),
+    M("ilvo",ItemData,oldLevel,BZ_FIELD_U32),
+    M("iper",ItemData,perishable,BZ_FIELD_BOOL),
+    M("iprn",ItemData,pickRandom,BZ_FIELD_BOOL),
+    M("ipow",ItemData,powerup,BZ_FIELD_BOOL),
+    M("ipri",ItemData,prio,BZ_FIELD_U32),
+    M("isca",ItemData,scale,BZ_FIELD_FLOAT),
+    M("issc",ItemData,selectionSize,BZ_FIELD_FLOAT),
+    M("isel",ItemData,sellable,BZ_FIELD_BOOL),
+    M("ipaw",ItemData,pawnable,BZ_FIELD_BOOL),
+    M("isto",ItemData,stockMax,BZ_FIELD_U32),
+    M("istr",ItemData,stockRegen,BZ_FIELD_U32),
+    M("isst",ItemData,stockStart,BZ_FIELD_U32),
+    M("iusa",ItemData,usable,BZ_FIELD_BOOL),
+    M("iuse",ItemData,uses,BZ_FIELD_U32),
+    M("bcat",DestructableData,category,BZ_FIELD_CSTR),
+    M("btil",DestructableData,tilesets,BZ_FIELD_CSTR),
+    M("bnam",DestructableData,displayName,BZ_FIELD_CSTR),
+    M("bfil",DestructableData,file,BZ_FIELD_CSTR),
+    M("btxf",DestructableData,textureFile,BZ_FIELD_CSTR),
+    M("btxi",DestructableData,texID,BZ_FIELD_CSTR),
+    M("bshd",DestructableData,shadow,BZ_FIELD_CSTR),
+    M("bptx",DestructableData,pathingTexture,BZ_FIELD_CSTR),
+    M("bptd",DestructableData,deathPathingTexture,BZ_FIELD_CSTR),
+    M("bdsn",DestructableData,deathSnd,BZ_FIELD_CSTR),
+    M("btar",DestructableData,targetType,BZ_FIELD_CSTR),
+    M("bhps",DestructableData,maxHealth,BZ_FIELD_U32),
+    M("barm",DestructableData,armorSoundType,BZ_FIELD_CSTR),
+    M("bvar",DestructableData,numVar,BZ_FIELD_U32),
+    M("bsel",DestructableData,selSize,BZ_FIELD_FLOAT),
+    M("bmis",DestructableData,minScale,BZ_FIELD_FLOAT),
+    M("bmas",DestructableData,maxScale,BZ_FIELD_FLOAT),
+    M("bmap",DestructableData,maxPitch,BZ_FIELD_FLOAT),
+    M("bmar",DestructableData,maxRoll,BZ_FIELD_FLOAT),
+    M("brad",DestructableData,radius,BZ_FIELD_FLOAT),
+    M("boch",DestructableData,occluderHeight,BZ_FIELD_FLOAT),
+    M("bflh",DestructableData,flyHeight,BZ_FIELD_FLOAT),
+    M("bwal",DestructableData,walkable,BZ_FIELD_BOOL),
+    M("bonw",DestructableData,onWater,BZ_FIELD_BOOL),
+    M("bonc",DestructableData,onCliffs,BZ_FIELD_BOOL),
+    M("uani",UnitProfile,animProps,BZ_FIELD_CSTR),
+    M("uico",UnitProfile,art,BZ_FIELD_CSTR),
+    M("iico",UnitProfile,itemArt,BZ_FIELD_CSTR),
+    M("uaap",UnitProfile,attachmentAnimProps,BZ_FIELD_CSTR),
+    M("ualp",UnitProfile,attachmentLinkProps,BZ_FIELD_CSTR),
+    M("uawt",UnitProfile,awakenTip,BZ_FIELD_CSTR),
+    M("ubpr",UnitProfile,boneProps,BZ_FIELD_CSTR),
+    M("ubsl",UnitProfile,buildingSoundLabel,BZ_FIELD_CSTR),
+    M("ubui",UnitProfile,builds,BZ_FIELD_CSTR),
+    M("ubpx",UnitProfile,buttonPosX,BZ_FIELD_CSTR),
+    M("ubpy",UnitProfile,buttonPosY,BZ_FIELD_CSTR),
+    M("ucua",UnitProfile,casterUpgradeArt,BZ_FIELD_CSTR),
+    M("ucun",UnitProfile,casterUpgradeName,BZ_FIELD_CSTR),
+    M("ucut",UnitProfile,casterUpgradeTip,BZ_FIELD_CSTR),
+    M("udep",UnitProfile,dependencyOr,BZ_FIELD_CSTR),
+    M("ides",UnitProfile,description,BZ_FIELD_CSTR),
+    M("unsf",UnitProfile,editorSuffix,BZ_FIELD_CSTR),
+    M("uhot",UnitProfile,hotkey,BZ_FIELD_CSTR),
+    M("ulfi",UnitProfile,loopingSoundFadeIn,BZ_FIELD_CSTR),
+    M("ulfo",UnitProfile,loopingSoundFadeOut,BZ_FIELD_CSTR),
+    M("umki",UnitProfile,makeItems,BZ_FIELD_CSTR),
+    M("uma1",UnitProfile,attack[0].arc,BZ_FIELD_FLOAT),
+    M("uma2",UnitProfile,attack[1].arc,BZ_FIELD_FLOAT),
+    M("ua1m",UnitProfile,attack[0].art,BZ_FIELD_CSTR),
+    M("ua2m",UnitProfile,attack[1].art,BZ_FIELD_CSTR),
+    M("umh1",UnitProfile,attack[0].homing,BZ_FIELD_BOOL),
+    M("umh2",UnitProfile,attack[1].homing,BZ_FIELD_BOOL),
+    M("ua1z",UnitProfile,attack[0].speed,BZ_FIELD_FLOAT),
+    M("ua2z",UnitProfile,attack[1].speed,BZ_FIELD_FLOAT),
+    M("umsl",UnitProfile,movementSoundLabel,BZ_FIELD_CSTR),
+    M("unam",UnitProfile,name,BZ_FIELD_CSTR),
+    M("upro",UnitProfile,properNames,BZ_FIELD_CSTR),
+    M("ursl",UnitProfile,randomSoundLabel,BZ_FIELD_CSTR),
+    M("urqc",UnitProfile,requiresCount,BZ_FIELD_CSTR),
+    M("ureq",UnitProfile,requires,BZ_FIELD_CSTR),
+    M("urq1",UnitProfile,requiresLevel[0],BZ_FIELD_CSTR),
+    M("urq2",UnitProfile,requiresLevel[1],BZ_FIELD_CSTR),
+    M("urq3",UnitProfile,requiresLevel[2],BZ_FIELD_CSTR),
+    M("urq4",UnitProfile,requiresLevel[3],BZ_FIELD_CSTR),
+    M("urq5",UnitProfile,requiresLevel[4],BZ_FIELD_CSTR),
+    M("urq6",UnitProfile,requiresLevel[5],BZ_FIELD_CSTR),
+    M("urq7",UnitProfile,requiresLevel[6],BZ_FIELD_CSTR),
+    M("urq8",UnitProfile,requiresLevel[7],BZ_FIELD_CSTR),
+    M("urqa",UnitProfile,requiresAmount,BZ_FIELD_CSTR),
+    M("ures",UnitProfile,researches,BZ_FIELD_CSTR),
+    M("urev",UnitProfile,revive,BZ_FIELD_CSTR),
+    M("utpr",UnitProfile,reviveTip,BZ_FIELD_CSTR),
+    M("ussi",UnitProfile,scoreScreenIcon,BZ_FIELD_CSTR),
+    M("usei",UnitProfile,sellItems,BZ_FIELD_CSTR),
+    M("useu",UnitProfile,sellUnits,BZ_FIELD_CSTR),
+    M("uspa",UnitProfile,specialArt,BZ_FIELD_CSTR),
+    M("utaa",UnitProfile,targetArt,BZ_FIELD_CSTR),
+    M("utip",UnitProfile,tip,BZ_FIELD_CSTR),
+    M("utra",UnitProfile,trains,BZ_FIELD_CSTR),
+    M("urva",UnitProfile,reviveAt,BZ_FIELD_CSTR),
+    M("utub",UnitProfile,uberTip,BZ_FIELD_CSTR),
+    M("uupt",UnitProfile,upgrade,BZ_FIELD_CSTR),
+    M("uabi",UnitAbilities,abilList,BZ_FIELD_CSTR),
+    M("udaa",UnitAbilities,defaultActiveAbility,BZ_FIELD_FOURCC),
+    M("uhab",UnitAbilities,heroAbilList,BZ_FIELD_CSTR),
+    M("uagi",UnitBalance,agility,BZ_FIELD_U32),
+    M("uagp",UnitBalance,agilityPerLevel,BZ_FIELD_FLOAT),
+    M("ubld",UnitBalance,buildTime,BZ_FIELD_U32),
+    M("ubdi",UnitBalance,goldBountyDice,BZ_FIELD_U32),
+    M("ubba",UnitBalance,goldBountyBase,BZ_FIELD_U32),
+    M("ubsi",UnitBalance,goldBountySides,BZ_FIELD_U32),
+    M("ulbd",UnitBalance,lumberBountyDice,BZ_FIELD_U32),
+    M("ulba",UnitBalance,lumberBountyBase,BZ_FIELD_U32),
+    M("ulbs",UnitBalance,lumberBountySides,BZ_FIELD_U32),
+    M("ucol",UnitBalance,collision,BZ_FIELD_FLOAT),
+    M("ucod",UnitData,collision,BZ_FIELD_FLOAT),
+    M("udef",UnitBalance,baseArmor,BZ_FIELD_U32),
+    M("udfc",UnitBalance,armor,BZ_FIELD_FLOAT),
+    M("udty",UnitBalance,defenseType,BZ_FIELD_CSTR),
+    M("udup",UnitBalance,armorPerUpgrade,BZ_FIELD_U32),
+    M("ufma",UnitBalance,foodMade,BZ_FIELD_U32),
+    M("ufoo",UnitBalance,foodUsed,BZ_FIELD_U32),
+    M("ugol",UnitBalance,goldCost,BZ_FIELD_U32),
+    M("ugor",UnitBalance,goldRep,BZ_FIELD_U32),
+    M("uhpm",UnitBalance,maxHealth,BZ_FIELD_FLOAT),
+    M("uint",UnitBalance,intelligence,BZ_FIELD_U32),
+    M("uinp",UnitBalance,intelligencePerLevel,BZ_FIELD_FLOAT),
+    M("ubdg",UnitUI,isBuilding,BZ_FIELD_BOOL),
+    M("ulev",UnitBalance,level,BZ_FIELD_U32),
+    M("ulum",UnitBalance,lumberCost,BZ_FIELD_U32),
+    M("ulur",UnitBalance,lumberRep,BZ_FIELD_U32),
+    M("umpi",UnitBalance,initialMana,BZ_FIELD_FLOAT),
+    M("umpm",UnitBalance,maxMana,BZ_FIELD_FLOAT),
+    M("umas",UnitBalance,maxSpeed,BZ_FIELD_FLOAT),
+    M("umis",UnitBalance,minSpeed,BZ_FIELD_FLOAT),
+    M("unbr",UnitBalance,nbrandom,BZ_FIELD_U32),
+    M("usin",UnitBalance,nightSightRadius,BZ_FIELD_FLOAT),
+    M("upap",UnitBalance,preventPlace,BZ_FIELD_CSTR),
+    M("upra",UnitBalance,primaryAttribute,BZ_FIELD_CSTR),
+    M("uhpr",UnitBalance,healthRegen,BZ_FIELD_FLOAT),
+    M("umpr",UnitBalance,manaRegen,BZ_FIELD_FLOAT),
+    M("uhrt",UnitBalance,healthRegenType,BZ_FIELD_CSTR),
+    M("urtm",UnitBalance,reptm,BZ_FIELD_U32),
+    M("urpo",UnitBalance,repulse,BZ_FIELD_U32),
+    M("urpg",UnitBalance,repulseGroup,BZ_FIELD_U32),
+    M("urpp",UnitBalance,repulseParam,BZ_FIELD_FLOAT),
+    M("urpr",UnitBalance,repulsePrio,BZ_FIELD_U32),
+    M("upar",UnitBalance,requirePlace,BZ_FIELD_CSTR),
+    M("usid",UnitBalance,sightRadius,BZ_FIELD_FLOAT),
+    M("umvs",UnitBalance,speed,BZ_FIELD_FLOAT),
+    M("usma",UnitBalance,stockMax,BZ_FIELD_U32),
+    M("usrg",UnitBalance,stockRegen,BZ_FIELD_U32),
+    M("usst",UnitBalance,stockStart,BZ_FIELD_U32),
+    M("ustr",UnitBalance,strength,BZ_FIELD_U32),
+    M("ustp",UnitBalance,strengthPerLevel,BZ_FIELD_FLOAT),
+    M("util",UnitBalance,tilesets,BZ_FIELD_CSTR),
+    M("utyp",UnitBalance,type,BZ_FIELD_CSTR),
+    M("upgr",UnitBalance,upgrades,BZ_FIELD_CSTR),
+    M("uabr",UnitData,buffRadius,BZ_FIELD_FLOAT),
+    M("uabt",UnitData,buffType,BZ_FIELD_CSTR),
+    M("ucbo",UnitData,canBuildOn,BZ_FIELD_BOOL),
+    M("ufle",UnitData,canFlee,BZ_FIELD_BOOL),
+    M("usle",UnitData,canSleep,BZ_FIELD_BOOL),
+    M("ucar",UnitData,cargoSize,BZ_FIELD_U32),
+    M("udtm",UnitData,death,BZ_FIELD_FLOAT),
+    M("udea",UnitData,deathType,BZ_FIELD_U32),
+    M("ulos",UnitData,useExtendedLineOfSight,BZ_FIELD_BOOL),
+    M("ufor",UnitData,formationRank,BZ_FIELD_U32),
+    M("uibo",UnitData,isBuildOn,BZ_FIELD_BOOL),
+    M("umvf",UnitData,moveFloor,BZ_FIELD_FLOAT),
+    M("umvh",UnitData,moveHeight,BZ_FIELD_FLOAT),
+    M("umvt",UnitData,moveTypeName,BZ_FIELD_CSTR),
+    M("upru",UnitData,nameCount,BZ_FIELD_U32),
+    M("uori",UnitData,orientationInterpolation,BZ_FIELD_U32),
+    M("upat",UnitData,pathingTexture,BZ_FIELD_CSTR),
+    M("upoi",UnitData,points,BZ_FIELD_U32),
+    M("upri",UnitData,priority,BZ_FIELD_U32),
+    M("uprw",UnitData,propWin,BZ_FIELD_FLOAT),
+    M("urac",UnitData,race,BZ_FIELD_CSTR),
+    M("upaw",UnitData,requireWaterRadius,BZ_FIELD_FLOAT),
+    M("utar",UnitData,targetType,BZ_FIELD_CSTR),
+    M("umvr",UnitData,turnRate,BZ_FIELD_FLOAT),
+    M("uarm",UnitUI,armorType,BZ_FIELD_U32),
+    M("uble",UnitUI,blend,BZ_FIELD_FLOAT),
+    M("uclb",UnitUI,tintBlue,BZ_FIELD_U32),
+    M("ushb",UnitUI,buildingShadowTexture,BZ_FIELD_CSTR),
+    M("ucam",UnitUI,campaign,BZ_FIELD_BOOL),
+    M("utcc",UnitUI,customTeamColor,BZ_FIELD_BOOL),
+    M("udro",UnitUI,dropItems,BZ_FIELD_BOOL),
+    M("uept",UnitUI,elevationSamplePoints,BZ_FIELD_U32),
+    M("uerd",UnitUI,elevationSampleRadius,BZ_FIELD_FLOAT),
+    M("umdl",UnitUI,modelFile,BZ_FIELD_CSTR),
+    M("uver",UnitUI,fileVerFlags,BZ_FIELD_U32),
+    M("ufrd",UnitUI,fogOfWarSampleRadius,BZ_FIELD_FLOAT),
+    M("uclg",UnitUI,tintGreen,BZ_FIELD_U32),
+    M("uhos",UnitUI,hostilePal,BZ_FIELD_BOOL),
+    M("uine",UnitUI,inEditor,BZ_FIELD_BOOL),
+    M("umxp",UnitUI,maxPitchDegrees,BZ_FIELD_FLOAT),
+    M("umxr",UnitUI,maxRollDegrees,BZ_FIELD_FLOAT),
+    M("usca",UnitUI,modelScale,BZ_FIELD_FLOAT),
+    M("unbm",UnitUI,neutralBuildingMinimapIcon,BZ_FIELD_BOOL),
+    M("uhhb",UnitUI,hideHeroBar,BZ_FIELD_BOOL),
+    M("uhhm",UnitUI,hideHeroMinimap,BZ_FIELD_BOOL),
+    M("uhhd",UnitUI,hideHeroDeathMsg,BZ_FIELD_BOOL),
+    M("uhom",UnitUI,hideOnMinimap,BZ_FIELD_BOOL),
+    M("uocc",UnitUI,occluderHeight,BZ_FIELD_FLOAT),
+    M("uclr",UnitUI,tintRed,BZ_FIELD_U32),
+    M("urun",UnitUI,animationRunSpeed,BZ_FIELD_FLOAT),
+    M("ussc",UnitUI,selectionScale,BZ_FIELD_FLOAT),
+    M("uscb",UnitUI,scaleProjectiles,BZ_FIELD_BOOL),
+    M("usew",UnitUI,selectionCircleOnWater,BZ_FIELD_BOOL),
+    M("uslz",UnitUI,selectionCircleHeight,BZ_FIELD_FLOAT),
+    M("ushh",UnitUI,shadowHeight,BZ_FIELD_FLOAT),
+    M("ushr",UnitUI,waterShadow,BZ_FIELD_BOOL),
+    M("ushw",UnitUI,shadowWidth,BZ_FIELD_FLOAT),
+    M("ushx",UnitUI,shadowCenterX,BZ_FIELD_FLOAT),
+    M("ushy",UnitUI,shadowCenterY,BZ_FIELD_FLOAT),
+    M("uspe",UnitUI,special,BZ_FIELD_CSTR),
+    M("utco",UnitUI,teamColor,BZ_FIELD_U32),
+    M("utss",UnitUI,tilesetSpecific,BZ_FIELD_BOOL),
+    M("uubs",UnitUI,groundTexture,BZ_FIELD_CSTR),
+    M("ushu",UnitUI,unitShadowTexture,BZ_FIELD_CSTR),
+    M("usnd",UnitUI,soundLabel,BZ_FIELD_CSTR),
+    M("uuch",UnitUI,useClickHelper,BZ_FIELD_BOOL),
+    M("uwal",UnitUI,animationWalkSpeed,BZ_FIELD_FLOAT),
+    M("uacq",UnitWeapons,acquisitionRange,BZ_FIELD_FLOAT),
+    M("ua1t",UnitWeapons,attack1.attackType,BZ_FIELD_CSTR),
+    M("ua2t",UnitWeapons,attack2.attackType,BZ_FIELD_CSTR),
+    M("ubs1",UnitWeapons,attack1.backswingPoint,BZ_FIELD_FLOAT),
+    M("ubs2",UnitWeapons,attack2.backswingPoint,BZ_FIELD_FLOAT),
+    M("ucbs",UnitWeapons,castBackSwing,BZ_FIELD_FLOAT),
+    M("ucpt",UnitWeapons,castPoint,BZ_FIELD_FLOAT),
+    M("ua1c",UnitWeapons,attack1.cooldown,BZ_FIELD_FLOAT),
+    M("ua2c",UnitWeapons,attack2.cooldown,BZ_FIELD_FLOAT),
+    M("udl1",UnitWeapons,attack1.damageLossFactor,BZ_FIELD_FLOAT),
+    M("udl2",UnitWeapons,attack2.damageLossFactor,BZ_FIELD_FLOAT),
+    M("ua1d",UnitWeapons,attack1.damageDice,BZ_FIELD_U32),
+    M("ua2d",UnitWeapons,attack2.damageDice,BZ_FIELD_U32),
+    M("ua1b",UnitWeapons,attack1.damageBase,BZ_FIELD_U32),
+    M("ua2b",UnitWeapons,attack2.damageBase,BZ_FIELD_U32),
+    M("udp1",UnitWeapons,attack1.damagePoint,BZ_FIELD_FLOAT),
+    M("udp2",UnitWeapons,attack2.damagePoint,BZ_FIELD_FLOAT),
+    M("udu1",UnitWeapons,attack1.damageUpgradeAmount,BZ_FIELD_U32),
+    M("udu2",UnitWeapons,attack2.damageUpgradeAmount,BZ_FIELD_U32),
+    M("ua1f",UnitWeapons,attack1.areaFull,BZ_FIELD_FLOAT),
+    M("ua2f",UnitWeapons,attack2.areaFull,BZ_FIELD_FLOAT),
+    M("ua1h",UnitWeapons,attack1.areaMedium,BZ_FIELD_FLOAT),
+    M("ua2h",UnitWeapons,attack2.areaMedium,BZ_FIELD_FLOAT),
+    M("uhd1",UnitWeapons,attack1.factorMedium,BZ_FIELD_FLOAT),
+    M("uhd2",UnitWeapons,attack2.factorMedium,BZ_FIELD_FLOAT),
+    M("uisz",UnitWeapons,impactSwimZ,BZ_FIELD_FLOAT),
+    M("uimz",UnitWeapons,impactHeight,BZ_FIELD_FLOAT),
+    M("ulsz",UnitWeapons,launchSwimZ,BZ_FIELD_FLOAT),
+    M("ulpx",UnitData,launchOffsetX,BZ_FIELD_FLOAT),
+    M("ulpy",UnitData,launchOffsetY,BZ_FIELD_FLOAT),
+    M("ulpz",UnitData,launchOffsetZ,BZ_FIELD_FLOAT),
+    M("uamn",UnitWeapons,minimumAttackRange,BZ_FIELD_FLOAT),
+    M("ua1q",UnitWeapons,attack1.areaSmall,BZ_FIELD_FLOAT),
+    M("ua2q",UnitWeapons,attack2.areaSmall,BZ_FIELD_FLOAT),
+    M("uqd1",UnitWeapons,attack1.factorSmall,BZ_FIELD_FLOAT),
+    M("uqd2",UnitWeapons,attack2.factorSmall,BZ_FIELD_FLOAT),
+    M("ua1r",UnitWeapons,attack1.range,BZ_FIELD_FLOAT),
+    M("ua2r",UnitWeapons,attack2.range,BZ_FIELD_FLOAT),
+    M("urb1",UnitWeapons,attack1.rangeBuffer,BZ_FIELD_FLOAT),
+    M("urb2",UnitWeapons,attack2.rangeBuffer,BZ_FIELD_FLOAT),
+    M("uwu1",UnitWeapons,attack1.showUI,BZ_FIELD_BOOL),
+    M("uwu2",UnitWeapons,attack2.showUI,BZ_FIELD_BOOL),
+    M("ua1s",UnitWeapons,attack1.damageSides,BZ_FIELD_U32),
+    M("ua2s",UnitWeapons,attack2.damageSides,BZ_FIELD_U32),
+    M("usd1",UnitWeapons,attack1.spillDistance,BZ_FIELD_FLOAT),
+    M("usd2",UnitWeapons,attack2.spillDistance,BZ_FIELD_FLOAT),
+    M("usr1",UnitWeapons,attack1.spillRadius,BZ_FIELD_FLOAT),
+    M("usr2",UnitWeapons,attack2.spillRadius,BZ_FIELD_FLOAT),
+    M("ua1p",UnitWeapons,attack1.areaTargets,BZ_FIELD_U32),
+    M("ua2p",UnitWeapons,attack2.areaTargets,BZ_FIELD_U32),
+    M("utc1",UnitWeapons,attack1.maxTargets,BZ_FIELD_U32),
+    M("utc2",UnitWeapons,attack2.maxTargets,BZ_FIELD_U32),
+    M("ua1g",UnitWeapons,attack1.targetsAllowed,BZ_FIELD_U32),
+    M("ua2g",UnitWeapons,attack2.targetsAllowed,BZ_FIELD_U32),
+    M("uaen",UnitWeapons,attacksEnabled,BZ_FIELD_U32),
+    M("ua1w",UnitWeapons,attack1.weaponType,BZ_FIELD_CSTR),
+    M("ua2w",UnitWeapons,attack2.weaponType,BZ_FIELD_CSTR),
+    M("ucs1",UnitWeapons,attack1.weaponSound,BZ_FIELD_CSTR),
+    M("ucs2",UnitWeapons,attack2.weaponSound,BZ_FIELD_CSTR),
+    { 0 }
+};
+
+#undef M
+
+/* =========================================================================
+ * Map-local object typed-row overrides.
+ *
+ * war3map.w3u/w3t records are owned by CM/mapInfo for the lifetime of a map.
+ * A spawned edict keeps immutable typed-row pointers, so overrides must live
+ * in stable per-map rows rather than a shared scratch object. UnitBalance,
+ * UnitProfile, UnitUI, UnitAbilities, and ItemData have per-map merges; other
+ * typed unit tables still resolve custom IDs to their base row.
+ * =========================================================================*/
+static UnitBalance_t const *FindMapUnitBalanceOverride(uint32_t id) {
+    FOR_LOOP(i, map_unit_balance_override_count) {
+        if (map_unit_balance_overrides[i].id == id)
+            return &map_unit_balance_overrides[i].row;
+    }
+    return NULL;
+}
+
+static UnitProfile_t const *FindMapUnitProfileOverride(uint32_t id) {
+    FOR_LOOP(i, map_unit_profile_override_count) {
+        if (map_unit_profile_overrides[i].id == id)
+            return &map_unit_profile_overrides[i].row;
+    }
+    return NULL;
+}
+
+static UnitUI_t const *FindMapUnitUIOverride(uint32_t id) {
+    FOR_LOOP(i, map_unit_ui_override_count) {
+        if (map_unit_ui_overrides[i].id == id)
+            return &map_unit_ui_overrides[i].row;
+    }
+    return NULL;
+}
+
+static UnitAbilities_t const *FindMapUnitAbilitiesOverride(uint32_t id) {
+    FOR_LOOP(i, map_unit_abilities_override_count) {
+        if (map_unit_abilities_overrides[i].id == id)
+            return &map_unit_abilities_overrides[i].row;
+    }
+    return NULL;
+}
+
+static UnitData_t const *FindMapUnitDataOverride(uint32_t id) {
+    FOR_LOOP(i, map_unit_data_override_count) {
+        if (map_unit_data_overrides[i].id == id)
+            return &map_unit_data_overrides[i].row;
+    }
+    return NULL;
+}
+
+static ItemData_t const *FindMapItemDataOverride(uint32_t id) {
+    FOR_LOOP(i, map_item_data_override_count) {
+        if (map_item_data_overrides[i].id == id)
+            return &map_item_data_overrides[i].row;
+    }
+    return NULL;
+}
+
+static DestructableData_t const *FindMapDestructableDataOverride(uint32_t id) {
+    FOR_LOOP(i, map_destructable_data_override_count) {
+        if (map_destructable_data_overrides[i].id == id)
+            return &map_destructable_data_overrides[i].row;
+    }
+    return NULL;
+}
+
+static Doodads_t const *FindMapDoodadOverride(uint32_t id) {
+    FOR_LOOP(i, map_doodad_override_count)
+        if (map_doodad_overrides[i].id == id) return &map_doodad_overrides[i].row;
+    return NULL;
+}
+
+static bool UnitModificationString(unitModification_t const *mod) {
+    switch (mod->type) {
+    case mod_string:
+    case mod_unitList:
+    case mod_itemList:
+    case mod_regenType:
+    case mod_attackType:
+    case mod_weaponType:
+    case mod_targetType:
+    case mod_moveType:
+    case mod_defenseType:
+    case mod_pathingTexture:
+    case mod_upgradeList:
+    case mod_stringList:
+    case mod_abilityList:
+    case mod_heroAbilityList:
+    case mod_missileArt:
+    case mod_attributeType:
+    case mod_attackBits:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void ApplyMapObjectTypedField(void *row, size_t row_offset, unitModification_t const *mod) {
+    unitMeta_t const *metadata = G_FindMetaData(UnitsMetaData, mod->modID);
+    uint8_t *dest;
+
+    if (!metadata || metadata->row_offset != row_offset || !mod->data)
+        return;
+
+    dest = (uint8_t *)row + metadata->field_offset;
+    switch (metadata->type) {
+    case BZ_FIELD_CSTR:
+        if (UnitModificationString(mod))
+            *(cstring_t *)dest = (cstring_t)mod->data;
+        break;
+    case BZ_FIELD_FLOAT:
+        if (mod->type == mod_real || mod->type == mod_unreal)
+            *(float *)dest = *(float const *)mod->data;
+        break;
+    case BZ_FIELD_BOOL:
+        if (mod->type == mod_int)
+            *(bool *)dest = *(uint32_t const *)mod->data != 0;
+        else if (mod->type == mod_bool || mod->type == mod_char)
+            *(bool *)dest = *(uint8_t const *)mod->data != 0;
+        break;
+    case BZ_FIELD_U32:
+        if (mod->type == mod_int)
+            *(uint32_t *)dest = *(uint32_t const *)mod->data;
+        else if (mod->type == mod_bool || mod->type == mod_char)
+            *(uint32_t *)dest = *(uint8_t const *)mod->data;
+        break;
+    case BZ_FIELD_FOURCC:
+        if (mod->type == mod_int)
+            *(uint32_t *)dest = *(uint32_t const *)mod->data;
+        break;
+    default:
+        break;
+    }
+}
+
+static void AddMapUnitBalanceOverride(unitData_t const *unit, uint32_t target_id, uint32_t base_id) {
+    UnitBalance_t const *base = FindMapUnitBalanceOverride(base_id);
+    mapUnitBalanceOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&balance_idx, base_id);
+    override = map_unit_balance_overrides + map_unit_balance_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, unit->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.UnitBalance), unit->modifications + i);
+}
+
+static void AddMapUnitProfileOverride(unitData_t const *unit, uint32_t target_id, uint32_t base_id) {
+    UnitProfile_t const *base = FindMapUnitProfileOverride(base_id);
+    mapUnitProfileOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&profile_idx, base_id);
+    override = map_unit_profile_overrides + map_unit_profile_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, unit->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.UnitProfile), unit->modifications + i);
+}
+
+static void AddMapUnitUIOverride(unitData_t const *unit, uint32_t target_id, uint32_t base_id) {
+    UnitUI_t const *base = FindMapUnitUIOverride(base_id);
+    mapUnitUIOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&ui_idx, base_id);
+    override = map_unit_ui_overrides + map_unit_ui_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, unit->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.UnitUI), unit->modifications + i);
+}
+
+static void AddMapUnitAbilitiesOverride(unitData_t const *unit, uint32_t target_id, uint32_t base_id) {
+    UnitAbilities_t const *base = FindMapUnitAbilitiesOverride(base_id);
+    mapUnitAbilitiesOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&abil_idx, base_id);
+    override = map_unit_abilities_overrides + map_unit_abilities_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, unit->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.UnitAbilities), unit->modifications + i);
+}
+
+static void AddMapUnitDataOverride(unitData_t const *unit, uint32_t target_id, uint32_t base_id) {
+    UnitData_t const *base = FindMapUnitDataOverride(base_id);
+    mapUnitDataOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&data_idx, base_id);
+    override = map_unit_data_overrides + map_unit_data_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+
+    FOR_LOOP(i, unit->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.UnitData), unit->modifications + i);
+}
+
+static void AddMapItemDataOverride(unitData_t const *item, uint32_t target_id, uint32_t base_id) {
+    ItemData_t const *base = FindMapItemDataOverride(base_id);
+    mapItemDataOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&item_idx, base_id);
+    override = map_item_data_overrides + map_item_data_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, item->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.ItemData), item->modifications + i);
+}
+
+static void AddMapDestructableDataOverride(unitData_t const *object, uint32_t target_id, uint32_t base_id) {
+    DestructableData_t const *base = FindMapDestructableDataOverride(base_id);
+    mapDestructableDataOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&dest_idx, base_id);
+    override = map_destructable_data_overrides + map_destructable_data_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, object->numbeOfModifications)
+        ApplyMapObjectTypedField(&override->row, offsetof(edict_t, data.DestructableData), object->modifications + i);
+
+    override->row.armor = G_NormalizeArmorType(override->row.armorSoundType, override->row.armor);
+}
+
+/* Map-local W3D records inherit an existing Doodads.slk row, then replace
+ * authored fields.  In particular, Rexxar's forcewall types are custom IDs
+ * whose dfil model path is absent from the stock Doodads.slk.  No campaign
+ * rawcode or model path is hardcoded here. */
+static void AddMapDoodadOverride(unitData_t const *object, uint32_t target_id, uint32_t base_id) {
+    Doodads_t const *base = FindMapDoodadOverride(base_id);
+    mapDoodadOverride_t *override;
+
+    if (!base) base = FS_SLKLookup(&doodad_idx, base_id);
+    override = map_doodad_overrides + map_doodad_override_count++;
+    memset(&override->row, 0, sizeof(override->row));
+    if (base) override->row = *base;
+    override->id = target_id;
+    override->row.id = target_id;
+
+    FOR_LOOP(i, object->numbeOfModifications) {
+        unitModification_t const *mod = object->modifications + i;
+        /* dfil is a model stem/path; dvar controls numbered MDX variations.
+         * Do not apply unrelated variation-specific fields to every instance. */
+        if (mod->modID == MAKEFOURCC('d','f','i','l') &&
+            UnitModificationString(mod) && mod->data)
+            override->row.file = (cstring_t)mod->data;
+        else if (mod->modID == MAKEFOURCC('d','v','a','r') &&
+                 mod->type == mod_int && mod->data &&
+                 *(int32_t const *)mod->data > 0)
+            override->row.numVar = *(int32_t const *)mod->data;
+    }
+}
+
+void G_SetMapUnitOverrides(mapInfo_t const *mapinfo) {
+    uint32_t unit_capacity, item_capacity, destructable_capacity, doodad_capacity;
+
+    free(map_unit_balance_overrides);
+    map_unit_balance_overrides = NULL;
+    map_unit_balance_override_count = 0;
+    free(map_unit_profile_overrides);
+    map_unit_profile_overrides = NULL;
+    map_unit_profile_override_count = 0;
+    free(map_unit_ui_overrides);
+    map_unit_ui_overrides = NULL;
+    map_unit_ui_override_count = 0;
+    free(map_unit_abilities_overrides);
+    map_unit_abilities_overrides = NULL;
+    map_unit_abilities_override_count = 0;
+    free(map_unit_data_overrides);
+    map_unit_data_overrides = NULL;
+    map_unit_data_override_count = 0;
+    free(map_item_data_overrides);
+    map_item_data_overrides = NULL;
+    map_item_data_override_count = 0;
+    free(map_destructable_data_overrides);
+    map_destructable_data_overrides = NULL;
+    map_destructable_data_override_count = 0;
+    free(map_doodad_overrides);
+    map_doodad_overrides = NULL;
+    map_doodad_override_count = 0;
+    if (!mapinfo) return;
+
+    unit_capacity = mapinfo->num_originalUnits + mapinfo->num_userCreatedUnits;
+    item_capacity = mapinfo->num_originalItems + mapinfo->num_userCreatedItems;
+    destructable_capacity = mapinfo->num_originalDestructables + mapinfo->num_userCreatedDestructables;
+    doodad_capacity = mapinfo->num_originalDoodads + mapinfo->num_userCreatedDoodads;
+    if (!unit_capacity && !item_capacity && !destructable_capacity && !doodad_capacity) return;
+    if (unit_capacity) {
+        map_unit_balance_overrides = calloc(unit_capacity, sizeof(*map_unit_balance_overrides));
+        map_unit_profile_overrides = calloc(unit_capacity, sizeof(*map_unit_profile_overrides));
+        map_unit_ui_overrides = calloc(unit_capacity, sizeof(*map_unit_ui_overrides));
+        map_unit_abilities_overrides = calloc(unit_capacity, sizeof(*map_unit_abilities_overrides));
+        map_unit_data_overrides = calloc(unit_capacity, sizeof(*map_unit_data_overrides));
+    }
+    if (item_capacity)
+        map_item_data_overrides = calloc(item_capacity, sizeof(*map_item_data_overrides));
+    if (destructable_capacity)
+        map_destructable_data_overrides = calloc(destructable_capacity, sizeof(*map_destructable_data_overrides));
+    if (doodad_capacity)
+        map_doodad_overrides = calloc(doodad_capacity, sizeof(*map_doodad_overrides));
+    if ((unit_capacity && (!map_unit_balance_overrides || !map_unit_profile_overrides ||
+                           !map_unit_ui_overrides || !map_unit_abilities_overrides || !map_unit_data_overrides)) ||
+        (item_capacity && !map_item_data_overrides) ||
+        (destructable_capacity && !map_destructable_data_overrides) ||
+        (doodad_capacity && !map_doodad_overrides)) {
+        free(map_unit_balance_overrides); map_unit_balance_overrides = NULL;
+        free(map_unit_profile_overrides); map_unit_profile_overrides = NULL;
+        free(map_unit_ui_overrides); map_unit_ui_overrides = NULL;
+        free(map_unit_abilities_overrides); map_unit_abilities_overrides = NULL;
+        free(map_unit_data_overrides); map_unit_data_overrides = NULL;
+        free(map_item_data_overrides); map_item_data_overrides = NULL;
+        free(map_destructable_data_overrides); map_destructable_data_overrides = NULL;
+        free(map_doodad_overrides); map_doodad_overrides = NULL;
+        return;
+    }
+
+    /* Original-object edits become the inheritance source for custom objects. */
+    FOR_LOOP(i, mapinfo->num_originalUnits) {
+        unitData_t const *unit = mapinfo->originalUnits + i;
+        AddMapUnitBalanceOverride(unit, unit->originalUnitID, unit->originalUnitID);
+        AddMapUnitProfileOverride(unit, unit->originalUnitID, unit->originalUnitID);
+        AddMapUnitUIOverride(unit, unit->originalUnitID, unit->originalUnitID);
+        AddMapUnitAbilitiesOverride(unit, unit->originalUnitID, unit->originalUnitID);
+        AddMapUnitDataOverride(unit, unit->originalUnitID, unit->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_userCreatedUnits) {
+        unitData_t const *unit = mapinfo->userCreatedUnits + i;
+        AddMapUnitBalanceOverride(unit, unit->newUnitID, unit->originalUnitID);
+        AddMapUnitProfileOverride(unit, unit->newUnitID, unit->originalUnitID);
+        AddMapUnitUIOverride(unit, unit->newUnitID, unit->originalUnitID);
+        AddMapUnitAbilitiesOverride(unit, unit->newUnitID, unit->originalUnitID);
+        AddMapUnitDataOverride(unit, unit->newUnitID, unit->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_originalItems) {
+        unitData_t const *item = mapinfo->originalItems + i;
+        AddMapItemDataOverride(item, item->originalUnitID, item->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_userCreatedItems) {
+        unitData_t const *item = mapinfo->userCreatedItems + i;
+        AddMapItemDataOverride(item, item->newUnitID, item->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_originalDestructables) {
+        unitData_t const *object = mapinfo->originalDestructables + i;
+        AddMapDestructableDataOverride(object, object->originalUnitID, object->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_userCreatedDestructables) {
+        unitData_t const *object = mapinfo->userCreatedDestructables + i;
+        AddMapDestructableDataOverride(object, object->newUnitID, object->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_originalDoodads) {
+        unitData_t const *object = mapinfo->originalDoodads + i;
+        AddMapDoodadOverride(object, object->originalUnitID, object->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_userCreatedDoodads) {
+        unitData_t const *object = mapinfo->userCreatedDoodads + i;
+        AddMapDoodadOverride(object, object->newUnitID, object->originalUnitID);
+    }
+}
+
+/* war3map.w3a → AbilityData. Apply DataA–I via dataPointer+level, plus common
+ * scalar fields identified by AbilityMetaData-style fourccs (alev/arlv/…). */
+static mapAbilityOverride_t const *FindMapAbilityOverride(uint32_t id) {
+    FOR_LOOP(i, map_ability_override_count)
+        if (map_ability_overrides[i].id == id) return map_ability_overrides + i;
+    return NULL;
+}
+
+static abilityLevel_t *MapAbilityOverrideLevel(mapAbilityOverride_t *override, uint32_t level) {
+    if (!override || level < 1 || level > override->num_levels) return NULL;
+    return level <= 4 ? &override->row.level[level - 1] : override->extra_levels + level - 5;
+}
+
+static abilityLevel_t const *MapAbilityLevelForInheritance(mapAbilityOverride_t const *override, uint32_t level) {
+    uint32_t last = override->num_levels;
+    if (last <= 4 && override->row.levels > 0) last = MIN(last, (uint32_t)override->row.levels);
+    level = MAX(1, MIN(level, last));
+    return level <= 4 ? &override->row.level[level - 1] : override->extra_levels + level - 5;
+}
+
+static abilityLevel_t const *SLKAbilityLevelForInheritance(AbilityData_t const *row, uint32_t level) {
+    uint32_t last = row->levels > 0 ? MIN((uint32_t)row->levels, 4u) : 1;
+    return row->level + MAX(1, MIN(level, last)) - 1;
+}
+
+static bool MapAbilityFieldAllows(unitModification_t const *mod, uint32_t candidate) {
+    abilityMetaData_t const *meta = FS_SLKLookup(&ability_meta_idx, mod->modID);
+    if (!meta || !meta->field || strcmp(meta->field, "Data") ||
+        meta->data != (int32_t)mod->dataPointer || !meta->useSpecific) return false;
+    PARSE_LIST(meta->useSpecific, name, parse_segment)
+        if (strlen(name) == 4 && FS_SLKKey(name) == candidate) return true;
+    return false;
+}
+
+/* RoC has no AbilityMetaData.slk. A matching authored Order can still confirm
+ * the field-name candidate; absent that confirmation, leave it unresolved. */
+static uint32_t MapAbilityParentFromOrder(unitData_t const *ability, cstring_t order) {
+    uint32_t parent = 0, handler = 0;
+    if (!order) return 0;
+    FOR_LOOP(i, ability->numbeOfModifications) {
+        unitModification_t const *mod = ability->modifications + i;
+        char field[5] = { 0 };
+        uint32_t candidate, candidate_handler;
+        AbilityData_t const *row;
+        cstring_t candidate_order;
+        if (mod->dataPointer < 1 || mod->dataPointer > 9) continue;
+        memcpy(field, GetClassName(mod->modID), 4);
+        if (field[3] != '0' + mod->dataPointer) return 0;
+        candidate = MAKEFOURCC('A', field[0], field[1], field[2]);
+        row = G_AbilityData(candidate);
+        candidate_order = FindConfigValue(GetClassName(candidate), "Order");
+        if (!row->id || !candidate_order || strcasecmp(order, candidate_order)) return 0;
+        candidate_handler = row->code ? row->code : candidate;
+        if (handler && handler != candidate_handler) return 0;
+        if (!parent) parent = candidate;
+        handler = candidate_handler;
+    }
+    return parent;
+}
+
+/* Original-table custom rows omit the parent rawcode. AbilityMetaData lists
+ * every stock ability that owns each Data field; the map's Order selects among
+ * different mechanics that share a field (Ocl1 is used by lightning and healing). */
+static uint32_t MapAbilityParentFromFields(unitData_t const *ability) {
+    abilityMetaData_t const *first = NULL;
+    uint32_t parent = 0, handler = 0;
+    char id[5] = { 0 };
+    cstring_t order;
+
+    memcpy(id, GetClassName(ability->newUnitID ? ability->newUnitID : ability->originalUnitID), 4);
+    order = FindConfigValue(id, "Order");
+    if (!ability_metadata_count) return MapAbilityParentFromOrder(ability, order);
+    FOR_LOOP(i, ability->numbeOfModifications) {
+        unitModification_t const *mod = ability->modifications + i;
+        abilityMetaData_t const *meta;
+        if (mod->dataPointer < 1 || mod->dataPointer > 9) continue;
+        meta = FS_SLKLookup(&ability_meta_idx, mod->modID);
+        if (!meta || !meta->field || strcmp(meta->field, "Data") ||
+            meta->data != (int32_t)mod->dataPointer || !meta->useSpecific) {
+            fprintf(stderr, "G_SetMapAbilityOverrides: no AbilityMetaData for %.4s field %.4s\n",
+                    id, GetClassName(mod->modID));
+            return 0;
+        }
+        if (!first) first = meta;
+    }
+    if (!first) return 0;
+    PARSE_LIST(first->useSpecific, name, parse_segment) {
+        AbilityData_t const *row;
+        uint32_t candidate, candidate_handler;
+        cstring_t candidate_order;
+        bool valid = true;
+
+        if (strlen(name) != 4) continue;
+        candidate = FS_SLKKey(name);
+        row = G_AbilityData(candidate);
+        if (!row || !row->id) continue;
+        FOR_LOOP(i, ability->numbeOfModifications) {
+            unitModification_t const *mod = ability->modifications + i;
+            if (mod->dataPointer >= 1 && mod->dataPointer <= 9 &&
+                !MapAbilityFieldAllows(mod, candidate)) { valid = false; break; }
+        }
+        if (!valid) continue;
+        candidate_order = FindConfigValue(name, "Order");
+        if (order && (!candidate_order || strcasecmp(order, candidate_order))) continue;
+        candidate_handler = row->code ? row->code : candidate;
+        if (parent && handler != candidate_handler) {
+            fprintf(stderr, "G_SetMapAbilityOverrides: ambiguous ability mechanic for %.4s%s%s\n",
+                    id, order ? " order " : "", order ? order : "");
+            return 0;
+        }
+        if (!parent) parent = candidate;
+        handler = candidate_handler;
+    }
+    if (!parent) fprintf(stderr, "G_SetMapAbilityOverrides: no matching ability mechanic for %.4s\n", id);
+    return parent;
+}
+
+static void ApplyMapAbilityMod(mapAbilityOverride_t *override, unitModification_t const *mod) {
+    abilityLevel_t *slot;
+    float value;
+
+    if (!override || !mod || !mod->data) return;
+
+    /* AbilityMetaData stores UnitID as a rawcode string on ability-specific
+     * field IDs (for example Hwe1). Apply it before the numeric/data-slot
+     * cases, and remember that the authored override owns this endpoint. */
+    abilityMetaData_t const *meta = FS_SLKLookup(&ability_meta_idx, mod->modID);
+    if (meta && meta->field && !strcmp(meta->field, "UnitID")) {
+        if (UnitModificationString(mod) && (slot = MapAbilityOverrideLevel(override, mod->level))) {
+            slot->unitID = FS_SLKKey((cstring_t)mod->data);
+            override->has_unit_id_override = true;
+        }
+        return;
+    }
+
+    /* Named AbilityMetaData fields first — their dataPointer is often 0 and
+     * must not be mistaken for DataA. */
+    switch (mod->modID) {
+    case MAKEFOURCC('a','l','e','v'):
+        if (mod->type == mod_int) override->row.levels = (int32_t)*(uint32_t const *)mod->data;
+        return;
+    case MAKEFOURCC('a','r','l','v'):
+        if (mod->type == mod_int) override->row.reqLevel = (int32_t)*(uint32_t const *)mod->data;
+        return;
+    case MAKEFOURCC('a','l','s','k'):
+        if (mod->type == mod_int) override->row.levelSkip = (int32_t)*(uint32_t const *)mod->data;
+        return;
+    case MAKEFOURCC('a','p','r','i'):
+        if (mod->type == mod_int) override->row.priority = (int32_t)*(uint32_t const *)mod->data;
+        return;
+    case MAKEFOURCC('a','t','a','r'):
+        if (UnitModificationString(mod) && (slot = MapAbilityOverrideLevel(override, mod->level)))
+            slot->targs = (cstring_t)mod->data;
+        return;
+    case MAKEFOURCC('a','m','c','s'):
+    case MAKEFOURCC('a','c','a','s'):
+    case MAKEFOURCC('a','d','u','r'):
+    case MAKEFOURCC('a','h','d','u'):
+    case MAKEFOURCC('a','c','d','n'):
+    case MAKEFOURCC('a','a','r','e'):
+    case MAKEFOURCC('a','r','a','n'):
+        slot = MapAbilityOverrideLevel(override, mod->level);
+        if (!slot) return;
+        value = (mod->type == mod_int) ? (float)*(uint32_t const *)mod->data : *(float const *)mod->data;
+        if (mod->modID == MAKEFOURCC('a','c','a','s')) slot->cast = value;
+        else if (mod->modID == MAKEFOURCC('a','d','u','r')) slot->dur = value;
+        else if (mod->modID == MAKEFOURCC('a','h','d','u')) slot->heroDur = value;
+        else if (mod->modID == MAKEFOURCC('a','c','d','n')) slot->cool = value;
+        else if (mod->modID == MAKEFOURCC('a','a','r','e')) slot->area = value;
+        else if (mod->modID == MAKEFOURCC('a','r','a','n')) slot->range = value;
+        else slot->cost = value;
+        return;
+    default:
+        break;
+    }
+
+    /* W3A dataPointer is one-based: 1..9 address DataA..DataI. */
+    if (mod->dataPointer >= 1 && mod->dataPointer <= 9 &&
+        (slot = MapAbilityOverrideLevel(override, mod->level))) {
+        if (mod->type == mod_int) {
+            slot->data[mod->dataPointer - 1].number = (float)*(uint32_t const *)mod->data;
+            slot->data[mod->dataPointer - 1].id = *(uint32_t const *)mod->data;
+        } else if (mod->type == mod_real || mod->type == mod_unreal) {
+            slot->data[mod->dataPointer - 1].number = *(float const *)mod->data;
+        }
+    }
+}
+
+static void AddMapAbilityOverride(unitData_t const *ability, uint32_t target_id, uint32_t base_id) {
+    mapAbilityOverride_t const *base_override = FindMapAbilityOverride(base_id);
+    AbilityData_t const *base = base_override ? &base_override->row : FS_SLKLookup(&ability_idx, base_id);
+    mapAbilityOverride_t *override = map_ability_overrides + map_ability_override_count;
+    uint32_t num_levels = MAX(4, base_override ? base_override->num_levels : (base ? MAX(0, base->levels) : 0));
+    uint32_t max_mod_level = 0;
+    bool has_authored_level_count = false;
+
+    if (!base) {
+        uint32_t inferred = MapAbilityParentFromFields(ability);
+        if (inferred) {
+            base_id = inferred;
+            base_override = FindMapAbilityOverride(base_id);
+            base = base_override ? &base_override->row : FS_SLKLookup(&ability_idx, base_id);
+            num_levels = MAX(num_levels, base_override ? base_override->num_levels :
+                             (base ? MAX(1, base->levels) : 0));
+        }
+    }
+    FOR_LOOP(i, ability->numbeOfModifications) {
+        unitModification_t const *mod = ability->modifications + i;
+        if (mod->level > num_levels) num_levels = mod->level;
+        if (mod->level > max_mod_level) max_mod_level = mod->level;
+        if (mod->modID == MAKEFOURCC('a','l','e','v') && mod->type == mod_int && mod->data) {
+            has_authored_level_count = true;
+            if (*(uint32_t const *)mod->data > num_levels) num_levels = *(uint32_t const *)mod->data;
+        }
+    }
+    memset(override, 0, sizeof(*override));
+    if (num_levels > 4 && !(override->extra_levels = calloc(num_levels - 4, sizeof(*override->extra_levels)))) {
+        char id[5] = { 0 };
+        memcpy(id, GetClassName(target_id), 4);
+        fprintf(stderr, "G_SetMapAbilityOverrides: could not allocate %u ability levels for %.4s\n",
+                (unsigned)num_levels, id);
+        return;
+    }
+    if (base) override->row = *base;
+    else {
+        char id[5] = { 0 }, parent[5] = { 0 };
+        memcpy(id, GetClassName(target_id), 4);
+        memcpy(parent, GetClassName(ability->originalUnitID), 4);
+        fprintf(stderr, "G_SetMapAbilityOverrides: no AbilityData base for %.4s (original %.4s)\n", id, parent);
+    }
+    override->id = target_id;
+    override->num_levels = num_levels;
+    if (base) FOR_LOOP(i, num_levels - 4) {
+        abilityLevel_t const *level = base_override
+            ? MapAbilityLevelForInheritance(base_override, i + 5)
+            : SLKAbilityLevelForInheritance(base, i + 5);
+        if (level) override->extra_levels[i] = *level;
+    }
+    override->row.id = target_id;
+
+    FOR_LOOP(i, ability->numbeOfModifications)
+        ApplyMapAbilityMod(override, ability->modifications + i);
+    /* Expose map-defined ranks when alev did not explicitly set the cap. */
+    if (!has_authored_level_count && max_mod_level > (uint32_t)MAX(0, override->row.levels))
+        override->row.levels = (int32_t)max_mod_level;
+    map_ability_override_count++;
+}
+
+static void FreeMapAbilityOverrides(void) {
+    FOR_LOOP(i, map_ability_override_count) free(map_ability_overrides[i].extra_levels);
+    free(map_ability_overrides);
+    map_ability_overrides = NULL;
+    map_ability_override_count = 0;
+}
+
+void G_SetMapAbilityOverrides(mapInfo_t const *mapinfo) {
+    uint32_t capacity;
+
+    FreeMapAbilityOverrides();
+    ability_data_generation++;
+    if (!mapinfo) return;
+
+    capacity = mapinfo->num_originalAbilities + mapinfo->num_userCreatedAbilities;
+    if (!capacity) return;
+    map_ability_overrides = calloc(capacity, sizeof(*map_ability_overrides));
+    if (!map_ability_overrides) {
+        fprintf(stderr, "G_SetMapAbilityOverrides: could not allocate %u map ability overrides\n", (unsigned)capacity);
+        return;
+    }
+
+    /* Build stock-backed parents first, so custom original rows inherit them regardless of W3A order. */
+    FOR_LOOP(i, mapinfo->num_originalAbilities) {
+        unitData_t const *ability = mapinfo->originalAbilities + i;
+        if (FS_SLKLookup(&ability_idx, ability->originalUnitID))
+            AddMapAbilityOverride(ability, ability->originalUnitID, ability->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_originalAbilities) {
+        unitData_t const *ability = mapinfo->originalAbilities + i;
+        if (!FS_SLKLookup(&ability_idx, ability->originalUnitID))
+            AddMapAbilityOverride(ability, ability->originalUnitID, ability->originalUnitID);
+    }
+    FOR_LOOP(i, mapinfo->num_userCreatedAbilities) {
+        unitData_t const *ability = mapinfo->userCreatedAbilities + i;
+        AddMapAbilityOverride(ability, ability->newUnitID, ability->originalUnitID);
+    }
+}
+
+/* =========================================================================
+ * Public lookup functions.
+ * Map-created units remap their ID to the base unit ID for typed tables that
+ * do not yet have a per-map merge. UnitBalance, UnitProfile, and UnitUI check
+ * stable map rows first.
+ * =========================================================================*/
+static uint32_t ResolveUnitID(uint32_t id) {
+    if (!level.mapinfo) return id;
+    FOR_LOOP(n, level.mapinfo->num_userCreatedUnits) {
+        if (level.mapinfo->userCreatedUnits[n].newUnitID == id)
+            return level.mapinfo->userCreatedUnits[n].originalUnitID;
+    }
+    return id;
+}
+
+static uint32_t ResolveDestructableID(uint32_t id) {
+    if (!level.mapinfo) return id;
+    FOR_LOOP(n, level.mapinfo->num_userCreatedDestructables) {
+        unitData_t const *object = level.mapinfo->userCreatedDestructables + n;
+        if (object->newUnitID == id)
+            return object->originalUnitID;
+    }
+    return id;
+}
+
+static uint32_t ResolveItemID(uint32_t id) {
+    if (!level.mapinfo) return id;
+    FOR_LOOP(n, level.mapinfo->num_userCreatedItems) {
+        if (level.mapinfo->userCreatedItems[n].newUnitID == id)
+            return level.mapinfo->userCreatedItems[n].originalUnitID;
+    }
+    return id;
+}
+
+/* Resolve a Warcraft field code through the immutable typed row cached on the edict. */
+static uint8_t const *UnitFieldValue(edict_t *unit, uint32_t field_id, bzFieldType_t *type) {
+    unitMeta_t const *metadata = G_FindMetaData(UnitsMetaData, field_id);
+    if (!metadata) { warn_unregistered_field(field_id); return NULL; }
+    uint8_t const *row = *(uint8_t const *const *)((uint8_t const *)unit + metadata->row_offset);
+    if (!row) return NULL;
+    *type = metadata->type;
+    return row + metadata->field_offset;
+}
+
+cstring_t UnitMetaString(edict_t *unit, uint32_t field_id) {
+    bzFieldType_t type; uint8_t const *value = UnitFieldValue(unit, field_id, &type);
+    return value && type == BZ_FIELD_CSTR ? *(cstring_t const *)value : NULL;
+}
+
+int32_t UnitMetaInteger(edict_t *unit, uint32_t field_id) {
+    bzFieldType_t type; uint8_t const *value = UnitFieldValue(unit, field_id, &type);
+    if (!value) return 0;
+    switch (type) {
+    case BZ_FIELD_FLOAT: return (int32_t)*(float const *)value;
+    case BZ_FIELD_BOOL: return *(bool const *)value;
+    case BZ_FIELD_CSTR: { cstring_t str = *(cstring_t const *)value; return str ? atoi(str) : 0; }
+    default: return *(int32_t const *)value;
+    }
+}
+
+bool UnitMetaBoolean(edict_t *unit, uint32_t field_id) {
+    bzFieldType_t type; uint8_t const *value = UnitFieldValue(unit, field_id, &type);
+    if (!value) return false;
+    if (type == BZ_FIELD_BOOL) return *(bool const *)value;
+    if (type == BZ_FIELD_FLOAT) return *(float const *)value != 0;
+    if (type == BZ_FIELD_CSTR) { cstring_t str = *(cstring_t const *)value; return str && (atoi(str) || !strcmp(str, "true")); }
+    return *(int32_t const *)value != 0;
+}
+
+float UnitMetaReal(edict_t *unit, uint32_t field_id) {
+    bzFieldType_t type; uint8_t const *value = UnitFieldValue(unit, field_id, &type);
+    if (!value) return 0;
+    if (type == BZ_FIELD_FLOAT) return *(float const *)value;
+    if (type == BZ_FIELD_BOOL) return *(bool const *)value;
+    if (type == BZ_FIELD_CSTR) { cstring_t str = *(cstring_t const *)value; return str ? atof(str) : 0; }
+    return *(int32_t const *)value;
+}
+
+UnitBalance_t const *G_UnitBalance(uint32_t id) {
+    static UnitBalance_t zero;
+    UnitBalance_t const *override = FindMapUnitBalanceOverride(id);
+    UnitBalance_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&balance_idx, ResolveUnitID(id));
+    return row ? row : &zero;
+}
+UpgradeData_t const *G_UpgradeData(uint32_t id) { static UpgradeData_t zero; UpgradeData_t *row = FS_SLKLookup(&upgrade_idx, id); return row ? row : &zero; }
+UnitProfile_t const *G_UnitProfile(uint32_t id) {
+    static UnitProfile_t zero;
+    UnitProfile_t const *override = FindMapUnitProfileOverride(id);
+    UnitProfile_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&profile_idx, ResolveUnitID(id));
+    return row ? row : &zero;
+}
+UnitData_t const *G_UnitData(uint32_t id) {
+    static UnitData_t zero;
+    UnitData_t const *override = FindMapUnitDataOverride(id);
+    UnitData_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&data_idx, ResolveUnitID(id));
+    return row ? row : &zero;
+}
+UnitUI_t const *G_UnitUI(uint32_t id) {
+    static UnitUI_t zero;
+    UnitUI_t const *override = FindMapUnitUIOverride(id);
+    UnitUI_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&ui_idx, ResolveUnitID(id));
+    return row ? row : &zero;
+}
+UnitWeapons_t const *G_UnitWeapons(uint32_t id) { static UnitWeapons_t zero; UnitWeapons_t *row = FS_SLKLookup(&weapons_idx, ResolveUnitID(id)); return row ? row : &zero; }
+UnitAbilities_t const *G_UnitAbil(uint32_t id) {
+    static UnitAbilities_t zero;
+    UnitAbilities_t const *override = FindMapUnitAbilitiesOverride(id);
+    UnitAbilities_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&abil_idx, ResolveUnitID(id));
+    return row ? row : &zero;
+}
+AbilityData_t const *G_AbilityData(uint32_t id) {
+    static AbilityData_t zero;
+    mapAbilityOverride_t const *override = FindMapAbilityOverride(id);
+    AbilityData_t *row;
+    if (override) return &override->row;
+    row = FS_SLKLookup(&ability_idx, id);
+    return row ? row : &zero;
+}
+AbilityData_t const *G_AbilityDataName(cstring_t name) { return G_AbilityData(FS_SLKKey(name)); }
+abilityLevel_t const *G_AbilityLevel(uint32_t id, uint32_t level) {
+    mapAbilityOverride_t const *override = FindMapAbilityOverride(id);
+    AbilityData_t const *row = G_AbilityData(id);
+    if (override) {
+        level = MAX(1, MIN(level, override->num_levels));
+        return level <= 4 ? &row->level[level - 1] : override->extra_levels + level - 5;
+    }
+    level = MAX(1, MIN(level, 4));
+    return row->level + level - 1;
+}
+AbilityBuffData_t const *G_AbilityBuffData(uint32_t id) { static AbilityBuffData_t zero; AbilityBuffData_t *row = FS_SLKLookup(&ability_buff_idx, id); return row ? row : &zero; }
+uint32_t G_AbilityCode(uint32_t id) { uint32_t code = G_AbilityData(id)->code; return code ? code : id; }
+uint32_t G_AbilityCodeName(cstring_t name) { return G_AbilityCode(FS_SLKKey(name)); }
+bool G_AbilityHasUnitIdOverride(uint32_t id) {
+    mapAbilityOverride_t const *override = FindMapAbilityOverride(id);
+    return override && override->has_unit_id_override;
+}
+
+/* Tooltip markup names authored AbilityData columns, so reflect through the
+ * same DDX schema while gameplay continues to use typed fields directly. */
+cstring_t G_AbilityDataText(cstring_t name, cstring_t column) {
+    static char text[4][32]; static uint32_t cursor;
+    AbilityData_t const *row = G_AbilityDataName(name);
+    string_t out = text[cursor++ & 3];
+    for (slkField_t const *field = ability_schema; field->column; field++) {
+        uint8_t const *value;
+        if (strcasecmp(column, field->column)) continue;
+        value = (uint8_t const *)row + field->offset;
+        if (field->type == BZ_FIELD_CSTR) return *(cstring_t const *)value;
+        if (field->type == BZ_FIELD_FLOAT) snprintf(out, 32, "%g", *(float const *)value);
+        else if (field->type == BZ_FIELD_FOURCC) snprintf(out, 32, "%.4s", (cstring_t)value);
+        else snprintf(out, 32, "%u", *(uint32_t const *)value);
+        return out;
+    }
+    return NULL;
+}
+Doodads_t const *G_Doodad(uint32_t id) {
+    static Doodads_t zero;
+    Doodads_t const *row = FindMapDoodadOverride(id);
+    if (!row) row = FS_SLKLookup(&doodad_idx, id);
+    return row ? row : &zero;
+}
+WaterData_t const *G_WaterData(uint32_t id) { static WaterData_t zero; WaterData_t *row = FS_SLKLookup(&water_idx, id); return row ? row : &zero; }
+UberSplatData_t const *G_UberSplat(uint32_t id) { static UberSplatData_t zero; UberSplatData_t *row = FS_SLKLookup(&uber_idx, id); return row ? row : &zero; }
+UnitAckSounds_t const *G_UnitAckSound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_UnitAckSoundsCount)
+        if (g_UnitAckSounds[i].name && !strcmp(g_UnitAckSounds[i].name, name)) return g_UnitAckSounds + i;
+    return &zero;
+}
+UnitAckSounds_t const *G_UnitCombatSound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_UnitCombatSoundsCount)
+        if (g_UnitCombatSounds[i].name && !strcmp(g_UnitCombatSounds[i].name, name)) return g_UnitCombatSounds + i;
+    return &zero;
+}
+
+UnitAckSounds_t const *G_UISound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_UISoundsCount)
+        if (g_UISounds[i].name && !strcmp(g_UISounds[i].name, name)) return g_UISounds + i;
+    return &zero;
+}
+
+UnitAckSounds_t const *G_AmbienceSound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_AmbienceSoundsCount)
+        if (g_AmbienceSounds[i].name && !strcmp(g_AmbienceSounds[i].name, name)) return g_AmbienceSounds + i;
+    return &zero;
+}
+
+UnitAckSounds_t const *G_AbilitySound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    UnitAckSounds_t const *row;
+
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_AbilitySoundsCount)
+        if (g_AbilitySounds[i].name && !strcmp(g_AbilitySounds[i].name, name)) return g_AbilitySounds + i;
+    row = G_AmbienceSound(name);
+    if (row->name && row->name[0]) return row;
+    row = G_UISound(name);
+    return row->name && row->name[0] ? row : &zero;
+}
+
+UnitAckSounds_t const *G_AnimSound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_AnimSoundsCount)
+        if (g_AnimSounds[i].name && !strcmp(g_AnimSounds[i].name, name)) return g_AnimSounds + i;
+    return &zero;
+}
+
+UnitAckSounds_t const *G_DialogSound(cstring_t name) {
+    static UnitAckSounds_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_DialogSoundsCount)
+        if (g_DialogSounds[i].name && !strcmp(g_DialogSounds[i].name, name)) return g_DialogSounds + i;
+    return &zero;
+}
+
+UnitAckSounds_t const *G_KeyedSound(cstring_t name) {
+    UnitAckSounds_t const *row;
+
+    /* Warcraft's label constructors accept rows from all normal SoundInfo
+     * catalogs. Keep the existing GameUI merge precedence first, then the
+     * additional label-only tables; stock labels are normally unique. */
+    row = G_AbilitySound(name);
+    if (row->name && row->name[0]) return row;
+    row = G_AnimSound(name);
+    if (row->name && row->name[0]) return row;
+    row = G_DialogSound(name);
+    if (row->name && row->name[0]) return row;
+    row = G_UnitAckSound(name);
+    if (row->name && row->name[0]) return row;
+    row = G_UnitCombatSound(name);
+    return row->name && row->name[0] ? row : NULL;
+}
+MusicData_t const *G_MusicData(cstring_t name) {
+    static MusicData_t zero;
+    if (!name || !*name) return &zero;
+    FOR_LOOP(i, g_MusicDataCount)
+        if (g_MusicData[i].name && !strcasecmp(g_MusicData[i].name, name)) return g_MusicData + i;
+    return &zero;
+}
+ItemData_t const *G_ItemData(uint32_t id) {
+    static ItemData_t zero;
+    ItemData_t const *override = FindMapItemDataOverride(id);
+    ItemData_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&item_idx, ResolveItemID(id));
+    return row ? row : &zero;
+}
+uint32_t G_ItemBaseID(uint32_t id) {
+    mapInfo_t const *mapinfo = level.mapinfo;
+    uint32_t current = id;
+
+    if (!mapinfo || !mapinfo->userCreatedItems) return current;
+    /* Custom map items can inherit from another custom item. Walk the parent
+     * chain so their command buttons use the base item's ItemFunc UI fields.
+     * The map item count bounds the walk and detects cyclic parent data. */
+    FOR_LOOP(depth, mapinfo->num_userCreatedItems) {
+        bool found = false;
+        FOR_LOOP(i, mapinfo->num_userCreatedItems) {
+            unitData_t const *item = mapinfo->userCreatedItems + i;
+            if (item->newUnitID != current || item->originalUnitID == current) continue;
+            uint32_t const parent = item->originalUnitID;
+            uint32_t probe = id;
+            FOR_LOOP(seen, depth + 1u) {
+                if (probe == parent) return id;
+                bool probe_found = false;
+                FOR_LOOP(j, mapinfo->num_userCreatedItems) {
+                    unitData_t const *ancestor = mapinfo->userCreatedItems + j;
+                    if (ancestor->newUnitID != probe || ancestor->originalUnitID == probe) continue;
+                    probe = ancestor->originalUnitID;
+                    probe_found = true;
+                    break;
+                }
+                if (!probe_found) break;
+            }
+            current = parent;
+            found = true;
+            break;
+        }
+        if (!found) break;
+    }
+    return current;
+}
+ItemData_t const *G_ItemDataRows(uint32_t *count) { *count = g_ItemDataCount; return g_ItemData; }
+DestructableData_t const *G_DestructableData(uint32_t id) {
+    static DestructableData_t zero;
+    DestructableData_t const *override = FindMapDestructableDataOverride(id);
+    DestructableData_t *row;
+    if (override) return override;
+    row = FS_SLKLookup(&dest_idx, ResolveDestructableID(id));
+    return row ? row : &zero;
+}
+
+/* TFT stores collision in UnitBalance; ROC stores it in UnitData. */
+float G_UnitCollision(uint32_t id) {
+    UnitBalance_t const *b = G_UnitBalance(id);
+    if (b && b->collision > 0.f) return b->collision;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->collision : 0.f;
+}
+
+/* Unit classification moved from UnitData (ROC) to UnitBalance (TFT). */
+int32_t G_UnitClassification(uint32_t id) {
+    UnitBalance_t const *b = G_UnitBalance(id);
+    cstring_t type = b ? b->type : NULL;
+    if (!type || !type[0]) {
+        UnitData_t const *d = G_UnitData(id);
+        type = d ? d->unitClassification : NULL;
+    }
+    return type ? atoi(type) : 0;
+}
+
+/* Cast timings moved from UnitData (ROC) to UnitWeapons (TFT). */
+float G_UnitCastBackSwing(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->castBackSwing != 0.f) return w->castBackSwing;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->castBackSwing : 0.f;
+}
+
+/* Cast point follows the same ROC/TFT split as cast back-swing. */
+float G_UnitCastPoint(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->castPoint != 0.f) return w->castPoint;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->castPoint : 0.f;
+}
+
+bool G_IsReignOfChaosMap(mapInfo_t const *mapinfo) {
+    /* Real ROC W3I formats are <= 24.  Treat zero as unknown so synthetic
+     * tests/maps without parsed W3I metadata do not silently gain ROC rules. */
+    return mapinfo && mapinfo->fileFormat > 0 && mapinfo->fileFormat <= 24;
+}
+
+uint32_t G_MapGameDataSet(mapInfo_t const *mapinfo) {
+    uint32_t data_set = mapinfo && mapinfo->fileFormat >= 25
+        ? mapinfo->gameDataSet
+        : WC3_MAP_GAME_DATA_SET_DEFAULT;
+
+    /* W3I <= 24 has no gameDataSet field; later maps may encode an unset
+     * data set as either zero or 0xFFFFFFFF.  In both cases, the melee flag
+     * selects Melee and non-melee maps select Custom. */
+    if (data_set == WC3_MAP_GAME_DATA_SET_DEFAULT || data_set == UINT32_MAX) {
+        data_set = mapinfo && (mapinfo->flags & melee_map)
+            ? WC3_MAP_GAME_DATA_SET_MELEE
+            : WC3_MAP_GAME_DATA_SET_CUSTOM;
+    }
+    /* Match Warsmash's binary branch: 1 is Custom; every other explicit
+     * value follows the Melee data path. */
+    return data_set == WC3_MAP_GAME_DATA_SET_CUSTOM
+        ? WC3_MAP_GAME_DATA_SET_CUSTOM
+        : WC3_MAP_GAME_DATA_SET_MELEE;
+}
+
+void G_MapGameDataPrefix(wc3MapGameDataPrefixParams_t const *params) {
+    cstring_t kind;
+
+    if (!params || !params->out || !params->size) return;
+    kind = G_MapGameDataSet(params->info) == WC3_MAP_GAME_DATA_SET_CUSTOM ? "Custom" : "Melee";
+    snprintf(params->out, params->size, "%s_V%u", kind, (unsigned)(params->version ? 1u : 0u));
+}
+
+/* Launch offsets moved from UnitData (ROC) to UnitWeapons (TFT). */
+float G_UnitAttack1LaunchX(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->attackLaunchX != 0.f) return w->attackLaunchX;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->launchOffsetX : 0.f;
+}
+
+/* Launch offsets moved from UnitData (ROC) to UnitWeapons (TFT). */
+float G_UnitAttack1LaunchY(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->attackLaunchY != 0.f) return w->attackLaunchY;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->launchOffsetY : 0.f;
+}
+
+/* Launch offsets moved from UnitData (ROC) to UnitWeapons (TFT). */
+float G_UnitAttack1LaunchZ(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->attackLaunchZ != 0.f) return w->attackLaunchZ;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->launchOffsetZ : 0.f;
+}
+
+/* Target impact height moved from UnitData (ROC) to UnitWeapons (TFT). */
+float G_UnitImpactZ(uint32_t id) {
+    UnitWeapons_t const *w = G_UnitWeapons(id);
+    if (w && w->impactHeight != 0.f) return w->impactHeight;
+    UnitData_t const *d = G_UnitData(id);
+    return d ? d->impactHeight : 0.f;
+}
+
+/* Is-building moved from UnitUI (ROC) to UnitBalance (TFT). */
+bool G_UnitIsBuilding(uint32_t id) {
+    UnitBalance_t const *b = G_UnitBalance(id);
+    if (b && b->isBuilding) return true;
+    UnitUI_t const *ui = G_UnitUI(id);
+    return ui ? ui->isBuilding : false;
+}
+
+/* Unit-type data describes authored capability; live gameplay uses the mode
+ * bit so uprooted Ancients stop behaving like structures without changing id. */
+bool G_UnitIsStructure(edict_t const *unit) {
+    return unit && (unit->s.flags & EF_BUILDING) != 0;
+}
+
+/* Ancient unit rows stay authored as buildings even while uprooted. Resolve
+ * live targeting against the current mode while preserving all other rows. */
+TARGTYPE G_UnitTargetType(edict_t const *unit) {
+    if (!unit) return TARG_NONE;
+    if (!S_AncientHasRootAbility(unit)) return unit->targtype;
+    return G_UnitIsStructure(unit) ? TARG_STRUCTURE : TARG_GROUND;
+}
+
+/* UnitUI/DestructableData author armor as symbolic material names even though
+ * JASS exposes integer ARMOR_TYPE_* values. Keep both views: sound lookup uses
+ * the normalized index so war3map.w3u integer overrides continue to work. */
+static int32_t G_NormalizeArmorType(cstring_t value, int32_t fallback) {
+    char *end = NULL;
+    long numeric;
+
+    if (!value || !value[0]) return fallback;
+    numeric = strtol(value, &end, 10);
+    if (end && end != value && !*end) return (int32_t)numeric;
+    if (!strcasecmp(value, "Flesh")) return 1;
+    if (!strcasecmp(value, "Metal")) return 2;
+    if (!strcasecmp(value, "Wood")) return 3;
+    if (!strcasecmp(value, "Ethereal")) return 4;
+    if (!strcasecmp(value, "Stone")) return 5;
+    if (!strcasecmp(value, "None")) return 0;
+    return fallback;
+}
+
+static void NormalizeArmorTypes(void) {
+    FOR_LOOP(i, g_UnitUICount)
+        g_UnitUI[i].armorType = G_NormalizeArmorType(g_UnitUI[i].armorSoundType, g_UnitUI[i].armorType);
+    FOR_LOOP(i, g_DestructableDataCount)
+        g_DestructableData[i].armor = G_NormalizeArmorType(g_DestructableData[i].armorSoundType, g_DestructableData[i].armor);
+}
+
+void InitUnitData(void) {
+    stbIniCache_t profile_ini = { 0 };
+
+    commandFuncConfig = NULL;
+    commandStringsConfig = NULL;
+    abilityConfigTableCount = 0;
+    
+    for (cstring_t *config = config_files; *config; config++) {
+        if (abilityConfigTableCount < sizeof(abilityConfigTables) / sizeof(*abilityConfigTables) &&
+            Stb_IniCacheLoad(abilityConfigTables + abilityConfigTableCount, *config)) {
+            stbIniCache_t *current = abilityConfigTables + abilityConfigTableCount++;
+            if (!strcmp(*config, "Units\\CommandFunc.txt")) {
+                commandFuncConfig = current;
+            } else if (!strcmp(*config, "Units\\CommandStrings.txt")) {
+                commandStringsConfig = current;
+            }
+        }
+    }
+    Stb_IniCacheLoadFiles(&profile_ini, profile_files);
+    g_UnitProfileCount = Stb_IniDecode(&profile_ini, profile_schema, (void **)&g_UnitProfile, sizeof(*g_UnitProfile));
+    Stb_IniCacheFree(&profile_ini);
+    FS_SLKBuildIndex(&profile_idx, g_UnitProfile, g_UnitProfileCount, sizeof(*g_UnitProfile));
+
+    FOR_LOOP(i, sizeof(slk_stores) / sizeof(*slk_stores)) {
+        slkStore_t *store = slk_stores + i;
+        *store->count = Stb_SlkLoad(store->path, store->schema, store->rows, store->row_size);
+        if (!*store->count && !store->optional) fprintf(stderr, "SLK: failed to load '%s'\n", store->path);
+        if (!strcmp(store->name, "UnitWeapons"))
+            NormalizeWeaponTargetMasks(g_UnitWeapons, g_UnitWeaponsCount);
+        if (store->idx) FS_SLKBuildIndex(store->idx, *store->rows, *store->count, store->row_size);
+    }
+    NormalizeArmorTypes();
+    ability_data_generation++;
+}
+
+uint32_t G_AbilityDataGeneration(void) { return ability_data_generation; }
+
+void ShutdownUnitData(void) {
+    G_SetMapUnitOverrides(NULL);
+    G_SetMapAbilityOverrides(NULL);
+    FS_SLKFreeIndex(&profile_idx);
+    FS_SLKFreeRows(profile_schema, g_UnitProfile, g_UnitProfileCount, sizeof(*g_UnitProfile));
+    g_UnitProfile = NULL; g_UnitProfileCount = 0;
+    FOR_LOOP(i, sizeof(slk_stores) / sizeof(*slk_stores)) {
+        slkStore_t *store = slk_stores + i;
+        FS_SLKFreeIndex(store->idx);
+        FS_SLKFreeRows(store->schema, *store->rows, *store->count, store->row_size);
+        *store->rows = NULL; *store->count = 0;
+    }
+    FOR_LOOP(i, abilityConfigTableCount) Stb_IniCacheFree(abilityConfigTables + i);
+}
+
+cstring_t FindConfigValue(cstring_t category, cstring_t field) {
+    cstring_t value;
+
+    if (!strncmp(category, "Cmd", 3)) {
+        if (commandFuncConfig) {
+            value = Stb_IniCacheFind(commandFuncConfig, category, field);
+            if (value) {
+                return value;
+            }
+        }
+        if (commandStringsConfig) {
+            value = Stb_IniCacheFind(commandStringsConfig, category, field);
+            if (value) {
+                return value;
+            }
+        }
+    }
+
+    FOR_LOOP(i, abilityConfigTableCount) {
+        value = Stb_IniCacheFind(abilityConfigTables + i, category, field);
+        if (value) {
+            return value;
+        }
+    }
+    return NULL;
+}
+
+cstring_t GetClassName(uint32_t class_id) {
+    static char classname[5] = { 0 };
+    memcpy(classname, &class_id, 4);
+    return classname;
+}
+
+/* GetObjectName: unit/item/ability profile Name, then fourcc fallback. */
+cstring_t G_ObjectName(uint32_t objectId) {
+    UnitProfile_t const *profile;
+    ItemData_t const *item;
+    cstring_t name;
+
+    if (!objectId) return "";
+    profile = G_UnitProfile(objectId);
+    if (profile && profile->name && *profile->name) return G_LevelString(profile->name);
+    item = G_ItemData(objectId);
+    if (item && item->id == objectId && item->displayName && *item->displayName)
+        return G_LevelString(item->displayName);
+    name = FindConfigValue(GetClassName(objectId), "Name");
+    if (name && *name) return G_LevelString(name);
+    return GetClassName(objectId);
+}

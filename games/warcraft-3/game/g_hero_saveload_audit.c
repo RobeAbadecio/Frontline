@@ -1,0 +1,309 @@
+/*
+ * Live-map hero walk/save/load diagnostic. Armed by wc3_hero_saveload_audit=1;
+ * one isolated dedicated process per campaign map prints HERO_SAVELOAD lines.
+ */
+#include <math.h>
+#include <stdarg.h>
+#include <string.h>
+#include "g_local.h"
+
+#define HSA_WALK_DIST 80.0f // world units; short enough for direct steering, long enough to observe motion
+#define HSA_WAIT_FRAMES 150 // frames; 15s at 10 Hz for cinematic skip / scripted spawn
+#define HSA_MOVE_FRAMES 40 // frames; 4s to observe a walk step before save
+#define HSA_ORIGIN_EPS 0.5f // world units; restored origin must match the pre-save snapshot
+#define HSA_LEAVE_EPS 1.0f // world units; snapped dest must leave the current cell, not just accept issueorder
+
+typedef enum {
+    HSA_IDLE,
+    HSA_WAIT_HERO,
+    HSA_WALK,
+    HSA_DONE
+} hsaPhase_t;
+
+typedef struct {
+    uint32_t number, class_id, added_count;
+    vec3_t origin;
+    uint32_t abilities[MAX_HERO_ABILITIES], levels[MAX_HERO_ABILITIES];
+    uint32_t added[MAX_ABILITIES];
+    uint32_t inventory[MAX_INVENTORY], charges[MAX_INVENTORY];
+    char move[32];
+} hsaSnap_t;
+
+static hsaPhase_t hsa_phase;
+static PATHSTR hsa_map;
+static uint32_t hsa_wait, hsa_walk, hsa_index;
+static hsaSnap_t hsa_before;
+
+static void hsa_fourcc(uint32_t code, char out[5]) {
+    memcpy(out, &code, 4);
+    out[4] = '\0';
+}
+
+static void hsa_append(string_t out, uint32_t size, cstring_t fmt, ...) {
+    va_list args;
+    uint32_t used = (uint32_t)strlen(out);
+    if (used >= size) return;
+    va_start(args, fmt);
+    vsnprintf(out + used, size - used, fmt, args);
+    va_end(args);
+}
+
+static void hsa_capture(edict_t const *hero, hsaSnap_t *snap) {
+    memset(snap, 0, sizeof(*snap));
+    if (!hero) return;
+    snap->number = hero->s.number;
+    snap->class_id = hero->class_id;
+    snap->origin = hero->s.origin;
+    FOR_LOOP(i, hero->unit_state ? MAX_HERO_ABILITIES : 0) {
+        snap->abilities[i] = hero->unit_state->ranks[i].code;
+        snap->levels[i] = hero->unit_state->ranks[i].level;
+    }
+    snap->added_count = (hero->unit_state ? ARRAY_COUNT(hero->unit_state->overrides.added) : 0);
+    if (snap->added_count > MAX_ABILITIES) snap->added_count = MAX_ABILITIES;
+    FOR_LOOP(i, snap->added_count) snap->added[i] = hero->unit_state->overrides.added[i];
+    FOR_LOOP(i, MAX_INVENTORY) {
+        if (!G_InventoryItem(hero, i)) continue;
+        snap->inventory[i] = G_InventoryItem(hero, i)->class_id;
+        snap->charges[i] = G_InventoryItem(hero, i)->item->charges;
+    }
+    if (hero->currentmove && hero->currentmove->animation)
+        strlcpy(snap->move, hero->currentmove->animation, sizeof(snap->move));
+}
+
+void G_FormatHeroSaveSnap(edict_t const *hero, string_t out, uint32_t out_size) {
+    hsaSnap_t snap;
+    char code[5];
+    bool any;
+
+    if (!out || !out_size) return;
+    out[0] = '\0';
+    if (!hero) {
+        snprintf(out, out_size, "unit=none");
+        return;
+    }
+    hsa_capture(hero, &snap);
+    hsa_fourcc(snap.class_id, code);
+    snprintf(out, out_size, "unit=%u class=%s origin=%.2f,%.2f,%.2f abilities=",
+             (unsigned)snap.number, code, snap.origin.x, snap.origin.y, snap.origin.z);
+    any = false;
+    FOR_LOOP(i, MAX_HERO_ABILITIES) {
+        if (!snap.abilities[i]) continue;
+        hsa_fourcc(snap.abilities[i], code);
+        hsa_append(out, out_size, "%s%s:%u", any ? "," : "", code, (unsigned)snap.levels[i]);
+        any = true;
+    }
+    if (!any) hsa_append(out, out_size, "-");
+    hsa_append(out, out_size, " added=");
+    any = false;
+    FOR_LOOP(i, snap.added_count) {
+        if (!snap.added[i]) continue;
+        hsa_fourcc(snap.added[i], code);
+        hsa_append(out, out_size, "%s%s", any ? "," : "", code);
+        any = true;
+    }
+    if (!any) hsa_append(out, out_size, "-");
+    hsa_append(out, out_size, " inventory=");
+    any = false;
+    FOR_LOOP(i, MAX_INVENTORY) {
+        if (!snap.inventory[i]) continue;
+        hsa_fourcc(snap.inventory[i], code);
+        hsa_append(out, out_size, "%s%s:%u", any ? "," : "", code, (unsigned)snap.charges[i]);
+        any = true;
+    }
+    if (!any) hsa_append(out, out_size, "-");
+    hsa_append(out, out_size, " move=%s", snap.move[0] ? snap.move : "none");
+}
+
+static bool hsa_hero_ok(edict_t const *ent) {
+    return ent && ent->inuse && (ent->svflags & SVF_MONSTER) && !M_IsDead(ent) &&
+        G_UnitIsHero(ent) && !(ent->s.renderfx & RF_HIDDEN);
+}
+
+static edict_t *hsa_find_hero(void) {
+    FOR_LOOP(player, MAX_PLAYERS) {
+        if (level.mapinfo && (!level.mapinfo->players[player].used ||
+                level.mapinfo->players[player].playerType != kPlayerTypeHuman))
+            continue;
+        FOR_LOOP(i, globals.num_edicts) {
+            edict_t *ent = g_edicts + i;
+            if (hsa_hero_ok(ent) && ent->s.player == player)
+                return ent;
+        }
+        if (!level.mapinfo) break;
+    }
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = g_edicts + i;
+        if (hsa_hero_ok(ent))
+            return ent;
+    }
+    return NULL;
+}
+
+static bool hsa_in_cinematic(edict_t const *hero) {
+    if (hero && hero->s.player < (uint32_t)game.max_clients)
+        return game.clients[hero->s.player].ps.client_ui_state == CLIENT_UI_CINEMATIC;
+    FOR_LOOP(i, game.max_clients)
+        if (game.clients[i].connected &&
+                game.clients[i].ps.client_ui_state == CLIENT_UI_CINEMATIC)
+            return true;
+    return false;
+}
+
+static bool hsa_ready_to_walk(edict_t const *hero, bool timed_out) {
+    if (!hsa_hero_ok(hero) || G_UnitHasFlag(hero, UNIT_FLAG_PAUSED)) return false;
+    return timed_out || !hsa_in_cinematic(hero);
+}
+
+static bool hsa_issue_walk(edict_t *hero) {
+    static float const dist[] = { HSA_WALK_DIST, 160.0f, 256.0f, 512.0f };
+    static vec2_t const dirs[] = {
+        { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+        { 0.7f, 0.7f }, { -0.7f, 0.7f }, { 0.7f, -0.7f }, { -0.7f, -0.7f }
+    };
+    vec2_t dest, goal;
+
+    /* unit_issueorder("move") stays true when ClosestPathable snaps the click
+     * back onto the current cell (intro pocket). Require the waypoint to leave. */
+    FOR_LOOP(d, sizeof(dist) / sizeof(dist[0])) {
+        FOR_LOOP(i, sizeof(dirs) / sizeof(dirs[0])) {
+            dest.x = hero->s.origin2.x + dirs[i].x * dist[d];
+            dest.y = hero->s.origin2.y + dirs[i].y * dist[d];
+            if (!unit_issueorder(hero, "move", &dest) || !hero->goalentity) continue;
+            goal = hero->goalentity->s.origin2;
+            if (fabsf(goal.x - hero->s.origin2.x) > HSA_LEAVE_EPS ||
+                    fabsf(goal.y - hero->s.origin2.y) > HSA_LEAVE_EPS)
+                return true;
+        }
+    }
+    return false;
+}
+
+static cstring_t hsa_compare(edict_t const *hero, hsaSnap_t const *want) {
+    hsaSnap_t got;
+    if (!hero) return "fail_missing";
+    hsa_capture(hero, &got);
+    if (got.number != want->number || got.class_id != want->class_id) return "fail_identity";
+    if (fabsf(got.origin.x - want->origin.x) > HSA_ORIGIN_EPS ||
+            fabsf(got.origin.y - want->origin.y) > HSA_ORIGIN_EPS ||
+            fabsf(got.origin.z - want->origin.z) > HSA_ORIGIN_EPS)
+        return "fail_origin";
+    FOR_LOOP(i, MAX_HERO_ABILITIES)
+        if (got.abilities[i] != want->abilities[i] || got.levels[i] != want->levels[i])
+            return "fail_abilities";
+    if (got.added_count != want->added_count) return "fail_abilities";
+    FOR_LOOP(i, want->added_count)
+        if (got.added[i] != want->added[i]) return "fail_abilities";
+    FOR_LOOP(i, MAX_INVENTORY)
+        if (got.inventory[i] != want->inventory[i] || got.charges[i] != want->charges[i])
+            return "fail_inventory";
+    return "pass";
+}
+
+static void hsa_finish(cstring_t status, edict_t const *hero) {
+    char snap[512];
+    G_FormatHeroSaveSnap(hero, snap, sizeof(snap));
+    fprintf(stderr, "HERO_SAVELOAD status=%s %s\n", status, snap);
+    hsa_phase = HSA_DONE;
+}
+
+static void hsa_saveload(edict_t *hero) {
+    PATHSTR path;
+    char snap[512];
+    cstring_t status;
+
+    hsa_capture(hero, &hsa_before);
+    G_FormatHeroSaveSnap(hero, snap, sizeof(snap));
+    fprintf(stderr, "HERO_SAVELOAD snapshot=before %s\n", snap);
+    gi.SavePath("hero-saveload-audit", path, sizeof(path));
+    if (!WriteGame(path)) {
+        hsa_finish("fail_save", hero);
+        return;
+    }
+    if (!ReadGame(path)) {
+        hsa_finish("fail_load", hero);
+        return;
+    }
+    hero = (hsa_before.number < globals.num_edicts) ? g_edicts + hsa_before.number : NULL;
+    if (!hero || !hero->inuse) {
+        hsa_finish("fail_missing", NULL);
+        return;
+    }
+    G_FormatHeroSaveSnap(hero, snap, sizeof(snap));
+    fprintf(stderr, "HERO_SAVELOAD snapshot=after %s\n", snap);
+    status = hsa_compare(hero, &hsa_before);
+    hsa_finish(status, hero);
+}
+
+static bool hsa_start_walk(edict_t *hero) {
+    hsa_index = hero->s.number;
+    hsa_before.origin = hero->s.origin;
+    if (!hsa_issue_walk(hero)) {
+        hsa_finish("fail_order", hero);
+        return false;
+    }
+    hsa_phase = HSA_WALK;
+    hsa_walk = 0;
+    return true;
+}
+
+void G_HeroSaveLoadAuditFrame(void) {
+    cstring_t armed = gi.CvarString ? gi.CvarString("wc3_hero_saveload_audit", "0") : "0";
+    edict_t *hero;
+    bool timed_out, walking;
+    float dx, dy;
+
+    if (!armed || atoi(armed) == 0) return;
+    if (!level.started || !level.map_path[0]) return;
+    if (strcmp(hsa_map, level.map_path)) {
+        strlcpy(hsa_map, level.map_path, sizeof(hsa_map));
+        hsa_phase = HSA_WAIT_HERO;
+        hsa_wait = hsa_walk = hsa_index = 0;
+        memset(&hsa_before, 0, sizeof(hsa_before));
+    }
+    if (hsa_phase == HSA_IDLE || hsa_phase == HSA_DONE) return;
+    timed_out = hsa_wait >= HSA_WAIT_FRAMES;
+    if (hsa_phase == HSA_WAIT_HERO) {
+        hero = hsa_find_hero();
+        if (hsa_ready_to_walk(hero, timed_out)) {
+            hsa_start_walk(hero);
+            return;
+        }
+        if (++hsa_wait >= HSA_WAIT_FRAMES && !hero) hsa_finish("no_hero", NULL);
+        return;
+    }
+    hero = (hsa_index && hsa_index < globals.num_edicts) ? g_edicts + hsa_index : NULL;
+    if (!hero || !hero->inuse || M_IsDead(hero) || !G_UnitIsHero(hero) || !(hero->svflags & SVF_MONSTER)) {
+        hsa_finish("fail_missing", hero);
+        return;
+    }
+    if (!hsa_hero_ok(hero)) {
+        hero = hsa_find_hero();
+        if (!hero) {
+            hsa_finish("fail_missing", NULL);
+            return;
+        }
+        if (hsa_ready_to_walk(hero, true)) hsa_start_walk(hero);
+        return;
+    }
+    dx = hero->s.origin.x - hsa_before.origin.x;
+    dy = hero->s.origin.y - hsa_before.origin.y;
+    walking = move_is_active_order_walk(hero);
+    if (fabsf(dx) > HSA_LEAVE_EPS || fabsf(dy) > HSA_LEAVE_EPS) {
+        /* Intro_Cleanup SetUnitPosition jumps without a walk step. A real walk
+         * think is tens of units; do not treat that first step as a teleport. */
+        if (!walking) {
+            hsa_start_walk(hero);
+            return;
+        }
+        hsa_saveload(hero);
+        return;
+    }
+    /* PauseAllUnitsBJ freezes think; keep waiting. Cinematic UI already gated
+     * WAIT_HERO; finale timeout fallback must still count walk frames. */
+    if (G_UnitHasFlag(hero, UNIT_FLAG_PAUSED)) return;
+    if (!walking && !hsa_issue_walk(hero)) {
+        hsa_finish("fail_order", hero);
+        return;
+    }
+    if (++hsa_walk >= HSA_MOVE_FRAMES) hsa_finish("fail_move", hero);
+}

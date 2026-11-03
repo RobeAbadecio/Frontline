@@ -1,0 +1,515 @@
+#include "g_local.h"
+
+bool jass_calltriggerevent(jass_t *j, trigger_t *trigger, gameEvent_t const *event);
+bool jass_evaluateboolexpr(jass_t *j, jassFunc_t const *expr, edict_t *unit);
+
+/* GetSaveBasicFilename is a short-lived context provided by the host save/load
+ * operation, not a physical filesystem path or a script-selectable scope. */
+static char save_basic_filename[MAX_PATHLEN];
+static bool save_event_dispatching;
+
+cstring_t G_GetSaveBasicFilename(void) { return save_basic_filename; }
+
+static bool G_DispatchSaveLoadEvent(EVENTTYPE type, cstring_t name) {
+    cstring_t base, slash, backslash, extension;
+    size_t length;
+    if (!level.vm || !name || !*name || save_event_dispatching) return false;
+    slash = strrchr(name, '/');
+    backslash = strrchr(name, '\\');
+    base = name;
+    if (slash && slash >= base) base = slash + 1;
+    if (backslash && backslash >= base) base = backslash + 1;
+    length = strlen(base);
+    extension = strrchr(base, '.');
+    if (extension && (!strcasecmp(extension, ".sav") || !strcasecmp(extension, ".w3z")))
+        length = (size_t)(extension - base);
+    if (!length || length >= sizeof(save_basic_filename)) return false;
+
+    memcpy(save_basic_filename, base, length);
+    save_basic_filename[length] = '\0';
+    save_event_dispatching = true;
+    if (!G_PublishEvent(NULL, type)) {
+        save_basic_filename[0] = '\0';
+        save_event_dispatching = false;
+        return false;
+    }
+    /* Flush both the event queue and queued JASS actions while the name is
+     * valid. Actions that sleep resume later without this transient context. */
+    G_RunEvents();
+    jass_runevents(level.vm);
+    bool ok = !jass_rterror_pending(level.vm);
+    save_basic_filename[0] = '\0';
+    save_event_dispatching = false;
+    return ok;
+}
+
+bool G_BeforeSaveGame(cstring_t name) {
+    return G_DispatchSaveLoadEvent(EVENT_GAME_SAVE, name);
+}
+
+void G_AfterLoadGame(cstring_t name) {
+    if (!G_DispatchSaveLoadEvent(EVENT_GAME_LOADED, name))
+        fprintf(stderr, "WC3: restored game-loaded event handlers could not complete\n");
+}
+
+void G_AfterScriptLoadGame(cstring_t name) {
+    /* Rexxar zone snapshots omit travelling Heroes before saving. Run the
+     * map's reload trigger after restoration so it imports those Heroes from
+     * the transition cache. MAP_RELOADED selects that trigger while keeping
+     * the user-load handler (which replaces the live zone-save directory)
+     * disabled. Restore the saved flag after synchronous trigger dispatch. */
+    uint32_t const reloaded_flag = 8192u * 64u;
+    bool const was_reloaded = (level.setup.map_flags & reloaded_flag) != 0;
+    SET_FLAG(level.setup.map_flags, reloaded_flag, true);
+    G_AfterLoadGame(name);
+    SET_FLAG(level.setup.map_flags, reloaded_flag, was_reloaded);
+}
+
+bool G_LimitMatches(uint32_t op, float value, float limit) {
+    switch (op) {
+        case WC3_LIMITOP_LESS_THAN: return value < limit;
+        case WC3_LIMITOP_LESS_THAN_OR_EQUAL: return value <= limit;
+        case WC3_LIMITOP_EQUAL: return value == limit;
+        case WC3_LIMITOP_GREATER_THAN_OR_EQUAL: return value >= limit;
+        case WC3_LIMITOP_GREATER_THAN: return value > limit;
+        case WC3_LIMITOP_NOT_EQUAL: return value != limit;
+        default: return false;
+    }
+}
+
+void G_JassVariableChanged(cstring_t name, float before, float after) {
+    FOR_EACH_EVENT(evt) {
+        if (evt->type == EVENT_GAME_VARIABLE_LIMIT && evt->variable && !strcmp(evt->variable, name) &&
+            !G_LimitMatches(evt->limitop, before, evt->limitval) && G_LimitMatches(evt->limitop, after, evt->limitval))
+            G_PublishEventResponse(NULL, EVENT_GAME_VARIABLE_LIMIT, evt);
+    }
+}
+
+/* One authoritative terminal-result transition shared by JASS RemovePlayer
+ * and developer cheats.  Keep campaign/result presentation downstream of the
+ * normal EVENT_PLAYER_VICTORY / EVENT_PLAYER_DEFEAT pipeline. */
+bool G_RemovePlayerWithResult(uint32_t player_num, uint32_t game_result) {
+    gameClient_t *client;
+    edict_t *pent;
+
+    if (player_num >= game.max_clients || game_result > 3) {
+        BZ_WC3_SCORE_LOG("RemovePlayer ignored reason=invalid_args player=%u result=%u",
+            (unsigned)player_num, (unsigned)game_result);
+        return false;
+    }
+
+    client = G_GetPlayerClientByNumber(player_num);
+    BZ_WC3_SCORE_LOG("RemovePlayer resolved player=%u client_index=%ld connected=%u removed=%u ui=%u",
+        (unsigned)player_num,
+        client ? (long)(client - game.clients) : -1L,
+        client ? (unsigned)client->connected : 0u,
+        client ? (unsigned)client->jass.removed : 0u,
+        client ? (unsigned)client->ps.client_ui_state : 0u);
+
+    if (!client) {
+        BZ_WC3_SCORE_LOG("RemovePlayer ignored player=%u reason=no_client", (unsigned)player_num);
+        return false;
+    }
+    if (client->jass.removed) {
+        BZ_WC3_SCORE_LOG("RemovePlayer ignored player=%u reason=already_removed stored_result=%u",
+            (unsigned)player_num, (unsigned)client->ps.stats[PLAYERSTATE_GAME_RESULT]);
+        return false;
+    }
+
+    client->ps.stats[PLAYERSTATE_GAME_RESULT] = (uint16_t)game_result;
+    client->jass.removed = true;
+    client->jass.pending_game_result = 0;
+    client->jass.pending_game_result_event = level.events.read;
+    G_BotRequestStop(player_num);
+
+    pent = G_GetPlayerEntityByNumber(player_num);
+    BZ_WC3_SCORE_LOG("RemovePlayer state player=%u result=%u pent=%p ent=%ld inuse=%u owner=%u",
+        (unsigned)player_num, (unsigned)game_result, (void *)pent,
+        pent ? (long)pent->s.number : -1L,
+        pent ? (unsigned)pent->inuse : 0u,
+        pent ? (unsigned)pent->s.player : 0u);
+    if (!pent) {
+        BZ_WC3_SCORE_LOG("RemovePlayer player=%u result=%u has no player edict; no result event/UI queued",
+            (unsigned)player_num, (unsigned)game_result);
+        return true;
+    }
+
+    if (game_result == 0) {
+        G_PublishEvent(pent, EVENT_PLAYER_VICTORY);
+        client->jass.pending_game_result = 1;
+        client->jass.pending_game_result_event = level.events.write;
+        BZ_WC3_SCORE_LOG("RemovePlayer queued VICTORY player=%u wait_event=%u events=%u/%u",
+            (unsigned)player_num, (unsigned)client->jass.pending_game_result_event,
+            (unsigned)level.events.read, (unsigned)level.events.write);
+    } else if (game_result == 1) {
+        G_PublishEvent(pent, EVENT_PLAYER_DEFEAT);
+        client->jass.pending_game_result = 2;
+        client->jass.pending_game_result_event = level.events.write;
+        BZ_WC3_SCORE_LOG("RemovePlayer queued DEFEAT player=%u wait_event=%u events=%u/%u",
+            (unsigned)player_num, (unsigned)client->jass.pending_game_result_event,
+            (unsigned)level.events.read, (unsigned)level.events.write);
+    } else {
+        BZ_WC3_SCORE_LOG("RemovePlayer player=%u result=%u records removal only; no victory/defeat UI",
+            (unsigned)player_num, (unsigned)game_result);
+    }
+    return true;
+}
+
+static void G_ExecuteEvent(gameEvent_t *evt) {
+    edict_t *subject = evt->edict;
+    bool misha_summon_event = false;
+    bool result_event = evt->type == EVENT_PLAYER_VICTORY || evt->type == EVENT_PLAYER_DEFEAT;
+    /* KillUnit followed by RemoveUnit still owes death notifications while the corpse exists. */
+    if (evt->edict_spawn_tracked &&
+        (!subject || !subject->inuse || subject->spawn_time != evt->edict_spawn_time ||
+         (!G_IsDeathEvent(evt->type) && G_IsDeferredFree(subject))))
+        return;
+    if (evt->source_spawn_tracked &&
+        (!evt->source || !evt->source->inuse || evt->source->spawn_time != evt->source_spawn_time || G_IsDeferredFree(evt->source))) {
+        evt->source = NULL;
+        evt->source_spawn_time = 0;
+        evt->source_spawn_tracked = false;
+    }
+    misha_summon_event = WC3_MISHA_DEBUG_ENABLED() &&
+        (evt->type == EVENT_PLAYER_UNIT_SUMMON || evt->type == EVENT_UNIT_SUMMON) &&
+        evt->source && evt->source->class_id == MAKEFOURCC('O','r','e','x');
+
+    if (misha_summon_event)
+        fprintf(stderr, "WC3_MISHA dispatch-summon event=%u caster=%u summoned=%u id=%.4s owner=%u ability=%.4s\n",
+                (unsigned)evt->type, (unsigned)evt->source->s.number,
+                subject ? (unsigned)subject->s.number : 0u,
+                subject ? (cstring_t)&subject->class_id : "----",
+                subject ? (unsigned)subject->s.player : 0u,
+                subject && subject->summon_ability ? (cstring_t)&subject->summon_ability : "----");
+
+    if (result_event) {
+        BZ_WC3_SCORE_LOG("execute event type=%s subject_ent=%ld owner=%u",
+            evt->type == EVENT_PLAYER_VICTORY ? "VICTORY" : "DEFEAT",
+            subject ? (long)subject->s.number : -1L,
+            subject ? (unsigned)subject->s.player : 0u);
+    }
+
+    FOR_EACH_EVENT(e) {
+        if (!G_EventSubjectIsCurrent(e)) continue;
+        switch (e->type) {
+            case EVENT_DIALOG_CLICK:
+            case EVENT_DIALOG_BUTTON_CLICK:
+                if (evt->responseTo == e && evt->dialog_id == e->dialog_id &&
+                    (!e->button_id || evt->button_id == e->button_id))
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                break;
+            case EVENT_GAME_SAVE:
+            case EVENT_GAME_LOADED:
+                /* Game events are global, with no unit/player subject. */
+                if (evt->type == e->type && !evt->responseTo)
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                break;
+            case EVENT_GAME_VICTORY:
+                break;
+            case EVENT_GAME_END_LEVEL:
+                break;
+            case EVENT_GAME_VARIABLE_LIMIT:
+                if (evt->responseTo == e) jass_calltriggerevent(level.vm, e->trigger, evt);
+                break;
+            case EVENT_GAME_STATE_LIMIT:
+                if (evt->responseTo == e) {
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                }
+                break;
+            case EVENT_GAME_TIMER_EXPIRED:
+                break;
+            case EVENT_GAME_ENTER_REGION:
+                if (evt->responseTo == e) {
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                }
+                break;
+            case EVENT_GAME_LEAVE_REGION:
+                if (evt->responseTo == e) {
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                }
+                break;
+            case EVENT_UNIT_IN_RANGE:
+                if (evt->responseTo == e) {
+                    jass_calltriggerevent(level.vm, e->trigger, evt);
+                }
+                break;
+            case EVENT_GAME_TRACKABLE_HIT:
+                break;
+            case EVENT_GAME_TRACKABLE_TRACK:
+                break;
+            case EVENT_GAME_SHOW_SKILL:
+                break;
+            case EVENT_GAME_BUILD_SUBMENU:
+                break;
+            default:
+                /* Two subject conventions share this path:
+                 *  - widget/unit events (e.g. EVENT_UNIT_DEATH): the handler's
+                 *    subject is a specific unit, matched directly.
+                 *  - player-unit events (EVENT_PLAYER_UNIT_*): registered via
+                 *    TriggerRegisterPlayerUnitEvent with subject = the player's
+                 *    edict; they fire for ANY of that player's units, so match
+                 *    the dying/triggering unit's owner against the handler's
+                 *    player.  Either way the triggering unit is passed as the
+                 *    context unit so GetTriggerUnit()/GetDyingUnit() resolve to
+                 *    it (e.g. Naga_Victory_Check counts the dying naga). */
+                if (e->type == evt->type) {
+                    bool direct = subject && e->subject == subject;
+                    bool owner_match = subject &&
+                        e->subject == G_GetPlayerEntityByNumber(subject->s.player);
+                    int32_t quest_trigger_ordinal = e->trigger
+                        ? (int32_t)(e->trigger - level.triggers) : -1L;
+                    if (misha_summon_event) {
+                        fprintf(stderr, "WC3_MISHA summon-handler event=%u trigger=%ld handler_subject=%ld direct=%u owner_match=%u enabled=%u\n",
+                                (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                e->subject ? (long)e->subject->s.number : -1L,
+                                (unsigned)direct, (unsigned)owner_match,
+                                (unsigned)(e->trigger && !e->trigger->disabled));
+                    }
+                    bool quest_peon_stage = gi.CvarString &&
+                        WC3_TUTORIAL_DEBUG_ENABLED() &&
+                        quest_trigger_ordinal >= 95 && quest_trigger_ordinal <= 106;
+                    bool subgroup_stage = gi.CvarString &&
+                        WC3_TUTORIAL_DEBUG_ENABLED() &&
+                        quest_trigger_ordinal >= 208 && quest_trigger_ordinal <= 213;
+                    bool quest_build_event = gi.CvarString &&
+                        WC3_TUTORIAL_DEBUG_ENABLED() &&
+                        (evt->type == EVENT_PLAYER_UNIT_CONSTRUCT_START ||
+                         evt->type == EVENT_PLAYER_UNIT_CONSTRUCT_FINISH ||
+                         evt->type == EVENT_UNIT_CONSTRUCT_FINISH);
+                    if (quest_build_event) {
+                        fprintf(stderr,
+                                "WC3_QUEST_BUILD dispatch event=%u trigger=%ld building=%ld id=%.4s owner=%u handler_subject=%ld direct=%d owner_match=%d match=%d disabled=%d\n",
+                                (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                subject ? (long)(subject - globals.edicts) : -1L,
+                                subject ? (cstring_t)&subject->class_id : "----",
+                                subject ? (unsigned)subject->s.player : 0u,
+                                e->subject ? (long)(e->subject - globals.edicts) : -1L,
+                                direct, owner_match, direct || owner_match,
+                                e->trigger ? (int)e->trigger->disabled : -1);
+                    }
+                    if (subgroup_stage) {
+                        fprintf(stderr,
+                                "WC3_SUBGROUP dispatch event=%u trigger=%ld subject=%ld id=%.4s owner=%u source=%ld source_id=%.4s handler_subject=%ld direct=%d owner_match=%d match=%d disabled=%d\n",
+                                (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                subject ? (long)(subject - globals.edicts) : -1L,
+                                subject ? (cstring_t)&subject->class_id : "----",
+                                subject ? (unsigned)subject->s.player : 0u,
+                                evt->source ? (long)(evt->source - globals.edicts) : -1L,
+                                evt->source ? (cstring_t)&evt->source->class_id : "----",
+                                e->subject ? (long)(e->subject - globals.edicts) : -1L,
+                                direct, owner_match, direct || owner_match,
+                                e->trigger ? (int)e->trigger->disabled : -1);
+                    }
+                    if (quest_peon_stage) {
+                        fprintf(stderr,
+                                "WC3_QUEST_PEON dispatch event=%u trigger=%ld unit=%ld id=%.4s owner=%u source=%ld source_id=%.4s handler_subject=%ld direct=%d owner_match=%d match=%d disabled=%d\n",
+                                (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                subject ? (long)(subject - globals.edicts) : -1L,
+                                subject ? (cstring_t)&subject->class_id : "----",
+                                subject ? (unsigned)subject->s.player : 0u,
+                                evt->source ? (long)(evt->source - globals.edicts) : -1L,
+                                evt->source ? (cstring_t)&evt->source->class_id : "----",
+                                e->subject ? (long)(e->subject - globals.edicts) : -1L,
+                                direct, owner_match, direct || owner_match,
+                                e->trigger ? (int)e->trigger->disabled : -1);
+                    }
+                    if (direct || owner_match) {
+                        bool queued = jass_calltriggerevent(level.vm, e->trigger, evt);
+                        if (misha_summon_event)
+                            fprintf(stderr, "WC3_MISHA summon-handler-result event=%u trigger=%ld queued=%u enabled=%u\n",
+                                    (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                    (unsigned)queued,
+                                    (unsigned)(e->trigger && !e->trigger->disabled));
+                        if (quest_build_event) {
+                            fprintf(stderr,
+                                    "WC3_QUEST_BUILD dispatch-result event=%u trigger=%ld queued=%d disabled=%d\n",
+                                    (unsigned)evt->type, (long)quest_trigger_ordinal, queued,
+                                    e->trigger ? (int)e->trigger->disabled : -1);
+                        }
+                        if (subgroup_stage) {
+                            fprintf(stderr,
+                                    "WC3_SUBGROUP dispatch-result event=%u trigger=%ld queued=%d disabled=%d\n",
+                                    (unsigned)evt->type, (long)quest_trigger_ordinal, queued,
+                                    e->trigger ? (int)e->trigger->disabled : -1);
+                        }
+                        if (quest_peon_stage) {
+                            fprintf(stderr,
+                                    "WC3_QUEST_PEON dispatch-result event=%u trigger=%ld queued=%d disabled=%d\n",
+                                    (unsigned)evt->type, (long)quest_trigger_ordinal,
+                                    queued, e->trigger ? (int)e->trigger->disabled : -1);
+                        }
+                    }
+                }
+                break;
+        }
+    }
+}
+
+static void G_TouchTriggers(edict_t *ent) {
+    FOR_EACH_EVENT(evt) {
+        switch (evt->type) {
+            case EVENT_GAME_ENTER_REGION: {
+                handle_t event_handle, region_handle;
+                region_t *region;
+                uint32_t spawn_time;
+                if (!(ent->svflags & SVF_MONSTER)) break; /* Region enter events carry units, not items, destructables, or map entities. */
+                event_handle = G_EventHandle(evt);
+                region_handle = evt->region;
+                region = G_RegionFromHandle(evt->region);
+                spawn_time = ent->spawn_time;
+                if (region && G_RegionContains(region, &ent->s.origin2) &&
+                    !G_RegionContains(region, &ent->old_origin) && jass_evaluateboolexpr(level.vm, evt->filter, ent) &&
+                    ent->inuse && ent->spawn_time == spawn_time && !G_IsDeferredFree(ent) &&
+                    G_EventFromHandle(event_handle) == evt && evt->region == region_handle)
+                {
+                    G_PublishEventResponse(ent, EVENT_GAME_ENTER_REGION, evt);
+                }
+                break;
+            }
+            case EVENT_GAME_LEAVE_REGION: {
+                handle_t event_handle = G_EventHandle(evt), region_handle = evt->region;
+                region_t *region = G_RegionFromHandle(evt->region);
+                uint32_t spawn_time = ent->spawn_time;
+                if (!(ent->svflags & SVF_MONSTER)) break; /* Region leave events carry units, not items, destructables, or map entities. */
+                if (region && !G_RegionContains(region, &ent->s.origin2) &&
+                    G_RegionContains(region, &ent->old_origin) && jass_evaluateboolexpr(level.vm, evt->filter, ent) &&
+                    ent->inuse && ent->spawn_time == spawn_time && !G_IsDeferredFree(ent) &&
+                    G_EventFromHandle(event_handle) == evt && evt->region == region_handle)
+                {
+                    G_PublishEventResponse(ent, EVENT_GAME_LEAVE_REGION, evt);
+                }
+                break;
+            }
+            case EVENT_UNIT_IN_RANGE:
+                if (!G_EventSubjectIsCurrent(evt)) break;
+                if (ent == evt->subject) {
+                    edict_t *target;
+
+                    /* A unit-in-range event is symmetric for movement: the
+                     * registered subject may approach a target.  The
+                     * subject-side pass owns pairs where both units moved,
+                     * preventing duplicate publications. */
+                    FOR_LOOP(i, globals.num_edicts) {
+                        target = globals.edicts + i;
+                        if (!target->inuse || target == ent)
+                            continue;
+                        if (Vector2_distance(&ent->old_origin, &target->old_origin) <= evt->range &&
+                            Vector2_distance(&ent->s.origin2, &target->s.origin2) > evt->range)
+                            continue;
+                        if (Vector2_distance(&ent->old_origin, &target->old_origin) > evt->range &&
+                            Vector2_distance(&ent->s.origin2, &target->s.origin2) <= evt->range) {
+                            G_PublishEventResponse(target, evt->type, evt);
+                        }
+                    }
+                } else if (evt->subject &&
+                           memcmp(&((edict_t *)evt->subject)->old_origin,
+                                  &((edict_t *)evt->subject)->s.origin2, sizeof(vec2_t)) == 0 &&
+                           Vector2_distance(&((edict_t *)evt->subject)->old_origin, &ent->old_origin) > evt->range &&
+                           Vector2_distance(&((edict_t *)evt->subject)->s.origin2, &ent->s.origin2) <= evt->range) {
+                    G_PublishEventResponse(ent, evt->type, evt);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+/* Explicit JASS position changes happen before G_RunEntities samples old_origin.
+ * Evaluate the crossing here, then make the teleported position the next baseline. */
+void G_UnitPositionChanged(edict_t *ent, vec2_t const *old_position) {
+    if (!ent || !ent->inuse || !old_position ||
+        !memcmp(old_position, &ent->s.origin2, sizeof(*old_position))) return;
+    ent->old_origin = *old_position;
+    G_TouchTriggers(ent);
+    ent->old_origin = ent->s.origin2;
+}
+
+void G_RunEntities(void) {
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = globals.edicts+i;
+        if (!ent->inuse) continue; /* freed edicts are memset and never re-sent; skip the per-frame clear */
+        ent->old_origin = ent->s.origin2;
+        if (ent->sound && ent->sound->pending) {
+            G_PlaySound(NULL, ent, CHAN_VOICE | CHAN_OWNER | CHAN_RELIABLE, ent->sound->pending,
+                     G_SoundIndexVolume(ent->sound->pending), 0.0f, 0.0f);
+            ent->sound->pending = 0;
+        }
+        if (ent->sound && ent->sound->owner_pending) {
+            G_PlaySound(NULL, ent, CHAN_VOICE | CHAN_OWNER | CHAN_RELIABLE, ent->sound->owner_pending,
+                     G_SoundIndexVolume(ent->sound->owner_pending), 0.0f, 0.0f);
+            ent->sound->owner_pending = 0;
+        }
+        if (ent->sound && ent->sound->world_pending) {
+            G_PlaySound(NULL, ent, CHAN_VOICE, ent->sound->world_pending,
+                     G_SoundIndexVolume(ent->sound->world_pending), 1.0f, 0.0f);
+            ent->sound->world_pending = 0;
+            ent->sound->world_pending_event = EV_NONE;
+        }
+    }
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = globals.edicts+i;
+        if (!ent->inuse) continue;
+        G_RunEntity(ent);
+    }
+    FOR_LOOP(i, globals.num_edicts) {
+        edict_t *ent = globals.edicts+i;
+        if (!ent->inuse) continue;
+        if (!G_UnitIsWorldActive(ent)) continue;
+        if (!memcmp(&ent->old_origin, &ent->s.origin2, sizeof(vec2_t)))
+            continue;
+        G_TouchTriggers(ent);
+    }
+}
+
+/* A late-frame death must reach its actions before deferred removal clears the dying unit. */
+bool G_HasPendingDeathEvent(edict_t const *ent) {
+    for (uint32_t i = level.events.read; i < level.events.write; i++) {
+        gameEvent_t const *evt = &level.events.queue[i % MAX_EVENT_QUEUE];
+        if (G_IsDeathEvent(evt->type) && evt->edict == ent &&
+            (!evt->edict_spawn_tracked || evt->edict_spawn_time == ent->spawn_time)) return true;
+    }
+    return false;
+}
+
+void G_RunEvents(void) {
+    for (levelEvents_t *e = &level.events; e->read < e->write; e->read++) {
+        gameEvent_t *evt = &e->queue[e->read % MAX_EVENT_QUEUE];
+        G_ExecuteEvent(evt);
+    }
+}
+
+/* Warcraft's stock CustomVictoryDialogBJ/CustomDefeatDialogBJ pauses a
+ * single-player game after RemovePlayer().  If RemovePlayer ran from a JASS
+ * action queued by this frame's first event pass, its result event was
+ * published too late for that pass and the server scheduler will stop before
+ * the next frame.  Drain only result events that are actively blocking a
+ * pending result handoff; repeat for chained player removals, bounded by the
+ * number of player slots. */
+void G_DrainPausedResultEvents(void) {
+    uint32_t passes = 0;
+
+    if (!level.script_paused || !level.vm) return;
+
+    while (passes++ < MAX_PLAYERS) {
+        bool waiting = false;
+
+        FOR_LOOP(i, game.max_clients) {
+            gameClient_t *client = game.clients + i;
+            if (client->jass.pending_game_result &&
+                level.events.read < client->jass.pending_game_result_event) {
+                waiting = true;
+                break;
+            }
+        }
+        if (!waiting) return;
+
+        BZ_WC3_SCORE_LOG("frame drain paused result events pass=%u events=%u/%u",
+            (unsigned)passes, (unsigned)level.events.read, (unsigned)level.events.write);
+        G_RunEvents();
+        jass_runevents(level.vm);
+    }
+
+    BZ_WC3_SCORE_LOG("frame drain paused result events stopped after %u passes events=%u/%u",
+        (unsigned)MAX_PLAYERS, (unsigned)level.events.read, (unsigned)level.events.write);
+}

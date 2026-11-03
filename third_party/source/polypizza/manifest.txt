@@ -1,0 +1,11 @@
+palm_a|A6cKJYFsIb|4c17decd-3087-4afe-9611-cfd92cca47cd
+rock_large|54jZKTAt5p|c14651f6-9ef8-41e8-8aca-cafed61d9ca2
+rock_medium|s1OJ3bBzqc|be5fef3a-4fa1-4d08-b2d4-82e02284588d
+sandbags|iHyRewQQcN|00e71997-0e9f-4083-9507-3935639996c7
+guard_tower|sbaM8I229r|5d56ff95-db7a-43d6-997f-e9eea3f13f53
+tent|5Q7qIrfDxA|fc8d560d-91b5-439c-88bf-4cbddb7eadbb
+container_green|h5RUr3vlcS|b3927d85-693b-4b24-86bc-7bd3502407e7
+crate|SfJtdV8GDr|f3d1cf3a-cb48-4204-8cb3-0e43cd5780ee
+barrel|MraIiFnpAY|1f4a7592-6157-4726-8159-49842c361f11
+water_tower|tMK8bhapAK|abaa700a-0aaf-4baa-aa8b-b29d1fc12a0a
+swat|Btfn3G5Xv4|713f6535-f4f3-4367-a4c6-ced126ae0936

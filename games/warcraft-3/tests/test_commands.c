@@ -1,0 +1,812 @@
+/*
+ * test_commands.c — Quake-style command and map resolver coverage.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
+
+#include "common.h"
+#include "test.h"
+#include "common/video_modes.h"
+
+static PATHSTR last_loading_map;
+static PATHSTR last_sv_map;
+static PATHSTR last_load_name;
+static PATHSTR last_load_map;
+static PATHSTR last_connect_host;
+static char last_forwarded[1024];
+static uint32_t forwarded_count;
+static bool command_tests_initialized;
+static bool late_command_called;
+static bool save_map_readable;
+static bool load_game_ok;
+static uint32_t control_groups_load_calls;
+static PATHSTR last_control_groups_load;
+static unsigned short last_connect_port;
+
+extern bool cl_screenshot_pending;
+extern uint32_t cl_screenshot_delay;
+void CL_Screenshot_f(void);
+bool CL_ScreenshotReady(void);
+
+void Key_Init(void) {
+}
+
+void Key_WriteBindings(FILE *file) {
+    (void)file;
+}
+
+void Cmd_ForwardToServer(cstring_t text) {
+    forwarded_count++;
+    snprintf(last_forwarded, sizeof(last_forwarded), "%s", text ? text : "");
+}
+
+void CL_SetGameplayBindings(void) {
+}
+
+void CL_Connect(cstring_t host, unsigned short port) {
+    snprintf(last_connect_host, sizeof(last_connect_host), "%s", host ? host : "");
+    last_connect_port = port;
+}
+
+void CL_BeginLoadingMap(cstring_t mapName) {
+    snprintf(last_loading_map, sizeof(last_loading_map), "%s", mapName ? mapName : "");
+}
+
+void CL_ControlGroupsLoad(cstring_t name) {
+    control_groups_load_calls++;
+    snprintf(last_control_groups_load, sizeof(last_control_groups_load), "%s", name ? name : "");
+}
+
+void CL_Shutdown(void) {
+}
+
+void SV_Map(cstring_t pFilename) {
+    snprintf(last_sv_map, sizeof(last_sv_map), "%s", pFilename ? pFilename : "");
+}
+
+bool SV_GetSaveMap(cstring_t name, string_t map, uint32_t map_size) {
+    (void)name;
+    if (!save_map_readable) return false;
+    strlcpy(map, "Maps\\Campaign\\Human02.w3m", map_size);
+    return true;
+}
+
+bool SV_LoadGame(cstring_t name, cstring_t map) {
+    snprintf(last_load_name, sizeof(last_load_name), "%s", name ? name : "");
+    snprintf(last_load_map, sizeof(last_load_map), "%s", map ? map : "");
+    return load_game_ok;
+}
+
+void SV_Shutdown(void) {
+}
+
+void Sys_Quit(void) {
+}
+
+void PF_Sleep(uint32_t msec) {
+    (void)msec;
+}
+
+static void reset_map_handoff(void) {
+    last_loading_map[0] = '\0';
+    last_sv_map[0] = '\0';
+    last_load_name[0] = '\0';
+    last_load_map[0] = '\0';
+    control_groups_load_calls = 0;
+    last_control_groups_load[0] = '\0';
+    last_connect_host[0] = '\0';
+    last_forwarded[0] = '\0';
+    late_command_called = false;
+    save_map_readable = load_game_ok = true;
+    last_connect_port = 0;
+}
+
+static void Test_LateCommand_f(void) {
+    late_command_called = true;
+}
+
+static void setup_command_tests(void) {
+    if (command_tests_initialized) {
+        return;
+    }
+
+    cstring_t argv[] = { "test_commands", "-config", "" };
+
+    Com_Init(3, argv);
+    T_ASSERT(FS_AddArchive("build/tests/tests.mpq") != NULL);
+    reset_map_handoff();
+    command_tests_initialized = true;
+}
+
+TEST(commands, deferred_tail_preserves_unknown_commands_arguments_and_order) {
+    char text[512];
+    setup_command_tests();
+    Cmd_AddCommand("test_defer", Cbuf_CopyToDefer);
+    Cbuf_AddText("test_defer;set defer_order before\n");
+    for (int i = 0; i < 12; i++) Cbuf_AddText("future_game_command\n");
+    memset(text, 'x', sizeof(text));
+    memcpy(text, "future_game_command \"", 21);
+    text[sizeof(text) - 3] = '"';
+    text[sizeof(text) - 2] = '\n';
+    text[sizeof(text) - 1] = 0;
+    Cbuf_AddText(text);
+    forwarded_count = 0;
+    Cbuf_Execute();
+    T_EQ(forwarded_count, 0);
+    Cbuf_AddText("set defer_order after\n");
+    Cbuf_InsertFromDefer();
+    Cbuf_Execute();
+    T_EQ(forwarded_count, 13);
+    text[sizeof(text) - 2] = 0;
+    T_STREQ(last_forwarded, text);
+    T_STREQ(Cvar_String("defer_order", ""), "after");
+    Cbuf_InsertFromDefer();
+    Cbuf_Execute();
+    T_EQ(forwarded_count, 13);
+}
+
+TEST(commands, canceled_or_replaced_loading_discards_old_tail) {
+    setup_command_tests();
+    forwarded_count = 0;
+    Cbuf_AddText("old_world_command\n");
+    Cbuf_CopyToDefer();
+    Cbuf_ClearDefer();
+    Cbuf_InsertFromDefer();
+    Cbuf_Execute();
+    T_EQ(forwarded_count, 0);
+    Cbuf_AddText("old_world_command\n");
+    Cbuf_CopyToDefer();
+    Cbuf_AddText("new_world_command");
+    Cbuf_CopyToDefer();
+    Cbuf_AddText("set defer_separator ok\n");
+    Cbuf_InsertFromDefer();
+    Cbuf_Execute();
+    T_EQ(forwarded_count, 1);
+    T_STREQ(Cvar_String("defer_separator", ""), "ok");
+    T_STREQ(last_forwarded, "new_world_command");
+}
+
+TEST(commands, command_registration) {
+    setup_command_tests();
+
+    T_ASSERT(Cmd_Exists("cmdlist"));
+    T_ASSERT(Cmd_Exists("load"));
+    T_ASSERT(Cmd_Exists("map"));
+    T_ASSERT(Cmd_Exists("maps"));
+    T_ASSERT(Cmd_Exists("dir"));
+    T_ASSERT(Cmd_Exists("path"));
+}
+
+TEST(commands, save_path_adds_one_sav_extension) {
+    PATHSTR path, home;
+    char expected[MAX_PATHLEN + 32];
+
+    setup_command_tests();
+    snprintf(home, sizeof(home), "%s", Test_TempPath("save-path-test"));
+    FS_SetHomeDirectory(home);
+    FS_SavePath("quick", path, sizeof(path));
+    snprintf(expected, sizeof(expected), "%s/saves/quick.sav", home);
+    T_STREQ(path, expected);
+    FS_SavePath("manual.SAV", path, sizeof(path));
+    snprintf(expected, sizeof(expected), "%s/saves/manual.SAV", home);
+    T_STREQ(path, expected);
+}
+
+/* Linux filenames preserve UTF-8 bytes; a quoted data directory may also contain spaces. */
+TEST(commands, media_paths_preserve_utf8_and_spaces) {
+    PATHSTR old_home, path, resolved, root;
+    uint32_t size = 0;
+    setup_command_tests();
+    /* Per-process root keeps the UTF-8/space components without sharing the file with a concurrent run. */
+    snprintf(root, sizeof(root), "%s", Test_TempPath("Téléchargements/Games WIP/ROC"));
+    snprintf(old_home, sizeof(old_home), "%s", FS_HomePath());
+    FS_SetHomeDirectory(root);
+    FS_UserPath("audio-path-test.wav", path, sizeof(path));
+    FILE *file = fopen(path, "wb");
+    T_NOT_NULL(file);
+    if (file) { T_EQ(fwrite("test", 1, 4, file), 4); fclose(file); }
+    T_ASSERT(FS_AddDataDirectory(root));
+    T_ASSERT(FS_ResolveLoosePath("audio-path-test.wav", resolved, sizeof(resolved)));
+    T_STREQ(resolved, path);
+    char *data = FS_ReadFile("audio-path-test.wav", &size);
+    T_NOT_NULL(data);
+    T_EQ(size, 4);
+    if (data) T_ASSERT(!memcmp(data, "test", 4));
+    FS_FreeFile(data);
+    remove(path);
+    FS_SetHomeDirectory(old_home);
+}
+
+TEST(commands, save_list_returns_newest_sav_basenames_first) {
+    PATHSTR older, newer, ignored;
+    char list[256] = { 0 };
+    FILE *file;
+    cstring_t second;
+#ifdef _WIN32
+    struct _utimbuf times;
+#else
+    struct utimbuf times;
+#endif
+    time_t now = time(NULL);
+
+    setup_command_tests();
+    /* A private home: the listing must not see saves written by a concurrent test run. */
+    FS_SetHomeDirectory(Test_TempPath("save-list-test"));
+    FS_SavePath("Zulu", newer, sizeof(newer));
+    FS_SavePath("alpha", older, sizeof(older));
+    FS_UserPath("saves/ignored.txt", ignored, sizeof(ignored));
+    remove(older);
+    remove(newer);
+    remove(ignored);
+
+    file = fopen(newer, "wb"); T_NOT_NULL(file); if (file) fclose(file);
+    file = fopen(older, "wb"); T_NOT_NULL(file); if (file) fclose(file);
+    file = fopen(ignored, "wb"); T_NOT_NULL(file); if (file) fclose(file);
+
+    times.actime = now - 20;
+    times.modtime = now - 20;
+#ifdef _WIN32
+    T_EQ(_utime(older, &times), 0);
+#else
+    T_EQ(utime(older, &times), 0);
+#endif
+    times.actime = now - 10;
+    times.modtime = now - 10;
+#ifdef _WIN32
+    T_EQ(_utime(newer, &times), 0);
+#else
+    T_EQ(utime(newer, &times), 0);
+#endif
+
+    T_EQ(FS_ListSaves(list, sizeof(list)), 2);
+    T_STREQ(list, "Zulu");
+    second = list + strlen(list) + 1;
+    T_STREQ(second, "alpha");
+    T_EQ(second[strlen(second) + 1], '\0');
+
+    remove(older);
+    remove(newer);
+    remove(ignored);
+}
+
+TEST(commands, save_list_keeps_basenames_containing_spaces) {
+    PATHSTR path;
+    char list[256] = { 0 };
+    FILE *file;
+
+    setup_command_tests();
+    FS_SetHomeDirectory(Test_TempPath("save-space-list-test"));
+    FS_SavePath("Night Elf 04 custom save", path, sizeof(path));
+    remove(path);
+    file = fopen(path, "wb"); T_NOT_NULL(file);
+    if (file) fclose(file);
+    T_EQ(FS_ListSaves(list, sizeof(list)), 1);
+    T_STREQ(list, "Night Elf 04 custom save");
+    T_EQ(list[strlen(list) + 1], '\0');
+    T_ASSERT(FS_DeleteSave("Night Elf 04 custom save"));
+}
+
+TEST(commands, delete_save_removes_named_save_file) {
+    PATHSTR path;
+    FILE *file;
+
+    setup_command_tests();
+    FS_SetHomeDirectory(Test_TempPath("save-delete-test"));
+    FS_SavePath("manual", path, sizeof(path));
+    remove(path);
+    file = fopen(path, "wb"); T_NOT_NULL(file); if (file) fclose(file);
+    T_ASSERT(FS_DeleteSave("manual"));
+    T_ASSERT(!FS_FileExists(path));
+}
+
+TEST(commands, config_path_uses_home_game_directory) {
+    PATHSTR path, home;
+    char expected[MAX_PATHLEN + sizeof("/config.cfg")];
+
+    setup_command_tests();
+    snprintf(home, sizeof(home), "%s", Test_TempPath("config-path-test"));
+    FS_SetHomeDirectory(home);
+    FS_ConfigPath("config.cfg", path, sizeof(path));
+    snprintf(expected, sizeof(expected), "%s/config.cfg", home);
+    T_STREQ(path, expected);
+}
+
+TEST(commands, config_loader_reports_missing_files) {
+    setup_command_tests();
+
+    T_ASSERT(!Cvar_LoadConfig(Test_TempPath("config-path-test/missing.cfg")));
+    T_ASSERT(Cvar_LoadConfig("games/world-of-warcraft/share/config.cfg"));
+    Cbuf_Execute();
+}
+
+TEST(commands, share_authored_ui_assets_are_readable) {
+    uint32_t size = 0;
+    handle_t data;
+
+    setup_command_tests();
+    data = FS_ReadFile("UI\\FrameDef\\OpenWarcraft3\\CampaignList.fdf", &size);
+    T_NOT_NULL(data); T_ASSERT(size > 0);
+    if (data) FS_FreeFile(data);
+}
+
+/* The game import now probes these same VFS rules during map spawning.
+ * A mounted map MPQ must override archives/loose paths, and removing that
+ * priority mount must immediately remove its private asset from lookup. */
+TEST(commands, priority_archive_file_exists_tracks_map_mount) {
+    static uint8_t const payload[] = { 'M', 'A', 'P' };
+    cstring_t const filename = "ReplaceableTextures\\Shadows\\WC3PriorityProbe.blp";
+    cstring_t const archive_path = Test_TempPath("wc3-priority-exists.mpq");
+    handle_t archive = NULL;
+    uint32_t size = 0;
+    void *data = NULL;
+    handle_t const previous = FS_GetPriorityArchive();
+
+    setup_command_tests();
+    T_ASSERT(!FS_FileExists(filename));
+    T_ASSERT(SFileCreateArchive(archive_path, 0, 16, &archive));
+    T_NOT_NULL(archive);
+    if (!archive) return;
+    T_ASSERT(SFileAddFileFromBuffer(archive, filename, payload, sizeof(payload)));
+    T_ASSERT(SFileCloseArchive(archive));
+    archive = NULL;
+    T_ASSERT(SFileOpenArchive(archive_path, 0, 0, &archive));
+    T_NOT_NULL(archive);
+    if (!archive) return;
+    FS_SetPriorityArchive(archive);
+    T_ASSERT(FS_FileExists(filename));
+    data = FS_ReadFile(filename, &size);
+    T_NOT_NULL(data);
+    T_EQ(size, sizeof(payload));
+    if (data) {
+        T_ASSERT(!memcmp(data, payload, sizeof(payload)));
+        FS_FreeFile(data);
+    }
+    FS_SetPriorityArchive(previous);
+    T_ASSERT(!FS_FileExists(filename));
+    T_ASSERT(SFileCloseArchive(archive));
+    remove(archive_path);
+}
+
+TEST(commands, command_and_cvar_completion) {
+    char out[128];
+
+    setup_command_tests();
+
+    T_EQ(Cmd_CompleteCommand("cmdli", out, sizeof(out), false), 1);
+    T_STREQ(out, "cmdlist");
+    T_EQ(Cmd_CompleteCommand("ma", out, sizeof(out), false), 2);
+    T_STREQ(out, "map");
+    T_EQ(Cvar_CompleteVariable("scr_show", out, sizeof(out), false), 1);
+    T_STREQ(out, "scr_showfps");
+    T_ASSERT(Cvar_String("scr_showfps", NULL) != NULL);
+}
+
+TEST(commands, registered_renderer_cvar_accepts_bare_assignment) {
+    setup_command_tests();
+    Cvar_Set("r_stats", "0");
+    Cmd_ExecuteString("r_stats 1");
+    T_STREQ(Cvar_String("r_stats", NULL), "1");
+}
+
+TEST(commands, cursor_defaults_to_native_sdl) {
+    setup_command_tests();
+    T_STREQ(Cvar_String("r_cursor", NULL), "0");
+}
+
+TEST(commands, cursor_allows_game_authored_override) {
+    cstring_t argv[] = { "test_commands", "+r_cursor", "1" };
+
+    setup_command_tests();
+    COM_InitArgv(3, argv);
+    Cbuf_AddEarlyCommands(true);
+    T_STREQ(Cvar_String("r_cursor", NULL), "1");
+}
+
+TEST(commands, data_command_line_sets_data_cvar) {
+    cstring_t argv[] = { "test_commands", "-data", "tests/data dir" };
+
+    setup_command_tests();
+    Cvar_ApplyCommandLine(3, argv);
+
+    T_STREQ(Cvar_String("data", NULL), "tests/data dir");
+}
+
+TEST(commands, tft_command_line_exposes_expansion_archives) {
+    cstring_t argv[] = { "test_commands", "-tft" };
+
+    setup_command_tests();
+    Cvar_Set("fs_expansion", "0");
+    Cvar_ApplyCommandLine(2, argv);
+
+    T_STREQ(Cvar_String("fs_expansion", NULL), "1");
+}
+
+TEST(commands, roc_command_line_hides_expansion_archives) {
+    cstring_t argv[] = { "test_commands", "-roc" };
+
+    setup_command_tests();
+    Cvar_Set("fs_expansion", "1");
+    Cvar_ApplyCommandLine(2, argv);
+
+    T_STREQ(Cvar_String("fs_expansion", NULL), "0");
+}
+
+TEST(commands, plus_tft_compatibility_flag_selects_expansion_early) {
+    cstring_t argv[] = { "test_commands", "+tft" };
+
+    setup_command_tests();
+    reset_map_handoff();
+    Cvar_Set("fs_expansion", "0");
+    COM_InitArgv(2, argv);
+    Cbuf_AddEarlyCommands(true);
+
+    T_STREQ(Cvar_String("fs_expansion", NULL), "1");
+    T_STREQ(COM_Argv(1), "");
+
+    Cbuf_AddLateCommands();
+    Cbuf_Execute();
+    T_STREQ(last_forwarded, "");
+}
+
+TEST(commands, plus_roc_compatibility_flag_selects_base_game_early) {
+    cstring_t argv[] = { "test_commands", "+roc" };
+
+    setup_command_tests();
+    reset_map_handoff();
+    Cvar_Set("fs_expansion", "1");
+    COM_InitArgv(2, argv);
+    Cbuf_AddEarlyCommands(true);
+
+    T_STREQ(Cvar_String("fs_expansion", NULL), "0");
+    T_STREQ(COM_Argv(1), "");
+
+    Cbuf_AddLateCommands();
+    Cbuf_Execute();
+    T_STREQ(last_forwarded, "");
+}
+
+TEST(commands, roc_uses_base_ai_scripts_without_dropping_localized_data) {
+    setup_command_tests();
+    Cvar_Set("fs_expansion", "0");
+    Cvar_Set("fs_expansion_archive_prefix", "");
+    T_ASSERT(FS_ArchiveFileVisible("data/War3x.mpq", "UI\\CampaignStrings_exp.txt"));
+    Cvar_Set("fs_expansion_archive_prefix", "War3x");
+
+    T_ASSERT(!FS_ArchiveFileVisible("data/War3Local.mpq", "Scripts\\human.ai"));
+    T_ASSERT(!FS_ArchiveFileVisible("data/war3local.MPQ", "Scripts\\campaign.ai"));
+    T_ASSERT(FS_ArchiveFileVisible("data/War3Local.mpq", "Scripts\\HumanMelee.pld"));
+    T_ASSERT(FS_ArchiveFileVisible("data/War3Local.mpq", "UI\\WorldEditStrings.txt"));
+    T_ASSERT(FS_ArchiveFileVisible("data/War3.mpq", "Scripts\\human.ai"));
+    T_ASSERT(!FS_ArchiveFileVisible("data/War3x.mpq", "UI\\CampaignStrings_exp.txt"));
+    T_ASSERT(!FS_ArchiveFileVisible("data/War3xLocal.mpq", "UI\\war3skins.txt"));
+
+    Cvar_Set("fs_expansion", "1");
+    T_ASSERT(FS_ArchiveFileVisible("data/War3Local.mpq", "Scripts\\human.ai"));
+    T_ASSERT(FS_ArchiveFileVisible("data/War3x.mpq", "UI\\CampaignStrings_exp.txt"));
+    T_ASSERT(FS_ArchiveFileVisible("data/War3xLocal.mpq", "UI\\war3skins.txt"));
+}
+
+TEST(commands, dash_cvars_are_not_command_line_cvars) {
+    cstring_t argv[] = { "test_commands", "-scr_showfps=0" };
+
+    setup_command_tests();
+    Cvar_Set("scr_showfps", "1");
+    Cvar_ApplyCommandLine(2, argv);
+
+    T_STREQ(Cvar_String("scr_showfps", NULL), "1");
+}
+
+TEST(commands, display_modes_require_explicit_flag) {
+    cstring_t args[] = { "test_commands", "-vid_modes" };
+    cstring_t other[] = { "test_commands", "-vid_modes_extra" };
+
+    setup_command_tests();
+    T_STREQ(Cvar_String("vid_modes", NULL), "0");
+    Cvar_ApplyCommandLine(2, other);
+    T_STREQ(Cvar_String("vid_modes", NULL), "0");
+    Cvar_ApplyCommandLine(2, args);
+    T_STREQ(Cvar_String("vid_modes", NULL), "1");
+    Cvar_Set("vid_modes", "0");
+}
+
+TEST(commands, fast_forward_requires_explicit_flag) {
+    cstring_t args[] = { "test_commands", "-com_fast_forward" };
+    cstring_t other[] = { "test_commands", "-com_fast_forward_extra" };
+
+    setup_command_tests();
+    T_STREQ(Cvar_String("com_fast_forward", NULL), "0");
+    Cvar_ApplyCommandLine(2, other);
+    T_STREQ(Cvar_String("com_fast_forward", NULL), "0");
+    Cvar_ApplyCommandLine(2, args);
+    T_STREQ(Cvar_String("com_fast_forward", NULL), "1");
+    Cvar_Set("com_fast_forward", "0");
+}
+
+TEST(commands, plus_cvars_apply_immediately) {
+    cstring_t argv[] = { "test_commands", "+game_port", "28010", "+scr_showfps", "0" };
+
+    setup_command_tests();
+    Cvar_Set("game_port", PORT_SERVER_STRING);
+    Cvar_Set("scr_showfps", "1");
+    COM_InitArgv(5, argv);
+    Cbuf_AddEarlyCommands(true);
+
+    T_STREQ(Cvar_String("game_port", NULL), "28010");
+    T_STREQ(Cvar_String("scr_showfps", NULL), "0");
+    Cvar_Set("scr_showfps", "1");
+}
+
+TEST(commands, obsolete_r_module_is_ignored) {
+    setup_command_tests();
+    T_NULL(Cvar_Set("r_module", "stdout"));
+    T_NULL(Cvar_String("r_module", NULL));
+}
+
+TEST(commands, plus_map_is_early_launch_selector) {
+    cstring_t argv[] = { "test_commands", "+map", "Human02" };
+
+    setup_command_tests();
+    Cvar_Set("map", "");
+    reset_map_handoff();
+    COM_InitArgv(3, argv);
+    Cbuf_AddEarlyCommands(true);
+    Cbuf_AddLateCommands();
+    Cbuf_Execute();
+
+    T_STREQ(Cvar_String("map", NULL), "Human02");
+    T_STREQ(last_loading_map, "");
+    T_STREQ(last_sv_map, "");
+}
+
+TEST(commands, remaining_plus_commands_run_late) {
+    cstring_t argv[] = { "test_commands", "+test_late_command" };
+
+    setup_command_tests();
+    if (!Cmd_Exists("test_late_command")) {
+        Cmd_AddCommand("test_late_command", Test_LateCommand_f);
+    }
+    late_command_called = false;
+    COM_InitArgv(2, argv);
+    Cbuf_AddEarlyCommands(true);
+    Cbuf_AddLateCommands();
+    Cbuf_Execute();
+
+    T_ASSERT(late_command_called);
+}
+
+TEST(commands, screenshot_optional_delay_counts_rendered_frames) {
+    setup_command_tests();
+    if (!Cmd_Exists("screenshot")) Cmd_AddCommand("screenshot", CL_Screenshot_f);
+    cl_screenshot_pending = false; cl_screenshot_delay = 0;
+    Cmd_ExecuteString("screenshot 3");
+    T_ASSERT(cl_screenshot_pending); T_EQ(cl_screenshot_delay, 3);
+    T_ASSERT(!CL_ScreenshotReady()); T_ASSERT(!CL_ScreenshotReady()); T_ASSERT(CL_ScreenshotReady());
+    T_ASSERT(!cl_screenshot_pending); T_EQ(cl_screenshot_delay, 0);
+    Cmd_ExecuteString("screenshot"); T_ASSERT(CL_ScreenshotReady());
+    Cmd_ExecuteString("screenshot invalid"); T_ASSERT(!cl_screenshot_pending);
+}
+
+typedef struct {
+    uint32_t count, found;
+} mapListState_t;
+
+static cstring_t const fixture_maps[] = {
+    "Maps\\Campaign\\Human02.w3m",
+    "Maps\\Campaign\\Human03.w3m",
+    "Maps\\FrozenThrone\\Campaign\\NightElfX04.w3x",
+    "Maps\\Campaign\\Orc01.w3m",
+    "Maps\\Melee\\TwinRivers.w3m",
+    "Maps\\FrozenThrone\\TwinRivers.w3x",
+    "Maps\\MapOverlay.w3x",
+    "Maps\\Transport.w3m",
+};
+
+static void count_fixture_map(cstring_t path, void *userData) {
+    mapListState_t *state = userData;
+    state->count++;
+    FOR_LOOP(i, sizeof(fixture_maps) / sizeof(fixture_maps[0]))
+        if (!strcmp(path, fixture_maps[i])) state->found |= 1u << i;
+}
+
+/* Nested overlay, terrain and loadable transport archives are included in the fixture map list. */
+TEST(commands, fixture_maps_are_listed_from_mpq) {
+    mapListState_t state = { 0 };
+    uint32_t expected = sizeof(fixture_maps) / sizeof(fixture_maps[0]);
+    setup_command_tests();
+    T_EQ(FS_ListMaps(count_fixture_map, &state), expected);
+    T_EQ(state.count, expected);
+    T_EQ(state.found, (1u << expected) - 1);
+}
+
+TEST(commands, short_map_name_resolves_from_fixture_mpq) {
+    PATHSTR path;
+
+    setup_command_tests();
+
+    T_EQ(FS_ResolveMapPath("Human02", path, sizeof(path)), FS_MAP_RESOLVE_OK);
+    T_STREQ(path, "Maps\\Campaign\\Human02.w3m");
+    T_EQ(FS_ResolveMapPath("orc01", path, sizeof(path)), FS_MAP_RESOLVE_OK);
+    T_STREQ(path, "Maps\\Campaign\\Orc01.w3m");
+}
+
+TEST(commands, explicit_map_path_still_resolves) {
+    PATHSTR path;
+
+    setup_command_tests();
+
+    T_EQ(FS_ResolveMapPath("Maps/Campaign/Human02.w3m", path, sizeof(path)), FS_MAP_RESOLVE_OK);
+    T_STREQ(path, "Maps\\Campaign\\Human02.w3m");
+}
+
+TEST(commands, ambiguous_short_map_name_is_rejected) {
+    PATHSTR path;
+
+    setup_command_tests();
+
+    T_EQ(FS_ResolveMapPath("TwinRivers", path, sizeof(path)), FS_MAP_RESOLVE_AMBIGUOUS);
+}
+
+TEST(commands, map_command_uses_resolver) {
+    setup_command_tests();
+    reset_map_handoff();
+
+    Cmd_ExecuteString("map Human02");
+
+    T_STREQ(last_loading_map, "Maps\\Campaign\\Human02.w3m");
+    T_STREQ(last_sv_map, "Maps\\Campaign\\Human02.w3m");
+}
+
+TEST(commands, map_command_rejects_ambiguous_short_name) {
+    setup_command_tests();
+    reset_map_handoff();
+
+    Cmd_ExecuteString("map TwinRivers");
+
+    T_STREQ(last_loading_map, "");
+    T_STREQ(last_sv_map, "");
+}
+
+TEST(commands, load_command_reloads_saved_map_without_connect) {
+    setup_command_tests();
+    reset_map_handoff();
+    Cvar_Set("dedicated", "0"); Cvar_Set("game_port", "28015");
+
+    Cmd_ExecuteString("load quick");
+
+    T_STREQ(last_loading_map, "Maps\\Campaign\\Human02.w3m");
+    T_STREQ(last_load_name, "quick");
+    T_STREQ(last_load_map, "Maps\\Campaign\\Human02.w3m");
+    T_EQ(control_groups_load_calls, 1);
+    T_STREQ(last_control_groups_load, "quick");
+    /* Q2 load reconnects with "new" on the existing slot, not CL_Connect. */
+    T_STREQ(last_connect_host, "");
+}
+
+TEST(commands, load_command_accepts_quoted_save_name_with_spaces) {
+    setup_command_tests();
+    reset_map_handoff();
+    Cvar_Set("dedicated", "0"); Cvar_Set("game_port", "28015");
+
+    Cmd_ExecuteString("load \"Night Elf 04 custom save\"");
+
+    T_STREQ(last_load_name, "Night Elf 04 custom save");
+    T_STREQ(last_load_map, "Maps\\Campaign\\Human02.w3m");
+}
+
+TEST(commands, load_command_stops_when_save_map_is_unreadable) {
+    setup_command_tests();
+    reset_map_handoff();
+    save_map_readable = false;
+
+    Cmd_ExecuteString("load broken");
+
+    T_STREQ(last_loading_map, "");
+    T_STREQ(last_load_name, "");
+    T_STREQ(last_connect_host, "");
+}
+TEST(video_modes, invalid_index_uses_safe_default) {
+    T_EQ(video_mode_get(-1)->width, (uint32_t)640); T_EQ(video_mode_get(99)->height, (uint32_t)480);
+    T_EQ(video_mode_get(2)->width, (uint32_t)1024); T_EQ(video_mode_get(2)->height, (uint32_t)768);
+}
+
+TEST(video_modes, steam_deck_mode_is_appended_without_renumbering_existing_modes) {
+    uint32_t steam_deck_mode = video_mode_count() - 1;
+
+    T_EQ(video_mode_count(), (uint32_t)14);
+    T_EQ(video_mode_get(5)->width, (uint32_t)1280);
+    T_EQ(video_mode_get(5)->height, (uint32_t)960);
+    T_EQ(video_mode_get((int)steam_deck_mode)->width, (uint32_t)1280);
+    T_EQ(video_mode_get((int)steam_deck_mode)->height, (uint32_t)800);
+}
+
+TEST(video_modes, wc3_defaults_to_native_fullscreen_with_vid_mode_fallback) {
+    setup_command_tests();
+    Cvar_Set("vid_native", "0");
+    Cvar_Set("vid_fullscreen", "0");
+    Cvar_Set("vid_mode", "0");
+
+    Cvar_LoadConfig("games/warcraft-3/share/config.cfg");
+    Cbuf_Execute();
+
+    T_STREQ(Cvar_String("vid_native", NULL), "1");
+    T_STREQ(Cvar_String("vid_fullscreen", NULL), "1");
+    T_STREQ(Cvar_String("vid_mode", NULL), "4");
+}
+
+TEST(video_modes, wow_defaults_allow_explicit_override) {
+    cstring_t args[] = { "test_commands", "+set", "vid_mode", "0" };
+
+    setup_command_tests();
+    Cvar_Set("vid_mode", "0");
+    Cvar_LoadConfig("games/world-of-warcraft/share/config.cfg");
+    Cbuf_Execute();
+    T_STREQ(Cvar_String("vid_mode", NULL), "2");
+    COM_InitArgv(4, args);
+    Cbuf_AddEarlyCommands(true);
+    T_STREQ(Cvar_String("vid_mode", NULL), "0");
+}
+
+TEST(commands, cvar_alias_preserves_override_order_and_one_archived_value) {
+    setup_command_tests();
+    Cvar_Init();
+    Cvar_Set("test_camera_speed", "1400");
+    Cmd_ExecuteString("cvar_alias test_old_camera_speed test_camera_speed");
+    Cmd_ExecuteString("seta test_old_camera_speed 900");
+    T_STREQ(Cvar_String("test_camera_speed", ""), "900");
+    T_ASSERT(Cvar_Get("test_camera_speed", "", 0)->flags & CVAR_ARCHIVE);
+    Cmd_ExecuteString("set test_camera_speed 700");
+    T_STREQ(Cvar_String("test_old_camera_speed", ""), "700");
+    T_EQ(Cvar_Get("test_old_camera_speed", "", 0), Cvar_Get("test_camera_speed", "", 0));
+    Cvar_EndConfig();
+    Cmd_ExecuteString("cvar_alias test_late_camera_alias test_camera_speed");
+    T_NULL(Cvar_String("test_late_camera_alias", NULL));
+    Cmd_ExecuteString("set test_old_camera_speed 600");
+    T_STREQ(Cvar_String("test_camera_speed", ""), "600");
+}
+
+TEST(commands, cvar_alias_migrates_early_settings_and_rejects_retargeting) {
+    setup_command_tests();
+    Cvar_Init();
+    Cvar_Get("test_early_speed", "123", CVAR_ARCHIVE);
+    Cvar_Set("test_new_speed", "456");
+    Cmd_ExecuteString("cvar_alias test_early_speed test_new_speed");
+    T_STREQ(Cvar_String("test_new_speed", ""), "123");
+    T_ASSERT(Cvar_Get("test_new_speed", "", 0)->flags & CVAR_ARCHIVE);
+    Cvar_Set("test_other_speed", "789");
+    Cmd_ExecuteString("cvar_alias test_early_speed test_other_speed");
+    T_STREQ(Cvar_String("test_early_speed", ""), "123");
+    Cmd_ExecuteString("cvar_alias test_new_speed test_early_speed");
+    T_STREQ(Cvar_String("test_new_speed", ""), "123");
+    Cvar_EndConfig();
+}
+
+/* The server reads sv_rate every snapshot; like the other sv_ cvars it is registered with a default and a description
+ * so `set`, cvarlist and the config file know it. */
+TEST(commands, sv_rate_is_registered_unlimited_by_default) {
+    setup_command_tests();
+    Cvar_Init();
+    T_STREQ(Cvar_String("sv_rate", NULL), "0");
+    T_NOT_NULL(Cvar_Get("sv_rate", "", 0)->description);
+    Cvar_EndConfig();
+}
+
+/* Profiling is an explicit console control, with an inverse and no persistence into ordinary play. */
+TEST(commands, renderer_profile_is_registered_and_not_archived) {
+    setup_command_tests();
+    Cvar_Init();
+    T_STREQ(Cvar_String("r_profile", NULL), "0");
+    Cmd_ExecuteString("r_profile 2");
+    T_STREQ(Cvar_String("r_profile", NULL), "2");
+    T_NOT_NULL(Cvar_Get("r_profile", "", 0)->description);
+    T_ASSERT(!(Cvar_Flags("r_profile") & CVAR_ARCHIVE));
+    Cmd_ExecuteString("r_profile 0");
+    T_STREQ(Cvar_String("r_profile", NULL), "0");
+    Cvar_EndConfig();
+}

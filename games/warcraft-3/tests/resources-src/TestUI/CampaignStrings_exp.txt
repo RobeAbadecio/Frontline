@@ -1,0 +1,41 @@
+[Index]
+CampaignList="","","","","NightElf","Human","Undead","","Orc"
+
+[NightElf]
+Header="Sentinels Campaign"
+Name="Terror of the Tides"
+Background="NightElfBackdrop"
+Cursor=3
+Mission0="Chapter One","Rise of the Naga","Maps\FrozenThrone\Campaign\NightElfX01.w3x"
+
+[Human]
+DefaultOpen=1
+Header="Alliance Campaign"
+Name="Curse of the Blood Elves"
+Background="HumanBackdrop"
+BackgroundFogStyle=0
+BackgroundFogStart=23
+BackgroundFogEnd=9023
+BackgroundFogDensity=0.75
+BackgroundFogColor=255,81,83,57
+Cursor=0
+IntroCinematic="Introduction","Alliance Introduction","HumanXIntro"
+OpenCinematic="Cinematic","Alliance Opening","HumanXOp"
+EndCinematic="Cinematic","Alliance Ending","HumanXEd"
+Mission0="Chapter One","Misconceptions","Maps\FrozenThrone\Campaign\HumanX01.w3x"
+Mission1="Chapter Two","A Dark Covenant","Maps\FrozenThrone\Campaign\HumanX02.w3x"
+Mission2="Chapter Three","The Dungeons of Dalaran","Maps\FrozenThrone\Campaign\HumanX03.w3x"
+
+[Undead]
+Header="Scourge Campaign"
+Name="Legacy of the Damned"
+Background="UndeadBackdrop"
+Cursor=2
+Mission0="Chapter One","King Arthas","Maps\FrozenThrone\Campaign\UndeadX01.w3x"
+
+[Orc]
+Header="Bonus Campaign"
+Name="The Founding of Durotar"
+Background="OrcBackdrop"
+Cursor=1
+Mission0="Chapter One","To Tame a Land","Maps\FrozenThrone\Campaign\OrcX01.w3x"

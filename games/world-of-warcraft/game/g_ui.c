@@ -1,0 +1,878 @@
+/*
+ * g_ui.c — Server-authored WoW HUD via svc_layout.
+ *
+ * Reproduces the classic WoW 1.12 HUD layout (action bar, targeting frame,
+ * minimap, copper) using the actual WoW assets and pixel positions from the
+ * virtual 1024×768 canvas, exactly matching what menu.dll rendered before
+ * in-game UI was moved server-side.
+ */
+
+#include "g_wow_local.h"
+#include "common/wow_character_utils.h"
+
+#define VW 1024.0f
+#define VH 768.0f
+#define PX(x) ((x) / VW)
+#define PY(y) ((y) / VH)
+#define PW(w) ((w) / VW)
+#define PH(h) ((h) / VH)
+#define HUD_FONT_SIZE 10
+#define WOW_BUTTON_TEXT_COLOR MAKE(color32_t, 255, 209, 0, 255) // RGBA; GameFontNormal 1.0/0.82/0; quest buttons
+
+static uint32_t ui_next_frame_number;
+static uint8_t ui_window_text[MAX_MSGLEN];
+static uint32_t ui_window_text_size;
+static bool ui_window_writing;
+
+/* svc_layout wire contract: every message carries exactly ONE layer —
+ * `svc_layout` byte, layer byte, frames, terminator (int32_t 0 + int16_t 0).  The
+ * client's CL_ParseLayout stops at the terminator and the outer parser reads the
+ * next byte as a *message id*, so a frame written outside a layer (before
+ * UI_WriteStart or after UI_WriteEnd) is silently discarded.  Track the open
+ * layer and refuse to serialize a frame outside one instead of dropping it. */
+static uint8_t ui_layout_layer = 0xFF; /* 0xFF = no layer open */
+
+/* Open a layout layer: emit the svc_layout + layer header and reset frame numbers. */
+static void UI_WriteStart(uint32_t layer) {
+    ui_layout_layer = (uint8_t)layer;
+    gi.Write(PF_BYTE, &(int32_t){svc_layout});
+    gi.Write(PF_BYTE, &(int32_t){layer});
+    ui_next_frame_number = 1;
+}
+
+/* Close the current layer with its terminator; nothing may be written until the next UI_WriteStart. */
+static void UI_WriteEnd(void) {
+    gi.Write(PF_LONG, &(int32_t){0});   /* bits=0 */
+    gi.Write(PF_SHORT, &(int32_t){0});  /* number=0 — MSG_ReadEntityBits consumes int32_t+int16_t */
+    ui_layout_layer = 0xFF;
+}
+
+/* Add one server-authored window string to the retained packet arena. */
+static uint32_t UI_WindowTextOffset(cstring_t text) {
+    uint32_t size, offset;
+    if (!text || !*text) return 0;
+    size = (uint32_t)strlen(text) + 1;
+    if (size > sizeof(ui_window_text) - ui_window_text_size) {
+        fprintf(stderr, "WoW UI: tutorial window text arena overflow\n");
+        return 0;
+    }
+    offset = ui_window_text_size;
+    memcpy(ui_window_text + offset, text, size);
+    ui_window_text_size += size;
+    return offset;
+}
+
+/* Open the generic server-authored window stream; all following proxy strings use arena offsets. */
+static void UI_WriteWindowStart(uiWindowDef_t const *def) {
+    ui_window_writing = true;
+    ui_window_text[0] = '\0'; ui_window_text_size = 1;
+    gi.Write(PF_BYTE, &(int32_t){svc_window}); gi.Write(PF_BYTE, &(int32_t){UI_WINDOW_OPEN});
+    gi.Write(PF_LONG, &def->id); gi.Write(PF_LONG, &def->class_id); gi.Write(PF_LONG, &def->flags);
+    ui_next_frame_number = 1;
+}
+
+/* Finish and unicast one complete server-authored window packet. */
+static void UI_WriteWindowEnd(edict_t *ent) {
+    pfWriteData_t text = { .data = ui_window_text, .size = ui_window_text_size };
+    ui_window_writing = false;
+    gi.Write(PF_LONG, &(int32_t){0}); gi.Write(PF_SHORT, &(int32_t){0});
+    gi.Write(PF_LONG, &ui_window_text_size); gi.Write(PF_DATA, &text); gi.unicast(ent);
+}
+
+static void UI_WriteImage(cstring_t path, float x, float y, float w, float h, color32_t color);
+
+static void UI_SetFramePoint(uiFramePoint_t *point, uiFramePointPos_t target, uint32_t relative, float offset, bool y_axis) {
+    point->used = 1;
+    point->targetPos = target;
+    point->relativeTo = (uint8_t)relative;
+    point->offset = (int16_t)((y_axis ? -offset : offset) * UI_FRAMEPOINT_SCALE);
+}
+
+static void UI_SetFrameRect(uiFrame_t *frame, float x, float y, float w, float h) {
+    UI_SetFramePoint(&frame->points.x[FPP_MIN], FPP_MIN, 0, x, false);
+    UI_SetFramePoint(&frame->points.y[FPP_MIN], FPP_MIN, 0, y, true);
+    frame->size.width = w;
+    frame->size.height = h;
+}
+
+static void UI_WriteProxyFrame(uiFrame_t *frame, handle_t data, uint32_t data_size) {
+    if (ui_layout_layer == 0xFF) {
+        fprintf(stderr, "WoW UI: FT_%d frame written outside a svc_layout layer (missing UI_WriteStart); skipped\n",
+                (int)frame->flags.type);
+        return;
+    }
+    frame->number = ui_next_frame_number++;
+    frame->parent = 0;
+    frame->color = frame->color.a ? frame->color : COLOR32_WHITE;
+    /* Set default full-UV only when caller left coords zeroed */
+    if (!frame->tex.coord[1] && !frame->tex.coord[3]) {
+        frame->tex.coord[1] = 0xff;
+        frame->tex.coord[3] = 0xff;
+    }
+    frame->buffer.data = data;
+    frame->buffer.size = data_size;
+    if (ui_window_writing) {
+        frame->text = (cstring_t)(uintptr_t)UI_WindowTextOffset(frame->text);
+        frame->tooltip = (cstring_t)(uintptr_t)UI_WindowTextOffset(frame->tooltip);
+        frame->onclick = (cstring_t)(uintptr_t)UI_WindowTextOffset(frame->onclick);
+    }
+    gi.Write(ui_window_writing ? PF_UIWINDOWFRAME : PF_UIFRAME, frame);
+}
+
+static void UI_WriteTextFrame(float x, float y, float w, float h, cstring_t text, color32_t color, uiFontJustificationH_t align) {
+    uiFrame_t frame;
+    uiLabel_t label;
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&label, 0, sizeof(label));
+    frame.flags.type = FT_STRING;
+    frame.text = text;
+    frame.color = color;
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", HUD_FONT_SIZE);
+    label.textalignx = align;
+    label.textaligny = FONT_JUSTIFYTOP;
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+/* Write the static world-hover widget; the client resolves its selected creature context each frame. */
+void UI_WriteWowHover(edict_t *ent) {
+    uiFrame_t frame = { 0 };
+    uiLabel_t label = { 0 };
+
+    if (!ent || !ent->client) return;
+    UI_WriteStart(LAYER_WORLD_HOVER);
+    frame.flags.type = FT_STRING; frame.stat = UI_STAT_CONTEXT_NAME; frame.color = MAKE(color32_t, 0, 255, 0, 255);
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 14);
+    label.textalignx = FONT_JUSTIFYCENTER; label.textaligny = FONT_JUSTIFYMIDDLE;
+    UI_SetFrameRect(&frame, -PW(120), -PH(34), PW(240), PH(20));
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_SIMPLESTATUSBAR; frame.tex.index = gi.ImageIndex("Interface\\TargetingFrame\\UI-StatusBar.blp");
+    frame.stat = UI_STAT_CONTEXT_HEALTH; frame.color = MAKE(color32_t, 0, 255, 0, 255);
+    UI_SetFrameRect(&frame, -PW(60), -PH(13), PW(120), PH(6));
+    UI_WriteProxyFrame(&frame, NULL, 0);
+
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_SIMPLESTATUSBAR; frame.tex.index = gi.ImageIndex("Interface\\TargetingFrame\\UI-StatusBar.blp");
+    frame.stat = UI_STAT_CONTEXT_MANA; frame.color = MAKE(color32_t, 60, 90, 235, 255);
+    UI_SetFrameRect(&frame, -PW(60), -PH(6), PW(120), PH(5));
+    UI_WriteProxyFrame(&frame, NULL, 0);
+    UI_WriteEnd();
+    gi.unicast(ent);
+}
+
+static void UI_WriteTextArea(float x, float y, float w, float h, cstring_t text, color32_t color) {
+    uiFrame_t frame;
+    uiTextArea_t area;
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&area, 0, sizeof(area));
+    frame.flags.type = FT_TEXTAREA;
+    frame.text = text ? text : "";
+    frame.color = color;
+    area.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 13);
+    area.inset = 0;
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, &area, sizeof(area));
+}
+
+/* UIPanelScrollFrameTemplate is one slider frame with fixed arrow and thumb textures. */
+static void UI_WriteQuestScrollBar(float x, float y) {
+    cstring_t paths[] = {
+        "Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up.blp",
+        "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up.blp",
+        "Interface\\Buttons\\UI-ScrollBar-Knob.blp",
+    };
+    uiFrame_t frame = {0};
+    uiScrollBarImage_t scroll = {0};
+
+    frame.flags.type = FT_SCROLLBAR;
+    FOR_LOOP(i, sizeof(paths) / sizeof(paths[0])) {
+        scroll.image[i] = gi.ImageIndex(paths[i]);
+    }
+    scroll.texcoord[0] = scroll.texcoord[2] = (uint8_t)(0.25f * 0xff);
+    scroll.texcoord[1] = scroll.texcoord[3] = (uint8_t)(0.75f * 0xff);
+    UI_SetFrameRect(&frame, x + PW(329), y + PH(81), PW(16), PH(334));
+    UI_WriteProxyFrame(&frame, &scroll, sizeof(scroll));
+}
+
+static void UI_WriteClickRegion(float x, float y, float w, float h, cstring_t command) {
+    uiFrame_t frame;
+    uiLabel_t label;
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&label, 0, sizeof(label));
+    frame.flags.type = FT_STRING;
+    frame.text = "";
+    frame.onclick = command;
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", HUD_FONT_SIZE);
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+static void UI_WriteSimpleButton(float x, float y, float w, float h,
+                                 cstring_t text, cstring_t command) {
+    uiFrame_t frame;
+    uiSimpleButton_t button;
+    RESOURCE texture = gi.ImageIndex("Interface\\Buttons\\UI-Panel-Button-Up.blp");
+    RESOURCE font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 12);
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&button, 0, sizeof(button));
+    frame.flags.type = FT_SIMPLEBUTTON;
+    frame.text = text;
+    frame.onclick = command;
+    button.normal.texture = texture;
+    button.normal.font = font;
+    /* UIPanelButtonTemplate crops the atlas; full UVs made its opaque art occupy only part of the frame. */
+    button.normal.texcoord[1] = (uint8_t)(0.625f * 0xff);
+    button.normal.texcoord[3] = (uint8_t)(0.6875f * 0xff);
+    button.normal.fontcolor = WOW_BUTTON_TEXT_COLOR;
+    button.pushed = button.normal;
+    button.disabled = button.normal;
+    button.highlight = button.normal;
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, &button, sizeof(button));
+}
+
+/* QuestFrame.xml uses a distinct 18px Morpheus title inside the parchment. */
+static void UI_WriteQuestTitle(float x, float y, cstring_t text) {
+    uiFrame_t frame = {0};
+    uiLabel_t label = {0};
+
+    frame.flags.type = FT_STRING;
+    frame.text = text;
+    frame.color = MAKE(color32_t, 0, 0, 0, 255);
+    label.font = gi.FontIndex("Fonts\\MORPHEUS.ttf", 18);
+    label.textalignx = FONT_JUSTIFYLEFT;
+    label.textaligny = FONT_JUSTIFYTOP;
+    UI_SetFrameRect(&frame, x + PW(28), y + PH(91), PW(285), PH(24));
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+/* QuestNpcNameFrame centers the giver name in the metal title bar. */
+static void UI_WriteQuestNpcName(float x, float y, cstring_t text) {
+    uiFrame_t frame = {0};
+    uiLabel_t label = {0};
+
+    frame.flags.type = FT_STRING;
+    frame.text = text;
+    frame.color = COLOR32_WHITE;
+    label.font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 12);
+    label.textalignx = FONT_JUSTIFYCENTER;
+    label.textaligny = FONT_JUSTIFYTOP;
+    /* QuestNpcNameFrame is TOP-anchored 23px below QuestFrame; the old 17px offset placed text over the border. */
+    UI_SetFrameRect(&frame, x + PW(42), y + PH(23), PW(300), PH(14));
+    UI_WriteProxyFrame(&frame, &label, sizeof(label));
+}
+
+/* The quest giver's model occupies the 60px portrait aperture in QuestFrame.xml. */
+static void UI_WriteQuestPortrait(float x, float y, RESOURCE model) {
+    uiFrame_t frame = {0};
+    if (!model) return;
+    frame.flags.type = FT_PORTRAIT;
+    frame.tex.index = model;
+    UI_SetFrameRect(&frame, x + PW(7), y + PH(6), PW(60), PH(60));
+    UI_WriteProxyFrame(&frame, NULL, 0);
+}
+
+typedef struct { edict_t *ent; cstring_t src; string_t dst; size_t size; } wowQuestText_t;
+
+/* Expand the player tokens retained from authoritative quest_template text. */
+static void UI_FormatQuestText(wowQuestText_t const *fmt) {
+    char race[64], sex[64];
+    cstring_t name = fmt->ent->client->ps.name && *fmt->ent->client->ps.name ? fmt->ent->client->ps.name : "adventurer";
+    cstring_t cls = Wow_ClassName(Wow_GetPlayerClass());
+    Wow_GetPlayerRaceSex(race, sizeof(race), sex, sizeof(sex));
+    struct { char key; cstring_t value; } repl[] = {
+        { 'N', name }, { 'n', name }, { 'C', cls }, { 'c', cls },
+        { 'R', race }, { 'r', race },
+    };
+    size_t out = 0;
+
+    for (cstring_t src = fmt->src ? fmt->src : ""; *src && out + 1 < fmt->size; src++) {
+        cstring_t value = NULL;
+        if (*src == '$' && src[1]) FOR_LOOP(i, sizeof(repl) / sizeof(repl[0]))
+            if (repl[i].key == src[1]) { value = repl[i].value; break; }
+        if (!value) { fmt->dst[out++] = *src; continue; }
+        size_t len = strlen(value);
+        if (len > fmt->size - out - 1) len = fmt->size - out - 1;
+        memcpy(fmt->dst + out, value, len); out += len; src++;
+    }
+    fmt->dst[out] = '\0';
+}
+
+/* Resolve the queststarter relation back to the creature-template name. */
+static cstring_t UI_QuestGiverName(uint32_t quest_id) {
+    FOR_LOOP(i, Wow_QuestGiverCount()) {
+        wowQuestGiver_t const *data = Wow_QuestGiver(i);
+        wowCreature_t const *creature;
+        if (data->quest_id != quest_id) continue;
+        creature = Wow_CreatureByEntry(data->creature_entry);
+        return creature ? creature->name : NULL;
+    }
+    return NULL;
+}
+
+/* The client ships QuestFrame.xml/Lua, but WoW game mode suppresses client UI
+ * scripts. Recreate the classic quest dialog and quest log on one shared layer.
+ * Both UI_WriteQuestDialog and UI_WriteQuestLog previously wrote separate
+ * svc_layout messages to LAYER_QUESTDIALOG; the second write always cleared the
+ * first.  Merged into a single write: quest_open takes priority, then
+ * questlog_open, otherwise the layer is cleared. */
+static void UI_WriteQuestDialog(edict_t *ent) {
+    wowClient_t *wc = (wowClient_t *)ent->client;
+
+    UI_WriteStart(LAYER_QUESTDIALOG);
+
+    if (wc->quest_open) {
+        wowQuestDetail_t const *detail = Wow_QuestDetail(wc->quest_id);
+        svQuestEntry_t *state = SV_QuestFind(wc->quest_log, wc->quest_count, wc->quest_id);
+        uint32_t slot = state ? (uint32_t)(state - wc->quest_log) : 0;
+        edict_t *selected = wc->selected_entity && wc->selected_entity < (uint32_t)globals.num_edicts
+            ? &wow_edicts[wc->selected_entity] : NULL;
+        wowEntityLocal_t *giver = selected ? Wow_EntityLocal(selected) : NULL;
+        cstring_t giver_name = NULL;
+        char command[64], desc[2048], obj[1024], text[3072];
+        float x = PX(0), y = PY(104);
+        bool is_complete = state && state->status == SV_QUEST_COMPLETE;
+        bool is_accepted = state && state->status == SV_QUEST_ACTIVE;
+
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-TopLeft.blp", x, y, PW(256), PH(256), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-TopRight.blp", x + PW(256), y, PW(128), PH(256), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-BotLeft.blp", x, y + PH(256), PW(256), PH(256), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-BotRight.blp", x + PW(256), y + PH(256), PW(128), PH(256), COLOR32_WHITE);
+
+        giver_name = UI_QuestGiverName(giver ? giver->quest_id : detail ? detail->quest_id : 0);
+        UI_WriteQuestPortrait(x, y, selected ? selected->s.model : 0);
+        UI_WriteQuestNpcName(x, y, giver_name ? giver_name : "Quest");
+        UI_WriteImage("Interface\\Buttons\\UI-Panel-MinimizeButton-Up.blp", x + PW(326), y + PH(14), PW(32), PH(32), COLOR32_WHITE);
+        UI_WriteClickRegion(x + PW(326), y + PH(14), PW(32), PH(32), "quest_close");
+        UI_WriteQuestTitle(x, y, detail ? detail->title : "Quest");
+
+        if (detail) {
+            int off = 0;
+            UI_FormatQuestText(&(wowQuestText_t){ ent, is_complete ? detail->reward_text : detail->description, desc, sizeof(desc) });
+            UI_FormatQuestText(&(wowQuestText_t){ ent, detail->objectives_text, obj, sizeof(obj) });
+            if (is_complete)
+                off = snprintf(text, sizeof(text), "%s\n\nRewards:\n%d XP  |  %u copper", desc, (int)detail->reward_xp, (unsigned)detail->reward_gold);
+            else {
+                off = snprintf(text, sizeof(text), "%s%s%s", desc, obj[0] ? "\n\n" : "", obj);
+                if (is_accepted && detail->kill_objective_count) {
+                    off += snprintf(text + off, sizeof(text) - off, "\n\nProgress:");
+                    FOR_LOOP(j, detail->kill_objective_count) {
+                        cstring_t name = Wow_CachedCreatureName(detail->kill_objectives[j].display_id);
+                        off += snprintf(text + off, sizeof(text) - off, "\n  %s: %u/%u", name ? name : "Creature", (unsigned)(state ? wc->kill_progress[slot][j] : 0), (unsigned)detail->kill_objectives[j].required_count);
+                    }
+                }
+            }
+        } else {
+            snprintf(text, sizeof(text), "Quest data not available.");
+        }
+        UI_WriteTextArea(x + PW(28), y + PH(116), PW(270), PH(286), text, MAKE(color32_t, 0, 0, 0, 255));
+        UI_WriteQuestScrollBar(x, y);
+
+        if (is_complete) {
+            snprintf(command, sizeof(command), "quest_complete %u", (unsigned)wc->quest_id);
+            UI_WriteSimpleButton(x + PW(23), y + PH(418), PW(120), PH(22), "Complete Quest", command);
+        } else if (!is_accepted) {
+            snprintf(command, sizeof(command), "quest_accept %u", (unsigned)wc->quest_id);
+            UI_WriteSimpleButton(x + PW(23), y + PH(418), PW(77), PH(22), "Accept", command);
+        }
+        UI_WriteSimpleButton(x + PW(267), y + PH(418), PW(78), PH(22), "Decline", "quest_close");
+    } else if (wc->questlog_open) {
+        float x = PX(24), y = PY(68);
+        float line_y = y + PH(48);
+        uint32_t line_count = 0;
+        char buf[128], cmd[64];
+
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-TopLeft.blp", x, y, PW(256), PH(128), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-TopRight.blp", x + PW(256), y, PW(128), PH(128), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-BotLeft.blp", x, y + PH(256), PW(256), PH(256), COLOR32_WHITE);
+        UI_WriteImage("Interface\\QuestFrame\\UI-QuestGreeting-BotRight.blp", x + PW(256), y + PH(256), PW(128), PH(256), COLOR32_WHITE);
+
+        UI_WriteTextFrame(x + PW(42), y + PH(12), PW(280), PH(22), "Quest Log", MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYCENTER);
+
+        if (!wc->quest_count) {
+            UI_WriteTextFrame(x + PW(42), line_y, PW(280), PH(22), "No active quests.", MAKE(color32_t, 160, 150, 140, 255), FONT_JUSTIFYCENTER);
+        } else FOR_LOOP(i, wc->quest_count) {
+            svQuestEntry_t *qs = &wc->quest_log[i];
+            wowQuestDetail_t const *detail = Wow_QuestDetail(qs->quest_id);
+            cstring_t status = qs->status == SV_QUEST_COMPLETE ? " (Complete)" : "";
+
+            snprintf(buf, sizeof(buf), "%s%s", detail ? detail->title : "Unknown Quest", status);
+            snprintf(cmd, sizeof(cmd), "quest %u", (unsigned)qs->quest_id);
+            UI_WriteSimpleButton(x + PW(28), line_y, PW(308), PH(22), buf, cmd);
+            line_y += PH(28);
+            if (++line_count >= 14) break;
+        }
+        UI_WriteSimpleButton(x + PW(250), y + PH(450), PW(90), PH(28), "Close", "quest_close");
+    }
+
+    UI_WriteEnd();
+}
+
+static void UI_WriteQuestLog(edict_t *ent) {
+    (void)ent; /* merged into UI_WriteQuestDialog */
+}
+
+/* Write an FT_TEXTURE frame with float-precision UV (supports l>r or t>b for flips). */
+static void UI_WriteImageUV(cstring_t path, float x, float y, float w, float h,
+                            float l, float r, float t, float b, color32_t color) {
+    uiFrame_t frame;
+    uiTextureUV_t uv;
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&uv, 0, sizeof(uv));
+    frame.flags.type = FT_TEXTURE;
+    frame.color = color;
+    frame.tex.index = gi.ImageIndex(path);
+    uv.l = l; uv.r = r; uv.t = t; uv.b = b;
+    uv.color = color;
+    uv.alphamode = BLEND_MODE_ALPHAKEY;
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, &uv, sizeof(uv));
+}
+
+static void UI_WriteImage(cstring_t path, float x, float y, float w, float h, color32_t color) {
+    UI_WriteImageUV(path, x, y, w, h, 0.0f, 1.0f, 0.0f, 1.0f, color);
+}
+
+/* Draw the server-owned unread message pool and its selected message panel. */
+void UI_WriteWowMessageQueue(edict_t *ent) {
+    wowClient_t *wc = ent ? (wowClient_t *)ent->client : NULL;
+    uiMessageQueue_t queue = {0};
+    char command[64];
+    uint32_t unread = 0;
+
+    if (!wc) return;
+    UI_WriteStart(LAYER_MESSAGE);
+    FOR_LOOP(i, wc->message_count) {
+        wowUiMessage_t const *message = &wc->messages[i];
+        if (!(message->flags & WOW_UI_MESSAGE_UNREAD) && message->message_id != wc->message_open_id) continue;
+        queue = (uiMessageQueue_t){
+            .message_id = message->message_id,
+            .image = gi.ImageIndex("Interface\\TutorialFrame\\TutorialFrameAlert"),
+            .title_font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 16),
+            .body_font = gi.FontIndex("Fonts\\FRIZQT__.TTF", 12),
+            .flags = (message->flags & WOW_UI_MESSAGE_UNREAD ? UI_MESSAGE_UNREAD : 0) |
+                     (message->message_id == wc->message_open_id ? UI_MESSAGE_OPEN : 0),
+        };
+        uiFrame_t frame = {0};
+        frame.flags.type = FT_MESSAGE_QUEUE;
+        frame.text = message->title;
+        frame.tooltip = message->body;
+        if (message->message_id == wc->message_open_id)
+            snprintf(command, sizeof(command), "message_close");
+        else
+            snprintf(command, sizeof(command), "message_open %u", (unsigned)message->message_id);
+        frame.onclick = command;
+        UI_SetFrameRect(&frame, message->message_id == wc->message_open_id ? PX(256) : PX(360) + PW(unread * 42),
+                        message->message_id == wc->message_open_id ? PY(192) : PY(680),
+                        message->message_id == wc->message_open_id ? PW(512) : PW(32),
+                        message->message_id == wc->message_open_id ? PH(169) : PH(32));
+        frame.buffer.data = &queue;
+        frame.buffer.size = sizeof(queue);
+        frame.color = COLOR32_WHITE;
+        frame.number = ui_next_frame_number++;
+        gi.Write(PF_UIFRAME, &frame);
+        if (message->flags & WOW_UI_MESSAGE_UNREAD) unread++;
+    }
+    UI_WriteEnd();
+    gi.unicast(ent);
+}
+
+/* Solid-color quad via a null texture slot */
+static void UI_WriteColorRect(float x, float y, float w, float h, color32_t color) {
+    uiFrame_t frame;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_TEXTURE;
+    frame.color = color;
+    frame.tex.index = 0;
+    frame.tex.coord[1] = 0xff;
+    frame.tex.coord[3] = 0xff;
+    UI_SetFrameRect(&frame, x, y, w, h);
+    UI_WriteProxyFrame(&frame, NULL, 0);
+}
+
+/* Author the initial loading screen; only the progress value remains client-owned. */
+void UI_WriteLoadingLayout(edict_t *ent) {
+    uiFrame_t frame = { 0 };
+    uiTextureUV_t uv = { .l = 0, .r = 1, .t = 0, .b = 1, .color = COLOR32_WHITE, .alphamode = BLEND_MODE_ALPHAKEY };
+
+    UI_WriteStart(LAYER_LOADING);
+    frame.flags.type = FT_TEXTURE; frame.color = COLOR32_WHITE; frame.tex.index = gi.ImageIndex(wow_loading_texture);
+    /* Layout sizes are normalized; pixel dimensions magnified the background into a solid corner. */
+    UI_SetFrameRect(&frame, 0, 0, 1, 1); UI_WriteProxyFrame(&frame, &uv, sizeof(uv));
+    UI_WriteTextFrame(PX(164), PY(590), PW(696), PH(42), wow_loading_title,
+                      MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYCENTER);
+    UI_WriteColorRect(PX(164), PY(650), PW(696), PH(12), MAKE(color32_t, 12, 10, 8, 220));
+    memset(&frame, 0, sizeof(frame));
+    frame.flags.type = FT_LOADING_BAR;
+    /* Classic archives provide Loading-BarFill; Loading-Bar.blp never resolved. */
+    frame.tex.index = gi.ImageIndex("Interface\\Glues\\LoadingBar\\Loading-BarFill.blp");
+    frame.color = MAKE(color32_t, 220, 180, 60, 255);
+    UI_SetFrameRect(&frame, PX(166), PY(652), PW(692), PH(8)); UI_WriteProxyFrame(&frame, NULL, 0);
+    UI_WriteEnd();
+    if (ent) gi.unicast(ent);
+}
+
+/* Solid health/mana bar drawn as two color rects (dark background + colored fill) */
+static void UI_WriteColorBar(float x, float y, float w, float h,
+                             float value, float maxvalue,
+                             color32_t fill_color) {
+    float p = maxvalue > 0.0f ? value / maxvalue : 0.0f;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    UI_WriteColorRect(x, y, w, h, MAKE(color32_t, 12, 10, 8, 220));
+    if (p > 0.0f)
+        UI_WriteColorRect(x + PW(2), y + PH(2), (w - PW(4)) * p, h - PH(4), fill_color);
+}
+
+/* Minimap.xml authors a 140px circle centered inside the cropped 192px border atlas. */
+static void UI_WriteMinimapFrames(void) {
+    uiFrame_t minimap;
+
+    memset(&minimap, 0, sizeof(minimap));
+    minimap.flags.type = FT_MINIMAP;
+    minimap.color = COLOR32_WHITE;
+    UI_SetFrameRect(&minimap, PX(867), PY(22), PW(140), PH(140));
+    UI_WriteProxyFrame(&minimap, NULL, 0);
+    /* MinimapBackdrop and the cluster's top strip use the exact Minimap.xml atlas crops. */
+    UI_WriteImageUV("Interface\\Minimap\\UI-Minimap-Border.blp", PX(832), PY(20), PW(192), PH(192),
+                    0.25f, 1.0f, 0.125f, 0.875f, COLOR32_WHITE);
+    UI_WriteImageUV("Interface\\Minimap\\UI-Minimap-Border.blp", PX(832), PY(0), PW(192), PH(32),
+                    0.25f, 1.0f, 0.0f, 0.125f, COLOR32_WHITE);
+}
+
+/* Main action bar: four 256×53 strips + two end-caps from UI-MainMenuBar-Dwarf.blp */
+static void UI_WriteActionBar(void) {
+    static cstring_t const bar = "Interface\\MainMenuBar\\UI-MainMenuBar-Dwarf.blp";
+    static cstring_t const cap = "Interface\\MainMenuBar\\UI-MainMenuBar-EndCap-Dwarf.blp";
+    /* Each strip covers a different vertical slice of the texture (v slices at 53/256 intervals) */
+    static float const strips[4][4] = {
+        /* {l, r, t, b}, screen x starts at 0 */
+        { 0.0f, 1.0f, 0.79296875f, 1.0f },
+        { 0.0f, 1.0f, 0.54296875f, 0.75f },
+        { 0.0f, 1.0f, 0.29296875f, 0.5f },
+        { 0.0f, 1.0f, 0.04296875f, 0.25f },
+    };
+
+    FOR_LOOP(i, 4)
+        UI_WriteImageUV(bar, PX((float)(i * 256)), PY(715), PW(256), PH(53), strips[i][0], strips[i][1], strips[i][2], strips[i][3], COLOR32_WHITE);
+
+    /* Left end-cap (normal orientation) */
+    UI_WriteImage(cap, PX(-96), PY(640), PW(128), PH(128), COLOR32_WHITE);
+    /* Right end-cap (horizontally flipped: l=1, r=0) */
+    UI_WriteImageUV(cap, PX(992), PY(640), PW(128), PH(128), 1.0f, 0.0f, 0.0f, 1.0f, COLOR32_WHITE);
+}
+
+/* Action button slot at grid position i (0..11 = left row, 12..15 = right empty slots) */
+static void UI_WriteActionButtonSlot(float x, float y, uint32_t image_index, uint32_t count) {
+    char count_buf[16];
+
+    /* Slot frame */
+    UI_WriteImage("Interface\\Buttons\\UI-Quickslot2.blp", x + PX(-14), y + PY(-13), PW(64), PH(64), COLOR32_WHITE);
+    /* Icon (may be 0 = empty slot, renderer draws nothing for index 0) */
+    if (image_index) {
+        uiFrame_t icon;
+        memset(&icon, 0, sizeof(icon));
+        icon.flags.type = FT_TEXTURE;
+        icon.color = COLOR32_WHITE;
+        icon.tex.index = image_index;
+        icon.tex.coord[1] = 0xff;
+        icon.tex.coord[3] = 0xff;
+        UI_SetFrameRect(&icon, x + PX(2), y + PY(2), PW(32), PH(32));
+        UI_WriteProxyFrame(&icon, NULL, 0);
+    }
+    /* The old Lua HUD drew stack counts in the corner of action buttons; keep
+     * the server-authored HUD visually identical by writing the same overlay. */
+    if (count > 1) {
+        snprintf(count_buf, sizeof(count_buf), "%u", (unsigned)count);
+        UI_WriteTextFrame(x + PX(2), y + PY(23), PW(32), PH(10), count_buf, COLOR32_WHITE, FONT_JUSTIFYRIGHT);
+    }
+}
+
+/* Targeting frame: the WoW character frame backdrop + health/mana bars + name/level text */
+static void UI_WriteTargetingFrame(edict_t *ent) {
+    player_t *ps = &ent->client->ps;
+    char name_buf[64], level_buf[32], health_buf[32], power_buf[32];
+    float health = ps->stats[WOW_STAT_HEALTH_MAX] ? (float)ps->stats[WOW_STAT_HEALTH] / ps->stats[WOW_STAT_HEALTH_MAX] : 0;
+    float power = ps->stats[WOW_STAT_POWER_MAX] ? (float)ps->stats[WOW_STAT_POWER] / ps->stats[WOW_STAT_POWER_MAX] : 0;
+
+    /* PlayerFrameTexture inherits the unmodified vertex color from PlayerFrame.xml. */
+    UI_WriteImageUV("Interface\\TargetingFrame\\UI-TargetingFrame.blp", PX(-19), PY(4), PW(232), PH(100),
+                    1.0f, 0.09375f, 0.0f, 0.78125f, COLOR32_WHITE);
+
+    /* Classic 1.12 unit-frame portraits are 2D per-race/sex textures, already oval-masked. */
+    {
+        char race[64], sex[64], path[256];
+        Wow_GetPlayerRaceSex(race, sizeof(race), sex, sizeof(sex));
+        snprintf(path, sizeof(path), "Interface\\CharacterFrame\\TemporaryPortrait-%s-%s.blp", sex, race);
+        UI_WriteImage(path, PX(23), PY(16), PW(64), PH(64), COLOR32_WHITE);
+    }
+
+    /* Dark name area */
+    UI_WriteColorRect(PX(87), PY(22), PW(119), PH(41), MAKE(color32_t, 0, 0, 0, 128));
+
+    /* Name */
+    snprintf(name_buf, sizeof(name_buf), "%s", ps->name && *ps->name ? ps->name : "Player");
+    UI_WriteTextFrame(PX(72), PY(18), PW(100), PH(12), name_buf, MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYCENTER);
+
+    /* Level */
+    snprintf(level_buf, sizeof(level_buf), "Lvl %d", (int)ps->stats[WOW_STAT_LEVEL]);
+    UI_WriteTextFrame(PX(24), PY(58), PW(42), PH(12), level_buf, MAKE(color32_t, 235, 225, 190, 255), FONT_JUSTIFYCENTER);
+
+    /* Health bar */
+    UI_WriteColorRect(PX(87), PY(41), PW(119), PH(12), MAKE(color32_t, 12, 10, 8, 220));
+    if (health > 0) UI_WriteImageUV("Interface\\TargetingFrame\\UI-StatusBar.blp", PX(87), PY(41), PW(119)*health,
+                                   PH(12), 0, health, 0, 1, MAKE(color32_t, 20, 178, 48, 255));
+
+    /* Mana/power bar */
+    UI_WriteColorRect(PX(87), PY(52), PW(119), PH(12), MAKE(color32_t, 12, 10, 8, 220));
+    if (power > 0) UI_WriteImageUV("Interface\\TargetingFrame\\UI-StatusBar.blp", PX(87), PY(52), PW(119)*power,
+                                  PH(12), 0, power, 0, 1, MAKE(color32_t, 26, 82, 210, 255));
+
+    /* TextStatusBarText is centered over each authored bar. */
+    snprintf(health_buf, sizeof(health_buf), "%u / %u", (unsigned)ps->stats[WOW_STAT_HEALTH],
+             (unsigned)ps->stats[WOW_STAT_HEALTH_MAX]);
+    snprintf(power_buf, sizeof(power_buf), "%u / %u", (unsigned)ps->stats[WOW_STAT_POWER],
+             (unsigned)ps->stats[WOW_STAT_POWER_MAX]);
+    UI_WriteTextFrame(PX(87), PY(41), PW(119), PH(12), health_buf, COLOR32_WHITE, FONT_JUSTIFYCENTER);
+    UI_WriteTextFrame(PX(87), PY(52), PW(119), PH(12), power_buf, COLOR32_WHITE, FONT_JUSTIFYCENTER);
+
+    /* PlayerFrame.lua hides PlayerRestIcon outside resting state; the server does not author that state yet. */
+}
+
+/* -------------------------------------------------------------------------
+ * Loot window — shows corpse loot snapshot, one row per item with click-to-take.
+ * Items are stored in client->loot_snap[] so the window is fully server-authored
+ * and requires no direct entity access in the layout pass.
+ * -------------------------------------------------------------------------*/
+static void UI_WriteLootWindow(edict_t *ent) {
+    wowClient_t *wc = (wowClient_t *)ent->client;
+    char buf[96];
+    uint32_t visible = 0;
+    float x, y, h;
+
+    if (!wc->loot_target) return;
+
+    /* Count visible slots to size the panel dynamically. */
+    FOR_LOOP(i, WOW_MAX_LOOT_ITEMS) if (wc->loot_snap[i].icon[0]) visible++;
+    if (!visible) { /* nothing left; auto-close */
+        wc->loot_target = 0;
+        return;
+    }
+
+    x = PX(300.0f); y = PY(160.0f);
+    h = PH(52.0f + (float)visible * 36.0f);
+
+    /* Dark parchment background + gold border */
+    UI_WriteColorRect(x, y, PW(380.0f), h, MAKE(color32_t, 20, 16, 10, 230));
+    UI_WriteColorRect(x, y, PW(380.0f), PH(1.0f), MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x, y + h, PW(380.0f), PH(1.0f), MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x, y, PW(1.0f), h, MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x + PW(379.0f), y, PW(1.0f), h, MAKE(color32_t, 170, 140, 60, 255));
+
+    /* Title bar */
+    UI_WriteColorRect(x, y, PW(380.0f), PH(22.0f), MAKE(color32_t, 50, 40, 20, 240));
+    UI_WriteTextFrame(x + PW(8), y + PH(5), PW(200), PH(14), "Loot",
+                      MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYLEFT);
+
+    /* Close button — top right corner */
+    UI_WriteSimpleButton(x + PW(320), y + PH(3), PW(56), PH(18), "Close", "loot_close");
+
+    /* Item rows */
+    uint32_t row = 0;
+    FOR_LOOP(i, WOW_MAX_LOOT_ITEMS) {
+        float row_y;
+        uint32_t icon_img;
+        char cmd[32];
+
+        if (!wc->loot_snap[i].icon[0]) continue;
+        row_y = y + PH(26.0f + (float)row * 36.0f);
+
+        /* Slot background */
+        UI_WriteColorRect(x + PW(8), row_y, PW(362.0f), PH(32.0f), MAKE(color32_t, 35, 28, 16, 200));
+
+        /* Item icon */
+        icon_img = gi.ImageIndex(wc->loot_snap[i].icon);
+        if (icon_img) {
+            uiFrame_t icon; memset(&icon, 0, sizeof(icon));
+            icon.flags.type = FT_TEXTURE;
+            icon.color = COLOR32_WHITE;
+            icon.tex.index = icon_img;
+            icon.tex.coord[1] = 0xff; icon.tex.coord[3] = 0xff;
+            UI_SetFrameRect(&icon, x + PW(12), row_y + PH(2), PW(28), PH(28));
+            UI_WriteProxyFrame(&icon, NULL, 0);
+        }
+
+        /* Item name + count */
+        if (wc->loot_snap[i].count > 1)
+            snprintf(buf, sizeof(buf), "%s x%u", wc->loot_snap[i].name, (unsigned)wc->loot_snap[i].count);
+        else
+            snprintf(buf, sizeof(buf), "%s", wc->loot_snap[i].name);
+        UI_WriteTextFrame(x + PW(48), row_y + PH(9), PW(280), PH(16), buf, COLOR32_WHITE, FONT_JUSTIFYLEFT);
+
+        /* Click region: "loot_take <slot>" */
+        snprintf(cmd, sizeof(cmd), "loot_take %u", (unsigned)i);
+        UI_WriteClickRegion(x + PW(8), row_y, PW(360.0f), PH(32.0f), cmd);
+        row++;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Backpack window — 4×4 grid showing all WOW_UI_INVENTORY_SLOTS item slots.
+ * Positioned in the upper-right, above the bag slot row.
+ * -------------------------------------------------------------------------*/
+static void UI_WriteBackpackWindow(edict_t *ent) {
+    wowClient_t *wc = (wowClient_t *)ent->client;
+    float x, y, w, h;
+
+    if (!wc->backpack_open) return;
+
+    x = PX(818.0f); y = PY(478.0f);
+    w = PW(190.0f); h = PH(230.0f);
+
+    /* Background + border */
+    UI_WriteColorRect(x, y, w, h, MAKE(color32_t, 20, 16, 10, 230));
+    UI_WriteColorRect(x, y, w, PH(1.0f), MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x, y + h, w, PH(1.0f), MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x, y, PW(1.0f), h, MAKE(color32_t, 170, 140, 60, 255));
+    UI_WriteColorRect(x + w, y, PW(1.0f), h, MAKE(color32_t, 170, 140, 60, 255));
+
+    /* Title bar */
+    UI_WriteColorRect(x, y, w, PH(22.0f), MAKE(color32_t, 50, 40, 20, 240));
+    UI_WriteTextFrame(x + PW(6), y + PH(5), PW(100), PH(14), "Backpack",
+                      MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYLEFT);
+    UI_WriteSimpleButton(x + w - PW(54), y + PH(3), PW(50), PH(18), "Close", "backpack");
+
+    /* 4×4 grid of item slots */
+    FOR_LOOP(i, WOW_UI_INVENTORY_SLOTS) {
+        float sx = x + PW(8.0f + (float)(i % 4) * 44.0f);
+        float sy = y + PH(26.0f + (float)(i / 4) * 44.0f);
+        uint32_t img = wc->inventory[i].icon[0] ? gi.ImageIndex(wc->inventory[i].icon) : 0;
+        UI_WriteActionButtonSlot(sx, sy, img, wc->inventory[i].count);
+    }
+}
+
+/* Show the welcome tutorial without taking control away from the player. */
+void UI_WriteWelcomeWindow(edict_t *ent) {
+    uiFrame_t frame = {0};
+    uiBackdrop_t backdrop = {0};
+
+    UI_WriteWindowStart(&(uiWindowDef_t){ .id = 1, .class_id = 1,
+        .flags = UI_WINDOW_UNIQUE });
+    frame.flags.type = FT_BACKDROP; frame.color = COLOR32_WHITE;
+    backdrop.Background = gi.ImageIndex("Interface\\DialogFrame\\UI-DialogBox-Background.blp");
+    backdrop.EdgeFile = gi.ImageIndex("Interface\\DialogFrame\\UI-DialogBox-Border.blp");
+    UI_SetFrameRect(&frame, PX(256), PY(192), PW(512), PH(384)); UI_WriteProxyFrame(&frame, &backdrop, sizeof(backdrop));
+    UI_WriteTextFrame(PX(288), PY(224), PW(448), PH(32), "Welcome to World of Warcraft!", COLOR32_WHITE, FONT_JUSTIFYCENTER);
+    UI_WriteTextArea(PX(288), PY(272), PW(448), PH(210),
+                     "Welcome, adventurer. Explore Azeroth, complete quests, and discover your destiny.",
+                     COLOR32_WHITE);
+    UI_WriteSimpleButton(PX(472), PY(512), PW(80), PH(28), "Okay", UI_WINDOW_CLOSE_ACTION);
+    UI_WriteWindowEnd(ent);
+}
+
+/* Build and unicast the WoW HUD layer for a player */
+void UI_WriteWowHud(edict_t *ent) {
+    player_t *ps;
+    wowClient_t *wc;
+    char copper_buf[64];
+
+    if (!ent || !ent->client)
+        return;
+    ps = &ent->client->ps;
+    wc = (wowClient_t *)ent->client;
+
+    UI_WriteStart(LAYER_CONSOLE);
+
+    /* Character/targeting frame (portrait area top-left) */
+    UI_WriteTargetingFrame(ent);
+
+    /* Damage flash overlays — brief text shown after hits.  Timers tick in Wow_UpdatePlayerHud. */
+    if (wc->outgoing_dmg_timer > 0) {
+        char dmg_buf[32];
+        snprintf(dmg_buf, sizeof(dmg_buf), "-%u", (unsigned)wc->outgoing_damage);
+        UI_WriteTextFrame(PX(180.0f), PY(72.0f), PW(80), PH(18), dmg_buf,
+                          MAKE(color32_t, 255, 255, 50, 255), FONT_JUSTIFYLEFT);
+    }
+    if (wc->incoming_dmg_timer > 0) {
+        char dmg_buf[32];
+        snprintf(dmg_buf, sizeof(dmg_buf), "-%u", (unsigned)wc->incoming_damage);
+        UI_WriteTextFrame(PX(130.0f), PY(60.0f), PW(80), PH(18), dmg_buf,
+                          MAKE(color32_t, 255, 60, 60, 255), FONT_JUSTIFYLEFT);
+    }
+
+    /* Main action bar + end-caps */
+    UI_WriteActionBar();
+
+    /* 12 action buttons, left row */
+    FOR_LOOP(i, 12) {
+        uint32_t img = wc->actions[i].icon[0] ? gi.ImageIndex(wc->actions[i].icon) : 0;
+        UI_WriteActionButtonSlot(PX(8.0f + (float)i * 42.0f), PY(728), img, wc->actions[i].count);
+    }
+
+    /* First 6 inventory slots shown in the quick-access bar; all 16 visible in backpack window. */
+    FOR_LOOP(i, 6) {
+        uint32_t img = wc->inventory[i].icon[0] ? gi.ImageIndex(wc->inventory[i].icon) : 0;
+        UI_WriteActionButtonSlot(PX(939.0f - (float)i * 42.0f), PY(728), img, wc->inventory[i].count);
+    }
+
+    /* Backpack button — image + click region to toggle the backpack window */
+    UI_WriteImage("Interface\\Buttons\\Button-Backpack-Up.blp", PX(981), PY(729), PW(37), PH(37), COLOR32_WHITE);
+    UI_WriteClickRegion(PX(981), PY(729), PW(37), PH(37), "backpack");
+
+    /* Minimap border + viewport */
+    UI_WriteMinimapFrames();
+
+    /* Quest log icon + label */
+    UI_WriteImage("Interface\\QuestFrame\\UI-QuestLog-BookIcon.blp", PX(840), PY(162), PW(32), PH(32), COLOR32_WHITE);
+    UI_WriteTextFrame(PX(876), PY(164), PW(110), PH(20), "Quests", MAKE(color32_t, 255, 215, 120, 255), FONT_JUSTIFYLEFT);
+    UI_WriteClickRegion(PX(834), PY(156), PW(72), PH(44), "quest");
+    UI_WriteClickRegion(PX(910), PY(156), PW(78), PH(44), "questlog");
+
+    /* Copper display */
+    snprintf(copper_buf, sizeof(copper_buf), "Copper %d", (int)ps->stats[WOW_STAT_COPPER]);
+    UI_WriteTextFrame(PX(816), PY(704), PW(150), PH(20), copper_buf, MAKE(color32_t, 255, 210, 100, 255), FONT_JUSTIFYRIGHT);
+
+    /* Cast bar — centered above action bar, shown during spell casts */
+    {
+        uint16_t progress = ps->stats[WOW_STAT_CAST_PROGRESS];
+        uint16_t max_val = ps->stats[WOW_STAT_CAST_MAX];
+        if (max_val > 0) {
+            char text[64];
+            snprintf(text, sizeof(text), "%.1f s", (float)progress / 1000.0f);
+            /* Background */
+            UI_WriteColorRect(PX(262), PY(690), PW(500), PH(28), MAKE(color32_t, 0, 0, 0, 192));
+            /* Fill bar: width * (1 - progress/max) since progress counts down */
+            {
+                float ratio = (float)(max_val - progress) / (float)max_val;
+                UI_WriteColorBar(PX(263), PY(691), PW(498), PH(26), ratio, 1.0f, MAKE(color32_t, 255, 200, 50, 255));
+            }
+            /* Border */
+            UI_WriteColorRect(PX(262), PY(690), PW(500), PH(1), COLOR32_WHITE);
+            UI_WriteColorRect(PX(262), PY(717), PW(500), PH(1), COLOR32_WHITE);
+            UI_WriteColorRect(PX(262), PY(691), PW(1), PH(27), COLOR32_WHITE);
+            UI_WriteColorRect(PX(761), PY(691), PW(1), PH(27), COLOR32_WHITE);
+            /* Time text */
+            UI_WriteTextFrame(PX(462), PY(695), PW(100), PH(20), text, COLOR32_WHITE, FONT_JUSTIFYCENTER);
+        }
+    }
+
+    /* Loot and backpack windows are HUD overlays on LAYER_CONSOLE.  They must be
+     * written before the console terminator: writing them after a layer's
+     * terminator (as previously done after UI_WriteQuestDialog) appends raw frame
+     * bytes the client parses as a new message id and discards. */
+    UI_WriteLootWindow(ent);
+    UI_WriteBackpackWindow(ent);
+    UI_WriteEnd();
+    UI_WriteWowMessageQueue(ent);
+    UI_WriteQuestDialog(ent);
+    UI_WriteQuestLog(ent);
+    gi.unicast(ent);
+}

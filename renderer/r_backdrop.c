@@ -1,0 +1,177 @@
+/*
+ * r_backdrop.c — Single-mesh backdrop renderer.
+ *
+ * Builds all 9-slice quads (background + up to 8 edge/corner pieces) into
+ * vertex arrays and draws them in at most 2 drawcalls (background texture,
+ * edge texture), replacing per-piece DrawImageEx calls in the client layout
+ * renderer and WoW XML UI.
+ */
+
+#include "r_local.h"
+#include "r_game.h"
+
+#define NUM_BACKDROP_CORNERS 8
+
+static void backdrop_rects(rect_t const *screen, rect_t *rects, float corner_size) {
+    float x[] = { 0, corner_size, screen->w - corner_size, screen->w };
+    float y[] = { 0, corner_size, screen->h - corner_size, screen->h };
+    FOR_LOOP(i, BACKDROP_SIZE) {
+        rects[i].x = screen->x + x[i % 3];
+        rects[i].y = screen->y + y[i / 3];
+        rects[i].w = x[(i % 3) + 1] - x[i % 3];
+        rects[i].h = y[(i / 3) + 1] - y[i / 3];
+    }
+}
+
+static float backdrop_edge_tile(rect_t const *rect, BACKDROPCORNER edge, float imagesize) {
+    switch (edge) {
+        case BACKDROP_LEFT_EDGE:
+        case BACKDROP_RIGHT_EDGE:
+            return imagesize > 0 ? ceilf(rect->h / imagesize) : 1;
+        case BACKDROP_TOP_EDGE:
+        case BACKDROP_BOTTOM_EDGE:
+            return imagesize > 0 ? ceilf(rect->w / imagesize) : 1;
+        default:
+            return 1;
+    }
+}
+
+static bool backdrop_edge_flip(BACKDROPCORNER edge) {
+    return edge == BACKDROP_TOP_EDGE || edge == BACKDROP_BOTTOM_EDGE;
+}
+
+static rect_t backdrop_edge_uv(BACKDROPCORNER c, float tile, int idx, bool wow) {
+    if (wow) {
+        switch (c) {
+            case BACKDROP_LEFT_EDGE:   return (rect_t){ 0.0f, 0.0f, 0.5f, tile };
+            case BACKDROP_RIGHT_EDGE:  return (rect_t){ 0.5f, 0.0f, 0.5f, tile };
+            case BACKDROP_TOP_EDGE:    return (rect_t){ 0.0f, 0.0f, tile, 0.5f };
+            case BACKDROP_BOTTOM_EDGE: return (rect_t){ 0.0f, 0.5f, tile, 0.5f };
+            case BACKDROP_TOP_LEFT_CORNER:     return (rect_t){ 0.0f, 0.0f, 0.5f, 0.5f };
+            case BACKDROP_TOP_RIGHT_CORNER:    return (rect_t){ 0.5f, 0.0f, 0.5f, 0.5f };
+            case BACKDROP_BOTTOM_LEFT_CORNER:  return (rect_t){ 0.0f, 0.5f, 0.5f, 0.5f };
+            case BACKDROP_BOTTOM_RIGHT_CORNER: return (rect_t){ 0.5f, 0.5f, 0.5f, 0.5f };
+            default: return (rect_t){ 0, 0, 1, 1 };
+        }
+    }
+    /* WC3: 8 equal horizontal strips */
+    float const k = 1.0f / NUM_BACKDROP_CORNERS;
+    return (rect_t){ idx * k, 0, k, tile };
+}
+
+void R_DrawBackdrop(drawBackdrop_t const *db) {
+    rect_t rects[BACKDROP_SIZE];
+    rect_t background;
+    vertex_t vertices[(1 + NUM_BACKDROP_CORNERS) * 6];
+    uint32_t num_vertices;
+    BACKDROPCORNER const corners[NUM_BACKDROP_CORNERS] = {
+        BACKDROP_LEFT_EDGE,
+        BACKDROP_RIGHT_EDGE,
+        BACKDROP_TOP_EDGE,
+        BACKDROP_BOTTOM_EDGE,
+        BACKDROP_TOP_LEFT_CORNER,
+        BACKDROP_TOP_RIGHT_CORNER,
+        BACKDROP_BOTTOM_LEFT_CORNER,
+        BACKDROP_BOTTOM_RIGHT_CORNER,
+    };
+    size2_t backSize, edgeSize;
+    bool const wow = (db->flags & DRAW_EDGE_2X2) != 0;
+
+    if (!db || (!db->bg.texture && !db->edge.texture)) {
+        return;
+    }
+
+    backdrop_rects(&db->screen, rects, db->corner.size);
+
+    /* --- background quad (possibly tiled) --- */
+    if (db->bg.texture) {
+        backSize = R_GetTextureSize(db->bg.texture);
+
+        background = db->screen;
+        background.x += db->insets.left;
+        background.y += db->insets.top;
+        background.w -= db->insets.left + db->insets.right;
+        background.h -= db->insets.top + db->insets.bottom;
+
+        rect_t bg_uv = { 0, 0, 1, 1 };
+        if ((db->flags & DRAW_TILE) && db->backgroundSize > 0) {
+            /* FDF tile spans include the insets; using raw texture pixels cropped inset button icons off-center. */
+            float size = db->backgroundSize - (db->insets.left + db->insets.right + db->insets.top + db->insets.bottom) * 0.5f;
+            if (size <= 0) {
+                fprintf(stderr, "R_DrawBackdrop: background size %g is consumed by insets\n", db->backgroundSize);
+                return;
+            }
+            bg_uv.w = background.w / size;
+            bg_uv.h = background.h / size;
+        } else if ((db->flags & DRAW_TILE) && backSize.width > 0 && backSize.height > 0) {
+            bg_uv.w = background.w / (backSize.width / 1000.f);
+            bg_uv.h = background.h / (backSize.height / 1000.f);
+        }
+
+        /* FDF mirroring is independent of tiling; untiled button art also uses it. */
+        if (db->flags & DRAW_MIRRORED) {
+            bg_uv.x = bg_uv.w;
+            bg_uv.w = -bg_uv.w;
+        }
+        num_vertices = 0;
+        R_AddQuad(vertices + num_vertices, &background, &bg_uv, db->bg.color, 0);
+        num_vertices += 6;
+
+        /* Opaque is opt-in (Q2 Draw_Pic keeps alpha); a translucent tint always blends. */
+        R_DrawImageBatchEx(&(drawImageBatchParams_t){
+            .texture = db->bg.texture,
+            .shader = SHADER_UI,
+            .alphamode = BLEND_MODE_BLEND,
+            .vertices = vertices,
+            .vertexCount = num_vertices,
+            .repeat = (db->flags & DRAW_TILE) && (fabsf(bg_uv.w) > 1 || bg_uv.h > 1),
+            .opaque = (db->flags & DRAW_BG_OPAQUE) && db->bg.color.a == 255,
+        });
+    }
+
+    /* --- edge/corner quads (batched into one drawcall) --- */
+    if (db->edge.texture) {
+        edgeSize = R_GetTextureSize(db->edge.texture);
+        bool edge_repeat = false;
+
+        num_vertices = 0;
+        FOR_LOOP(i, NUM_BACKDROP_CORNERS) {
+            BACKDROPCORNER const c = corners[i];
+            if ((db->corner.flags & (1 << c)) == 0)
+                continue;
+
+            float tile;
+            if (wow) {
+                /* WoW 2×2 quadrant: edges tile by their strip dimension */
+                float const half_h = edgeSize.height * 0.5f / 1000.f;
+                float const full_w = edgeSize.width / 1000.f;
+                if (c == BACKDROP_LEFT_EDGE || c == BACKDROP_RIGHT_EDGE)
+                    tile = half_h > 0 ? ceilf(rects[c].h / half_h) : 1;
+                else if (c == BACKDROP_TOP_EDGE || c == BACKDROP_BOTTOM_EDGE)
+                    tile = full_w > 0 ? ceilf(rects[c].w / full_w) : 1;
+                else
+                    tile = 1;
+            } else {
+                float const h = edgeSize.height / 1000.f;
+                tile = backdrop_edge_tile(rects + c, c, h);
+            }
+
+            rect_t const uv = backdrop_edge_uv(c, tile, i, wow);
+            bool const flip = !wow && backdrop_edge_flip(c);
+
+            if (tile > 1.0f) edge_repeat = true;
+            R_AddQuad(vertices + num_vertices, rects + c, &uv, db->edge.color, 0);
+            if (flip) {
+                vec2_t tmp = vertices[num_vertices + 1].texcoord;
+                vertices[num_vertices + 1].texcoord = vertices[num_vertices + 5].texcoord;
+                vertices[num_vertices + 5].texcoord = tmp;
+            }
+            num_vertices += 6;
+        }
+
+        if (num_vertices > 0) {
+            R_DrawImageBatch(db->edge.texture, SHADER_UI, BLEND_MODE_BLEND,
+                             0, 0, false, NULL, vertices, num_vertices, edge_repeat);
+        }
+    }
+}

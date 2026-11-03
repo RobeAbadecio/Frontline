@@ -1,0 +1,80 @@
+#ifndef r_emit_h
+#define r_emit_h
+
+#include "r_local.h"
+#include <math.h>
+#include <stdlib.h>
+
+#define R_EMIT_PARTICLE_BUDGET 256 // particles per emitter per render call; bounds CPU work for extreme authored rates
+
+/* Preserve sub-unit authored sizes in the shared compact particle curve. */
+static inline void R_EncodeParticleSize(cparticle_t *particle, float const values[3]) {
+    float peak = MAX(values[0], MAX(values[1], values[2]));
+    particle->size_value_scale = peak > 0 ? peak / 255.0f : 1.0f;
+    FOR_LOOP(i, 3) particle->size[i] = peak > 0 ? (uint8_t)MIN(255, MAX(0, values[i] / peak * 255.0f + 0.5f)) : 0;
+    particle->size_time_scale = 1.0f / MAX(particle->lifespan, 0.001f);
+}
+
+static vec3_t FX_GenerateRandomDirection(float latitude) {
+	float theta = (float)(((double)rand() / (double)RAND_MAX) * 2.0 * M_PI);
+	float phi = (float)(((double)rand() / (double)RAND_MAX) * latitude);
+	return (vec3_t){ sinf(phi) * cosf(theta), sinf(phi) * sinf(theta), cosf(phi) };
+}
+
+__attribute__((unused))
+static vec3_t FX_GenerateRandomOrigin(float length, float width) {
+	return (vec3_t){
+		(float)(((double)rand() / (double)RAND_MAX - 0.5) * length),
+		(float)(((double)rand() / (double)RAND_MAX - 0.5) * width),
+		0.0f,
+	};
+}
+
+/* Frame-relative accumulator emission. Each caller supplies a per-emitter accumulator that
+   survives across frames; rate * dt is added to it and particles are spawned whenever the
+   accumulator crosses 1.0. Clamp catch-up time after long stalls without lowering authored
+   high-rate emitters during ordinary frames. Pattern derived from WoWee's M2Renderer::emitParticles. */
+__attribute__((unused))
+static void R_EmitParticles(float rate, float *accum, uint32_t delta_ms,
+                            void (*spawn)(void *), void *ctx) {
+	uint32_t emitted = 0;
+	static bool warned_invalid, warned_budget;
+	double pending;
+	if (rate <= 0.0f || delta_ms == 0 || !accum || !spawn) return;
+	if (!isfinite(rate) || !isfinite(*accum) || *accum < 0.0f) {
+		if (!warned_invalid) fprintf(stderr, "Renderer: invalid particle emission rate/accumulator (%g, %g)\n", rate, *accum);
+		warned_invalid = true;
+		*accum = 0.0f;
+		return;
+	}
+	/* Finite authored floats can overflow rate * milliseconds in float arithmetic. */
+	pending = *accum + (double)rate * MIN(delta_ms, 100u) / 1000.0;
+	while (pending >= 1.0 && emitted < R_EMIT_PARTICLE_BUDGET) {
+		pending -= 1.0;
+		spawn(ctx);
+		emitted++;
+	}
+	if (pending >= 1.0) {
+		if (!warned_budget) fprintf(stderr, "Renderer: particle emission exceeded per-call budget (%u); dropping excess whole emissions\n",
+		        R_EMIT_PARTICLE_BUDGET);
+		warned_budget = true;
+		pending = fmod(pending, 1.0);
+	}
+	*accum = (float)pending;
+}
+
+/* File-mapped effects have no runtime accumulator; derive emissions from the shared render clock. */
+__attribute__((unused))
+static void R_EmitParticlesAtTime(float rate, uint32_t now_ms, uint32_t delta_ms,
+                                  void (*spawn)(void *), void *ctx) {
+	uint32_t last_ms, start_ms;
+	float interval_ms;
+	if (rate <= 0.0f || delta_ms == 0) return;
+	interval_ms = 1000.0f / rate;
+	last_ms = now_ms - delta_ms;
+	start_ms = last_ms - last_ms % 1000;
+	for (float t = (float)start_ms; t < (float)now_ms; t += interval_ms)
+		if (t >= (float)last_ms) spawn(ctx);
+}
+
+#endif

@@ -1,0 +1,442 @@
+/*
+ * scene.c - shared glue background/sprite-layer model cache.
+ */
+
+#include <stdlib.h>
+#include <math.h>
+
+#include "menu_local.h"
+#include "menu_glue_motion.h"
+#include "common/stb_slk.h"
+
+#define UI_GLUE_ANIM_NAME 96 // chars; fits Blizzard glue sequence names and suffixes; used as animation storage.
+#define UI_GLUE_BIRTH_TIME 1000 // ms; every named RoC/TFT panel Birth interval has this length.
+#define UI_GLUE_DEATH_TIME 667 // ms; every named RoC/TFT panel Death interval rounds to this length.
+
+#define BZ_GLUE_MAX_TABS 3 // tabs; largest authored group is custom-game browser/create/options.
+
+typedef struct { cstring_t stand, enter, leave; } glueTab_t;
+
+
+typedef struct { cstring_t name; glueTab_t tabs[BZ_GLUE_MAX_TABS]; } gluePanel_t;
+
+
+
+typedef enum {
+    UI_GLUE_PANEL_IDLE,
+    UI_GLUE_PANEL_EXIT,
+    UI_GLUE_PANEL_ENTER,
+} uiGluePanelPhase_t;
+
+typedef struct {
+    glueDest_t current, target;
+    uint32_t start;
+    uiGluePanelPhase_t phase;
+} glueLayer_t;
+
+
+
+typedef struct {
+    bool loaded;
+    bool has_render_time;
+    uint32_t last_render_time;
+    uiBirthSequence_t background_birth;
+    model_t const *background, *top_left_panel, *top_right_panel;
+    bool fog_enabled;
+    float fog_start, fog_end;
+    vec3_t fog_color;
+    glueLayer_t layers[UI_GLUE_SIDE_COUNT];
+    uiGluePanelChanged_f exited, changed;
+} glueScene_t;
+
+
+
+static glueScene_t scene;
+
+void UI_BirthSequenceReset(uiBirthSequence_t *sequence) {
+    *sequence = (uiBirthSequence_t){0};
+}
+
+void UI_BirthSequenceBegin(uiBirthSequence_t *sequence, refExport_t *renderer,
+                           model_t const *model, cstring_t label) {
+    UI_BirthSequenceReset(sequence);
+    if (UI_GlueSkipTransitions()) {
+        sequence->complete = true;
+        return;
+    }
+    sequence->started = true;
+    sequence->start = M_Time();
+    if (!renderer || !renderer->GetModelAnimationDuration || !model ||
+        !renderer->GetModelAnimationDuration(model, "Birth", &sequence->duration) ||
+        !sequence->duration) {
+        fprintf(stderr, "UI: %s has no valid Birth sequence duration; using stable pose\n",
+                label ? label : "menu model");
+        sequence->complete = true;
+    }
+}
+
+cstring_t UI_BirthSequenceAnimation(uiBirthSequence_t *sequence, string_t anim,
+                                    size_t anim_size, cstring_t stable) {
+    if (UI_GlueSkipTransitions()) sequence->complete = true;
+    if (!sequence->started || sequence->complete) return stable;
+    uint32_t const elapsed = M_Time() - sequence->start;
+    if (elapsed >= sequence->duration) {
+        sequence->complete = true;
+        return stable;
+    }
+    snprintf(anim, anim_size, "Birth@%.4f", (float)elapsed / (float)sequence->duration);
+    return anim;
+}
+
+bool UI_GlueSkipTransitions(void) {
+    cstring_t value = mi.Cvar_String ? mi.Cvar_String("ui_skip_transitions", "0") : "0";
+    return value && atoi(value) != 0;
+}
+
+/* Sequence families differ in the MDX: Create has Birth/Death, while morph-only
+ * tabs retain their authored final pose instead of inventing a Stand sequence. */
+static const gluePanel_t glue_panels[UI_GLUE_PANEL_COUNT] = {
+    [UI_GLUE_MAIN_MENU] = { .name = "MainMenu" },
+    [UI_GLUE_REALM_SELECTION] = { .name = "RealmSelection" },
+    [UI_GLUE_SINGLE_PLAYER] = { .name = "SinglePlayer", .tabs = {
+        [1] = { "SinglePlayerSkirmish Stand", "SinglePlayerSkirmish Morph", "SinglePlayerSkirmish Morph Alternate" },
+    } },
+    [UI_GLUE_OPTIONS] = { .name = "Options", .tabs = {
+        [1] = { "Options Stand Alternate", "Options Morph", "Options Morph Alternate" },
+    } },
+    [UI_GLUE_MULTIPLAYER_PRE_GAME_CHAT] = { .name = "MultiplayerPreGameChat", .tabs = {
+        [1] = { "MultiplayerSubmenu Morph@1.0000", "MultiplayerSubmenu Morph", "MultiplayerSubmenu Morph Alternate" },
+    } },
+    [UI_GLUE_BATTLENET_CUSTOM] = { .name = "BattlenetCustom", .tabs = {
+        [1] = { "BattlenetCustomCreate Stand", "BattlenetCustomCreate Birth", "BattlenetCustomCreate Death" },
+        [2] = { "BattlenetAdvancedOptions Morph@1.0000", "BattlenetAdvancedOptions Morph", "BattlenetAdvancedOptions Morph Alternate" },
+    } },
+};
+
+/* Content without a moving left mesh (logo/profile) follows the navigation's
+ * sampled travel. Each side intentionally moves as one rigid FDF partition. */
+static glueMotion_t const *const motion[UI_GLUE_PANEL_COUNT][UI_GLUE_SIDE_COUNT][BZ_GLUE_MAX_TABS] = {
+    [UI_GLUE_MAIN_MENU] = {{&motion_main}, {&motion_main}},
+    [UI_GLUE_REALM_SELECTION] = {{&motion_realm}, {&motion_main}},
+    [UI_GLUE_SINGLE_PLAYER] = {{&motion_main, &motion_main}, {&motion_main}},
+    [UI_GLUE_OPTIONS] = {{&motion_opts, &motion_tab}, {&motion_opts}},
+    [UI_GLUE_MULTIPLAYER_PRE_GAME_CHAT] = {{&motion_chat, &motion_chat}, {&motion_chatnav}},
+    [UI_GLUE_BATTLENET_CUSTOM] = {{&motion_lan, &motion_create, &motion_lan}, {&motion_lannav}},
+};
+
+static cstring_t const phases[] = { "Stand", "Death", "Birth" };
+static uint32_t const durations[] = { 0, UI_GLUE_DEATH_TIME, UI_GLUE_BIRTH_TIME };
+static void UI_GlueReleaseModel(model_t const *model) {
+    mi.GetRenderer()->ReleaseModel((model_t *)model);
+}
+
+static cstring_t UI_GlueBackgroundPath(void) {
+    cstring_t model = Theme_String("GlueSpriteLayerBackground", "Default");
+
+    if (!model || !*model || !strcmp(model, "GlueSpriteLayerBackground")) {
+        model = Theme_String("MainMenu", "Default");
+    }
+    if (!model || !*model || !strcmp(model, "MainMenu")) {
+        model = "UI\\Glues\\MainMenu\\MainMenu3d\\MainMenu3d.mdx";
+    }
+    return model;
+}
+
+static cstring_t UI_GlueTopLeftPanelPath(void) {
+    return Theme_String("GlueSpriteLayerTopLeft", "UI\\Glues\\SpriteLayers\\TopLeftPanel.mdx");
+}
+
+static cstring_t UI_GlueTopRightPanelPath(void) {
+    return Theme_String("GlueSpriteLayerTopRight", "UI\\Glues\\SpriteLayers\\TopRightPanel.mdx");
+}
+
+/* The stock sprite layers are an authored 4:3 pair: the left layer stays at the scene origin and the right
+ * layer follows whatever extra width the engine canvas resolved (zero under the classic stretched policy). */
+static float UI_GlueRightPanelOffset(refExport_t *renderer) {
+    return renderer->GetUISceneRect().w - UI_BASE_WIDTH;
+}
+
+/* Both clocks use the renderer's normalized sequence-time contract. */
+static void UI_GlueProgress(string_t anim, uint32_t start, uint32_t duration) {
+    size_t len = strlen(anim);
+    snprintf(anim + len, UI_GLUE_ANIM_NAME - len, "@%.4f", (float)MIN(M_Time() - start, duration) / duration);
+}
+
+/* A non-default left panel must enter/leave its authored pose. Options Birth
+ * animates only the base layout; using it before Stand Alternate caused a snap. */
+static cstring_t UI_GlueLayerAnimation(glueLayer_t const *layer, string_t anim) {
+    gluePanel_t const *panel = &glue_panels[layer->current.panel];
+    if (layer->current.tab) {
+        glueTab_t const *tab = &panel->tabs[layer->current.tab];
+        cstring_t names[] = { tab->stand, tab->leave, tab->enter };
+        snprintf(anim, UI_GLUE_ANIM_NAME, "%s", names[layer->phase]);
+    } else snprintf(anim, UI_GLUE_ANIM_NAME, "%s %s", panel->name, phases[layer->phase]);
+    if (layer->phase != UI_GLUE_PANEL_IDLE)
+        UI_GlueProgress(anim, layer->start, durations[layer->phase]);
+    return anim;
+}
+
+#ifdef WC3_DEBUG_GLUE
+/* Boundary diagnostics share the exact sequence resolver used for drawing. */
+static void UI_GlueDebugPhase(glueLayer_t const *layer) {
+    char anim[UI_GLUE_ANIM_NAME];
+    fprintf(stderr, "WC3 glue: side=%ld current=%u/%d/%d target=%u/%d/%d anim=\"%s\"\n",
+            layer - scene.layers, layer->current.panel, layer->current.tab, layer->current.page,
+            layer->target.panel, layer->target.tab, layer->target.page,
+            layer->current.panel ? UI_GlueLayerAnimation(layer, anim) : "none");
+}
+#else
+#define UI_GlueDebugPhase(LAYER) ((void)0)
+#endif
+
+void UI_ResetGlueTransitions(void) {
+    memset(scene.layers, 0, sizeof(scene.layers));
+    scene.exited = scene.changed = NULL;
+}
+
+void UI_ResetGlueSceneModels(void) {
+    refExport_t *renderer = mi.GetRenderer ? mi.GetRenderer() : NULL;
+    if (renderer && renderer->ReleaseEntityCameraEvents)
+        renderer->ReleaseEntityCameraEvents((uintptr_t)&scene);
+    memset(&scene, 0, sizeof(scene));
+}
+
+void UI_ReleaseGlueSceneModels(void) {
+    SAFE_DELETE(scene.background, UI_GlueReleaseModel);
+    SAFE_DELETE(scene.top_left_panel, UI_GlueReleaseModel);
+    SAFE_DELETE(scene.top_right_panel, UI_GlueReleaseModel);
+    UI_ResetGlueSceneModels();
+}
+
+/* Cache one load attempt per scene lifetime, but identify every missing sprite layer. */
+static model_t const *UI_GlueLoadModel(cstring_t path) {
+    model_t const *model = mi.GetRenderer()->LoadModel(path);
+    if (!model) fprintf(stderr, "UI: failed to load glue model '%s'\n", path);
+    return model;
+}
+
+/* TFT extends MenuZFog scalars to two cells and ARGB to two four-cell groups.
+ * Older archives keep singleton fields even when mounted as expansion data. */
+static bool UI_GlueFogValue(stbIniCache_t const *ini, cstring_t key,
+                            uint32_t index, uint32_t fallback, float *out) {
+    cstring_t text = Stb_IniCacheFind(ini, "MenuZFog", key);
+    FOR_LOOP(attempt, 2) {
+        cstring_t cursor = text;
+        uint32_t cell = attempt ? fallback : index;
+        FOR_LOOP(i, cell + 1) {
+            char *end;
+            if (!cursor) break;
+            float value = strtof(cursor, &end);
+            if (cursor == end || !isfinite(value)) break;
+            if (i == cell) { *out = value; return true; }
+            while (*end == ' ' || *end == '\t') end++;
+            cursor = *end == ',' ? end + 1 : NULL;
+        }
+        if (index == fallback) break;
+    }
+    return false;
+}
+
+static void UI_GlueLoadFog(void) {
+    stbIniCache_t ini = {0};
+    void *buffer = NULL;
+    if (!mi.FS_ReadFile || !mi.FS_FreeFile ||
+        mi.FS_ReadFile("UI\\MiscData.txt", &buffer) < 0 || !buffer) return;
+    Stb_IniCacheLoadBuffer(&ini, buffer);
+    mi.FS_FreeFile(buffer);
+    uint32_t edition = mi.Cvar_String && atoi(mi.Cvar_String("fs_expansion", "0")) != 0;
+    float style = -1, color[4];
+    bool valid = UI_GlueFogValue(&ini, "Style", edition, 0, &style) && style == 0 &&
+        UI_GlueFogValue(&ini, "Start", edition, 0, &scene.fog_start) &&
+        UI_GlueFogValue(&ini, "End", edition, 0, &scene.fog_end);
+    FOR_LOOP(i, 4)
+        valid = UI_GlueFogValue(&ini, "Color", edition * 4 + i, i, &color[i]) && valid;
+    scene.fog_enabled = valid && scene.fog_end > scene.fog_start;
+    if (!scene.fog_enabled && style != -1 && Stb_IniCacheFind(&ini, "MenuZFog", "Style"))
+        fprintf(stderr, "UI: unsupported or incomplete linear MenuZFog for edition %u\n", edition);
+    if (scene.fog_enabled)
+        scene.fog_color = (vec3_t){color[1] / 255.0f, color[2] / 255.0f, color[3] / 255.0f};
+    Stb_IniCacheFree(&ini);
+}
+
+void UI_PreloadGlueSceneModels(void) {
+    if (scene.loaded) return;
+    scene.background = UI_GlueLoadModel(UI_GlueBackgroundPath());
+    scene.top_left_panel = UI_GlueLoadModel(UI_GlueTopLeftPanelPath());
+    scene.top_right_panel = UI_GlueLoadModel(UI_GlueTopRightPanelPath());
+    UI_GlueLoadFog();
+    scene.loaded = true;
+}
+
+/* Page identity makes two content tabs sharing one MDX pose transition too. */
+static bool UI_GlueSameDest(glueDest_t a, glueDest_t b) {
+    return a.panel == b.panel && a.tab == b.tab && a.page == b.page;
+}
+
+bool UI_GlueSideReady(uiGlueSide_t side) {
+    glueLayer_t const *layer = &scene.layers[side];
+    return layer->phase == UI_GLUE_PANEL_IDLE && UI_GlueSameDest(layer->current, layer->target);
+}
+
+/* Sample the same phase clock as the MDX; retain overshoot and the native exit curve. */
+float UI_GlueSideOffset(uiGlueSide_t side) {
+    glueLayer_t const *layer = &scene.layers[side];
+    if (UI_GlueSkipTransitions()) return 0;
+    if (layer->phase == UI_GLUE_PANEL_IDLE || !layer->current.panel) return 0;
+    glueMotion_t const *track = motion[layer->current.panel][side][layer->current.tab];
+    float pos = (BZ_GLUE_SAMPLES - 1) * (float)MIN(M_Time() - layer->start, durations[layer->phase]) / durations[layer->phase];
+    int idx = MIN((int)pos, BZ_GLUE_SAMPLES - 2);
+    float const *curve = layer->phase == UI_GLUE_PANEL_ENTER ? track->enter : track->leave;
+    return curve[idx] + (curve[idx + 1] - curve[idx]) * (pos - idx);
+}
+
+bool UI_GlueIsTransitioning(void) {
+    return !UI_GlueSideReady(UI_GLUE_LEFT) || !UI_GlueSideReady(UI_GLUE_RIGHT);
+}
+
+/* Finish the running sequence before honoring a retarget. A tab leaves through
+ * its base pose; a different family leaves through the closed-panel state. */
+static void UI_GlueAdvanceLayer(glueLayer_t *layer) {
+    if (UI_GlueSkipTransitions()) {
+        layer->current = layer->target;
+        layer->phase = UI_GLUE_PANEL_IDLE;
+        layer->start = M_Time();
+        return;
+    }
+    if (layer->phase != UI_GLUE_PANEL_IDLE) {
+        if (M_Time() - layer->start < durations[layer->phase]) return;
+        if (layer->phase == UI_GLUE_PANEL_EXIT) {
+            if (layer->current.tab && layer->current.panel == layer->target.panel)
+                layer->current = (glueDest_t){ .panel = layer->current.panel };
+            else layer->current = (glueDest_t){0};
+        }
+        layer->phase = UI_GLUE_PANEL_IDLE;
+    }
+    if (!UI_GlueSameDest(layer->current, layer->target)) {
+        if (layer->current.panel && (layer->current.panel != layer->target.panel || layer->current.tab))
+            layer->phase = UI_GLUE_PANEL_EXIT;
+        else {
+            layer->current = layer->target;
+            layer->phase = layer->current.panel ? UI_GLUE_PANEL_ENTER : UI_GLUE_PANEL_IDLE;
+        }
+        layer->start = M_Time();
+    }
+    UI_GlueDebugPhase(layer);
+}
+
+/* Clear callback ownership before dispatch: screen installation may queue work.
+ * Both sides must reach the destination before any of its controls are installed. */
+static void UI_GlueAdvanceTransition(void) {
+    bool arrived = true;
+    FOR_LOOP(i, UI_GLUE_SIDE_COUNT) {
+        glueLayer_t *layer = &scene.layers[i];
+        if (!UI_GlueSideReady(i)) UI_GlueAdvanceLayer(layer);
+        if (layer->phase == UI_GLUE_PANEL_EXIT || !UI_GlueSameDest(layer->current, layer->target)) arrived = false;
+    }
+    if (arrived && scene.exited) {
+        uiGluePanelChanged_f exited = scene.exited;
+        scene.exited = NULL;
+        exited();
+    }
+    if (!UI_GlueIsTransitioning() && scene.changed) {
+        uiGluePanelChanged_f changed = scene.changed;
+        scene.changed = NULL;
+        changed();
+    }
+}
+
+/* SetEntityAnimFrame runs before RenderFrame installs this scene's time. Pass an
+ * explicit sequence phase so a prior map view clock cannot freeze the menu. */
+static cstring_t UI_GlueBackgroundStand(refExport_t *renderer, string_t anim, size_t anim_size) {
+    uint32_t duration;
+
+    if (!renderer->GetModelAnimationDuration ||
+        !renderer->GetModelAnimationDuration(scene.background, "Stand", &duration) || !duration)
+        return "Stand";
+    snprintf(anim, anim_size, "Stand@%.4f", (float)(M_Time() % duration) / (float)duration);
+    return anim;
+}
+
+/* The selected background's authored Birth settles into its stable Stand pose. */
+static cstring_t UI_GlueBackgroundAnimation(refExport_t *renderer, string_t anim, size_t anim_size) {
+    if (!scene.background_birth.started && !scene.background_birth.complete)
+        UI_BirthSequenceBegin(&scene.background_birth, renderer, scene.background,
+                              UI_GlueBackgroundPath());
+    return UI_BirthSequenceAnimation(&scene.background_birth, anim, anim_size,
+                                     UI_GlueBackgroundStand(renderer, anim, anim_size));
+}
+
+/* Left content and right navigation own separate clocks, targets, and readiness.
+ * Only startup overrides can replace an unfinished Birth without first leaving. */
+void UI_GotoGluePanel(glueDest_t dest, uiGluePanelChanged_f exited, uiGluePanelChanged_f changed) {
+    if (dest.panel < UI_GLUE_NONE || dest.panel >= UI_GLUE_PANEL_COUNT || dest.tab < 0 ||
+        dest.tab >= BZ_GLUE_MAX_TABS || (dest.tab && !glue_panels[dest.panel].tabs[dest.tab].stand)) {
+        fprintf(stderr, "UI: invalid glue destination %u/%d\n", (unsigned)dest.panel, dest.tab);
+        return;
+    }
+    if (dest.panel) UI_PreloadGlueSceneModels();
+    bool startup = dest.panel && scene.layers[UI_GLUE_RIGHT].phase == UI_GLUE_PANEL_ENTER &&
+        dest.panel != scene.layers[UI_GLUE_RIGHT].current.panel;
+    scene.exited = exited;
+    scene.changed = changed;
+    FOR_LOOP(i, UI_GLUE_SIDE_COUNT) {
+        glueLayer_t *layer = &scene.layers[i];
+        layer->target = i == UI_GLUE_LEFT ? dest : (glueDest_t){ .panel = dest.panel };
+        if (startup) {
+            layer->current = layer->target;
+            layer->phase = UI_GLUE_PANEL_ENTER;
+            layer->start = M_Time();
+            UI_GlueDebugPhase(layer);
+        }
+    }
+    UI_GlueAdvanceTransition();
+}
+
+void UI_CloseGluePanel(uiGluePanelChanged_f changed) { UI_GotoGluePanel((glueDest_t){0}, NULL, changed); }
+
+void UI_DrawGlueScene(void) {
+    refExport_t *renderer = mi.GetRenderer();
+    float right_offset;
+    uint32_t scene_time, delta_time;
+    char left_anim[UI_GLUE_ANIM_NAME];
+    char right_anim[UI_GLUE_ANIM_NAME];
+
+    UI_GlueAdvanceTransition();
+    if (!scene.layers[UI_GLUE_LEFT].current.panel && !scene.layers[UI_GLUE_RIGHT].current.panel) return;
+    UI_PreloadGlueSceneModels();
+    right_offset = UI_GlueRightPanelOffset(renderer);
+    scene_time = M_Time();
+    delta_time = scene.has_render_time && scene_time >= scene.last_render_time
+        ? scene_time - scene.last_render_time : 0;
+    scene.last_render_time = scene_time;
+    scene.has_render_time = true;
+
+    if (scene.background) {
+        renderEntity_t entity = {
+            .model = scene.background, .scale = 1.0f,
+            .number = MAX_GAME_ENTITIES - 2,
+            .instance_id = (uintptr_t)&scene,
+            .flags = RF_NO_SHADOW | RF_NO_FOGOFWAR | RF_PORTRAIT_LIGHTING,
+        };
+        char background_anim[UI_GLUE_ANIM_NAME];
+        renderer->SetEntityAnimFrame(scene.background,
+                                     UI_GlueBackgroundAnimation(renderer, background_anim,
+                                                                sizeof(background_anim)),
+                                     &entity);
+
+        viewDef_t viewdef = {
+            .viewport = {0, 0, 1, 1}, .num_entities = 1, .entities = &entity,
+            .time = scene_time, .deltaTime = delta_time,
+            .fogEnable = scene.fog_enabled, .fogStart = scene.fog_start,
+            .fogEnd = scene.fog_end, .fogColor = scene.fog_color,
+            .rdflags = RDF_NOWORLDMODEL | RDF_NOFRUSTUMCULL |
+                RDF_USE_ENTITY_CAMERA | RDF_ISOLATED_PARTICLES,
+        };
+        renderer->RenderFrame(&viewdef);
+    }
+
+    if (scene.top_left_panel && scene.layers[UI_GLUE_LEFT].current.panel)
+        renderer->DrawSprite(&MAKE(drawSprite_t, .model = scene.top_left_panel, .anim = UI_GlueLayerAnimation(&scene.layers[UI_GLUE_LEFT], left_anim), .y = UI_BASE_HEIGHT, .id = &scene.layers[UI_GLUE_LEFT]));
+    if (scene.top_right_panel && scene.layers[UI_GLUE_RIGHT].current.panel)
+        renderer->DrawSprite(&MAKE(drawSprite_t, .model = scene.top_right_panel, .anim = UI_GlueLayerAnimation(&scene.layers[UI_GLUE_RIGHT], right_anim), .x = right_offset, .y = UI_BASE_HEIGHT, .id = &scene.layers[UI_GLUE_RIGHT]));
+}

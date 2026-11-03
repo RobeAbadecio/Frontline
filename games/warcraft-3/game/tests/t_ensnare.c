@@ -1,0 +1,356 @@
+#ifdef BZ_TESTS
+#include "test.h"
+#include "../skills/s_skills.h"
+
+#define BZ_AENS MAKEFOURCC('A', 'e', 'n', 's') // rawcode; stock Raider Ensnare
+#define BZ_ANEN MAKEFOURCC('A', 'N', 'e', 'n') // rawcode; TFT Naga Ensnare alias
+#define BZ_BENS MAKEFOURCC('B', 'e', 'n', 's') // rawcode; abstract / ROC Ensnare buff
+#define BZ_BENA MAKEFOURCC('B', 'e', 'n', 'a') // rawcode; TFT EnsnareAir buff
+#define BZ_BENG MAKEFOURCC('B', 'e', 'n', 'g') // rawcode; TFT EnsnareGround buff
+
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void reset_entities(void);
+void setup_test_world(void);
+slkTestData_t *parse_slk_string(char const *text);
+void free_slk_rows(slkTestData_t *rows);
+
+/* Non-stock Dur/Cost so tests cannot pass on hardcoded retail 12/0.
+ * Instant-land fixtures omit DataA/B so missing cells stay 0 (snap path). */
+#define ENS_SLK \
+    "ID;PWXL;N;EBB;Y2;X10\n" \
+    "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n" \
+    "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n" \
+    "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n" \
+    "C;Y1;X10;K\"BuffID1\"\n" \
+    "C;Y2;X1;K\"Aens\"\nC;Y2;X2;K\"Aens\"\nC;Y2;X3;K\"1\"\n" \
+    "C;Y2;X4;K\"ground,air,enemy,neutral\"\nC;Y2;X5;K\"17\"\nC;Y2;X6;K\"0\"\n" \
+    "C;Y2;X7;K\"500\"\nC;Y2;X8;K\"7\"\nC;Y2;X9;K\"3\"\n" \
+    "C;Y2;X10;K\"Bena,Beng\"\nE\n"
+
+#define ENS_BENS_SLK \
+    "ID;PWXL;N;EBB;Y2;X10\n" \
+    "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n" \
+    "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n" \
+    "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n" \
+    "C;Y1;X10;K\"BuffID1\"\n" \
+    "C;Y2;X1;K\"Aens\"\nC;Y2;X2;K\"Aens\"\nC;Y2;X3;K\"1\"\n" \
+    "C;Y2;X4;K\"ground,air,enemy,neutral\"\nC;Y2;X5;K\"17\"\nC;Y2;X6;K\"0\"\n" \
+    "C;Y2;X7;K\"500\"\nC;Y2;X8;K\"7\"\nC;Y2;X9;K\"3\"\n" \
+    "C;Y2;X10;K\"Bens\"\nE\n"
+
+/* Non-stock DataA=2s / DataB=160 / DataC=90 so gradual land cannot pass on 0.6/200/128. */
+#define ENS_GRADUAL_SLK \
+    "ID;PWXL;N;EBB;Y2;X13\n" \
+    "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n" \
+    "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\n" \
+    "C;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\nC;Y1;X9;K\"HeroDur1\"\n" \
+    "C;Y1;X10;K\"BuffID1\"\nC;Y1;X11;K\"DataA1\"\nC;Y1;X12;K\"DataB1\"\n" \
+    "C;Y1;X13;K\"DataC1\"\n" \
+    "C;Y2;X1;K\"Aens\"\nC;Y2;X2;K\"Aens\"\nC;Y2;X3;K\"1\"\n" \
+    "C;Y2;X4;K\"ground,air,enemy,neutral\"\nC;Y2;X5;K\"17\"\nC;Y2;X6;K\"0\"\n" \
+    "C;Y2;X7;K\"500\"\nC;Y2;X8;K\"7\"\nC;Y2;X9;K\"3\"\n" \
+    "C;Y2;X10;K\"Bena,Beng\"\nC;Y2;X11;K\"2\"\nC;Y2;X12;K\"160\"\n" \
+    "C;Y2;X13;K\"90\"\nE\n"
+
+typedef struct {
+    slkTestData_t *rows, *old;
+    edict_t *caster, *ground, *flyer;
+    UnitData_t flyer_data;
+} ensFix_t;
+
+/* Fill the caller's ENSFIX. Edicts point at fix->flyer_data; a returned copy would dangle. */
+static void ens_setup(ensFix_t *fix, cstring_t slk) {
+    reset_entities(); setup_test_world(); level.time = 1000;
+    ((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+    ((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+    memset(level.alliances, 0, sizeof(level.alliances));
+    fix->rows = parse_slk_string(slk); fix->old = G_SetSLKRows("AbilityData", fix->rows);
+    fix->caster = alloc_test_unit(MAKEFOURCC('o','r','a','i'), 0, 0);
+    fix->ground = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 96, 0);
+    fix->flyer = alloc_test_unit(MAKEFOURCC('h','g','r','y'), 160, 0);
+    fix->caster->s.player = 0; fix->ground->s.player = fix->flyer->s.player = 1;
+    fix->caster->svflags |= SVF_MONSTER; fix->ground->svflags |= SVF_MONSTER; fix->flyer->svflags |= SVF_MONSTER;
+    fix->caster->targtype = fix->ground->targtype = TARG_GROUND;
+    fix->flyer->targtype = TARG_AIR;
+    fix->caster->unit_state->ranks[0] = MAKE(heroability_t, .code = BZ_AENS, .level = 1);
+    fix->caster->mana.value = fix->caster->mana.max_value = 100;
+    fix->ground->health.value = fix->ground->health.max_value = 500;
+    fix->flyer->health.value = fix->flyer->health.max_value = 500;
+    memset(&fix->flyer_data, 0, sizeof(fix->flyer_data));
+    fix->flyer_data.moveTypeName = "fly";
+    fix->flyer_data.moveHeight = 180.0f;
+    fix->flyer->data.UnitData = &fix->flyer_data;
+    fix->flyer->aiflags |= AI_FLYING;
+    fix->flyer->unitinfo.FlyHeight = 180.0f;
+    fix->flyer->s.origin.z = 180.0f;
+    fix->ground->stand = unit_stand; unit_stand(fix->ground);
+    fix->flyer->stand = unit_stand; unit_stand(fix->flyer);
+}
+
+static void ens_done(ensFix_t fix) { G_SetSLKRows("AbilityData", fix.old); free_slk_rows(fix.rows); }
+
+TEST(wc3_spell, ensnare_aliases_share_procedure) {
+    T_EQ(S_AbilityItem(BZ_AENS).ability->proc, CAbilityEnsnare);
+    T_EQ(S_AbilityItem(BZ_ANEN).ability->proc, CAbilityEnsnare);
+}
+
+/* Ground Bens keeps the order_move early-return lock used with BEer. */
+TEST(wc3_spell, ensnare_ground_bens_blocks_move) {
+    ensFix_t fix; ens_setup(&fix, ENS_BENS_SLK);
+    edict_t *wp;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.ground));
+    T_EQ(G_UnitStatusLevel(fix.ground, BZ_BENS), 1);
+    {
+        heroabilitystatus_t *slot = unit_findstatus(fix.ground, BZ_BENS);
+        T_NOT_NULL(slot);
+        T_ASSERT(slot->buff_flags & WC3_STATUS_BUFF_PHYSICAL);
+        T_ASSERT(!(slot->buff_flags & WC3_STATUS_BUFF_MAGICAL));
+        T_ASSERT(!unit_status_can_magic_dispel(slot));
+    }
+    T_ASSERT(S_UnitIsEnsnared(fix.ground));
+    T_ASSERT(!(fix.ground->aiflags & AI_FLYING));
+    T_FEQ(fix.ground->unitinfo.FlyHeight, 0, 0.001f);
+
+    wp = Waypoint_add(&(vec2_t){200, 0});
+    fix.ground->goalentity = NULL;
+    order_move(fix.ground, wp);
+    T_ASSERT(fix.ground->goalentity != wp);
+    ens_done(fix);
+}
+
+/* Flying targets take Bena, lose AI_FLYING, and land on the support surface. */
+TEST(wc3_spell, ensnare_flyer_lands_and_locks) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+    edict_t *wp;
+
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    T_EQ(G_UnitStatusLevel(fix.flyer, BZ_BENA), 1);
+    T_EQ(G_UnitStatusLevel(fix.flyer, BZ_BENG), 0);
+    T_ASSERT(S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+    T_ASSERT(fix.flyer->s.origin.z < 179.0f);
+
+    wp = Waypoint_add(&(vec2_t){240, 0});
+    fix.flyer->goalentity = NULL;
+    order_move(fix.flyer, wp);
+    T_ASSERT(fix.flyer->goalentity != wp);
+    ens_done(fix);
+}
+
+/* Ground TFT targets take Beng and are never given AI_FLYING. */
+TEST(wc3_spell, ensnare_ground_gets_beng_not_flying) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.ground));
+    T_EQ(G_UnitStatusLevel(fix.ground, BZ_BENG), 1);
+    T_EQ(G_UnitStatusLevel(fix.ground, BZ_BENA), 0);
+    T_ASSERT(!(fix.ground->aiflags & AI_FLYING));
+    T_FEQ(fix.ground->unitinfo.FlyHeight, 0, 0.001f);
+    ens_done(fix);
+}
+
+/* Expiry restores authored flyer flags and moveHeight through status refresh. */
+TEST(wc3_spell, ensnare_expiry_restores_flyer) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+    edict_t *wp;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+
+    level.time += 7000; unit_updatestatuses(fix.flyer);
+    T_ASSERT(!S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+
+    wp = Waypoint_add(&(vec2_t){280, 0});
+    order_move(fix.flyer, wp);
+    T_ASSERT(fix.flyer->goalentity == wp);
+    ens_done(fix);
+}
+
+/* ROC empty BuffID still applies Bens; recast refreshes the same lock. */
+TEST(wc3_spell, ensnare_roc_empty_buffid_and_recast) {
+    const char slk[] =
+        "ID;PWXL;N;EBB;Y2;X8\n"
+        "C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\n"
+        "C;Y1;X4;K\"targs\"\nC;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Rng1\"\n"
+        "C;Y1;X7;K\"Dur1\"\nC;Y1;X8;K\"HeroDur1\"\n"
+        "C;Y2;X1;K\"Aens\"\nC;Y2;X2;K\"Aens\"\nC;Y2;X3;K\"1\"\n"
+        "C;Y2;X4;K\"ground,air,enemy,neutral\"\nC;Y2;X5;K\"17\"\nC;Y2;X6;K\"500\"\n"
+        "C;Y2;X7;K\"7\"\nC;Y2;X8;K\"3\"\nE\n";
+    ensFix_t fix; ens_setup(&fix, slk);
+    edict_t *wp;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.ground));
+    T_EQ(G_UnitStatusLevel(fix.ground, BZ_BENS), 1);
+    fix.caster->mana.value = 100;
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.ground));
+    T_EQ(G_UnitStatusLevel(fix.ground, BZ_BENS), 1);
+    wp = Waypoint_add(&(vec2_t){300, 0});
+    order_move(fix.ground, wp);
+    T_ASSERT(fix.ground->goalentity != wp);
+    ens_done(fix);
+}
+
+/* DataA/B lower FlyHeight over time; AI_FLYING clears immediately; DataC sets melee range. */
+TEST(wc3_spell, ensnare_flyer_gradual_land_uses_dataa_datab) {
+    ensFix_t fix; ens_setup(&fix, ENS_GRADUAL_SLK);
+    float mid;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    T_ASSERT(S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 160, 0.001f); /* DataB start; not snapped to 0 */
+    T_FEQ(S_EnsnareMeleeRange(fix.flyer), 90, 0.001f);
+
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    mid = fix.flyer->unitinfo.FlyHeight;
+    T_ASSERT(mid > 1.0f && mid < 159.0f);
+
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+    ens_done(fix);
+}
+
+/* After gradual land, expiry rises over DataA instead of snapping moveHeight. */
+TEST(wc3_spell, ensnare_gradual_restore_after_expiry) {
+    ensFix_t fix; ens_setup(&fix, ENS_GRADUAL_SLK);
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    level.time += 2000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+
+    level.time += 5000; unit_updatestatuses(fix.flyer);
+    T_ASSERT(!S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f); /* rise just started */
+
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_ASSERT(fix.flyer->unitinfo.FlyHeight > 1.0f && fix.flyer->unitinfo.FlyHeight < 179.0f);
+
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+    ens_done(fix);
+}
+
+/* Dispel mid-land goes through the same expirstatus funnel: rise starts and
+ * flight restores instead of snapping. */
+TEST(wc3_spell, ensnare_dispel_mid_land_starts_rise) {
+    ensFix_t fix; ens_setup(&fix, ENS_GRADUAL_SLK);
+    heroabilitystatus_t *slot = NULL;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_ASSERT(fix.flyer->unitinfo.FlyHeight > 1.0f && fix.flyer->unitinfo.FlyHeight < 159.0f);
+    FOR_LOOP(i, MAX_UNIT_STATUSES)
+        if (fix.flyer->unit_state->statuses[i].level && S_StatusIsEnsnare(fix.flyer->unit_state->statuses[i].code))
+            slot = fix.flyer->unit_state->statuses + i;
+    T_NOT_NULL(slot);
+    unit_expirestatus(fix.flyer, slot); /* what Dispel Magic and Purge call per slot */
+    unit_refreshstatusflags(fix.flyer);
+    T_ASSERT(!S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_ASSERT(fix.flyer->unitinfo.FlyHeight > 1.0f && fix.flyer->unitinfo.FlyHeight < 179.0f);
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+    ens_done(fix);
+}
+
+/* A second remaining bind keeps the lock when the first expires. */
+TEST(wc3_spell, ensnare_second_bind_keeps_lock_after_first_expires) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+    heroabilitystatus_t *slot = NULL;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    unit_addtimedstatus(fix.flyer, "Beng", 1, 20);
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    FOR_LOOP(i, MAX_UNIT_STATUSES)
+        if (fix.flyer->unit_state->statuses[i].level && fix.flyer->unit_state->statuses[i].code == BZ_BENA)
+            slot = fix.flyer->unit_state->statuses + i;
+    T_NOT_NULL(slot);
+    unit_expirestatus(fix.flyer, slot);
+    unit_refreshstatusflags(fix.flyer);
+    T_ASSERT(S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    T_ASSERT(!S_UnitCanTranslate(fix.flyer));
+    ens_done(fix);
+}
+
+/* Expiry restores ordinary attack and movement orders, not just status slots. */
+TEST(wc3_spell, ensnare_expiry_restores_attack_and_move_orders) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+    edict_t *wp, *victim;
+
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    level.time += 7000; unit_updatestatuses(fix.flyer);
+    T_ASSERT(!S_UnitIsEnsnared(fix.flyer));
+    wp = Waypoint_add(&(vec2_t){280, 0});
+    fix.flyer->goalentity = NULL;
+    order_move(fix.flyer, wp);
+    T_ASSERT(fix.flyer->goalentity == wp);
+    victim = alloc_test_unit(MAKEFOURCC('h','f','o','o'), 300, 0);
+    victim->s.player = 0; victim->svflags |= SVF_MONSTER; victim->targtype = TARG_GROUND;
+    victim->health.value = victim->health.max_value = 500;
+    fix.flyer->unit_state->attack1.type = ATK_PIERCE; fix.flyer->unit_state->attack1.range = 300.0f;
+    fix.flyer->unit_state->attack1.targetsAllowed = WC3_TARGET_FLAG_GROUND;
+    order_attack(fix.flyer, victim);
+    T_ASSERT(fix.flyer->goalentity == victim);
+    ens_done(fix);
+}
+
+/* An unrelated status expiring on a flyer never touches flight state. */
+TEST(wc3_spell, ensnare_unrelated_flight_state_untouched) {
+    ensFix_t fix; ens_setup(&fix, ENS_SLK);
+
+    level.time = 1000;
+    unit_addtimedstatus(fix.flyer, "Bstu", 1, 0.05f);
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    level.time += 1000; unit_updatestatuses(fix.flyer);
+    unit_refreshstatusflags(fix.flyer);
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+    T_FEQ(fix.flyer->s.origin.z, 180, 0.001f);
+    ens_done(fix);
+}
+
+/* Save/load mid-land resumes the descent after load. */
+TEST(wc3_save, ensnare_land_round_trips) {
+    cstring_t filename = Test_TempPath("ensnare-land.bin");
+    ensFix_t fix; ens_setup(&fix, ENS_GRADUAL_SLK);
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_ASSERT(fix.flyer->unitinfo.FlyHeight > 1.0f && fix.flyer->unitinfo.FlyHeight < 159.0f);
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(!(fix.flyer->aiflags & AI_FLYING));
+    level.time += 1000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 0, 0.001f);
+    remove(filename);
+    ens_done(fix);
+}
+
+/* Save/load mid-rise resumes the ascent after load. */
+TEST(wc3_save, ensnare_rise_round_trips) {
+    cstring_t filename = Test_TempPath("ensnare-rise.bin");
+    ensFix_t fix; ens_setup(&fix, ENS_GRADUAL_SLK);
+    T_ASSERT(S_CastUnitTargetSpell(fix.caster, BZ_AENS, fix.flyer));
+    level.time += 2000; S_RunAbilityUpdates(fix.flyer);
+    level.time += 5000; unit_updatestatuses(fix.flyer);
+    T_ASSERT(!S_UnitIsEnsnared(fix.flyer));
+    T_ASSERT(WriteGame(filename));
+    T_ASSERT(ReadGame(filename));
+    T_ASSERT(fix.flyer->aiflags & AI_FLYING);
+    level.time += 2000; S_RunAbilityUpdates(fix.flyer);
+    T_FEQ(fix.flyer->unitinfo.FlyHeight, 180, 0.001f);
+    remove(filename);
+    ens_done(fix);
+}
+
+#endif

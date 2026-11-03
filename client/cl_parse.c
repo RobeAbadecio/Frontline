@@ -1,0 +1,1618 @@
+/*
+ * cl_parse.c — Parse server-to-client messages.
+ *
+ * CL_ParseServerMessage() is the main dispatch loop: it reads each message
+ * type byte and calls the appropriate handler.  The supported message types
+ * are defined in src/common/common.h (svc_* constants).
+ *
+ * Entity state arrives as delta-compressed packets (svc_packetentities) that
+ * are applied on top of the previous frame's state.  Player state, UI layout,
+ * config strings and temporary effects each have their own message types.
+ */
+#include <limits.h>
+#include <stdlib.h>
+#include <zlib.h>
+
+#include "client.h"
+#include "sound/s_local.h"
+#include "ui_layout.h"
+
+/* Keep predicted camera targets inside the loaded map. Scripted WC3 camera
+ * rectangles stay server-side; the client does not get a per-player copy. */
+vec2_t CL_ClampCameraPosition(vec2_t position) {
+    box2_t bounds = CM_GetWorldBounds();
+    if (bounds.max.x > bounds.min.x)
+        position.x = MAX(bounds.min.x, MIN(bounds.max.x, position.x));
+    if (bounds.max.y > bounds.min.y)
+        position.y = MAX(bounds.min.y, MIN(bounds.max.y, position.y));
+    return position;
+}
+
+static cstring_t CL_LobbySlotTypeName(lobbySlotType_t type) {
+    switch (type) {
+        case LOBBY_SLOT_OPEN: return "open";
+        case LOBBY_SLOT_HUMAN: return "human";
+        case LOBBY_SLOT_COMPUTER: return "computer";
+        case LOBBY_SLOT_CLOSED: return "closed";
+    }
+    return "unknown";
+}
+
+static cstring_t CL_PlayerRaceName(playerRace_t race) {
+    switch (race) {
+        case kPlayerRaceNone: return "none";
+        case kPlayerRaceHuman: return "human";
+        case kPlayerRaceOrc: return "orc";
+        case kPlayerRaceUndead: return "undead";
+        case kPlayerRaceNightElf: return "nightelf";
+    }
+    return "unknown";
+}
+
+/* Apply a stream of delta-encoded entity updates.  For each entity the server
+ * sends only the fields that changed since the previous frame.  A U_REMOVE
+ * flag signals that an entity should be removed from the local table. */
+void CL_AddActiveEntity(uint32_t index) {
+    if (index >= MAX_CLIENT_ENTITIES || !cl.ents[index].current.model) {
+        return;
+    }
+    FOR_LOOP(i, cl.num_active) {
+        if (cl.active_entities[i] == index) {
+            return;
+        }
+    }
+    cl.active_entities[cl.num_active++] = index;
+}
+
+void CL_RemoveActiveEntity(uint32_t index) {
+    FOR_LOOP(i, cl.num_active) {
+        if (cl.active_entities[i] == index) {
+            cl.active_entities[i] = cl.active_entities[--cl.num_active];
+            return;
+        }
+    }
+}
+
+/* SV_BuildClientFrame sends an entity while it has a model, a looping sound or an event. */
+static bool CL_InSnapshot(entityState_t const *state) { return state->model || state->sound || state->event; }
+
+/* List an entity in modelless_entities exactly while the snapshot carries it without a model. */
+static void CL_ListModelless(uint32_t index) {
+    bool const member = !cl.ents[index].current.model && CL_InSnapshot(&cl.ents[index].current);
+    FOR_LOOP(i, cl.num_modelless) {
+        if (cl.modelless_entities[i] != index) continue;
+        if (!member) cl.modelless_entities[i] = cl.modelless_entities[--cl.num_modelless];
+        return;
+    }
+    if (member) cl.modelless_entities[cl.num_modelless++] = index;
+}
+
+/* Forget one entity entirely, exactly as a U_REMOVE does. */
+static void CL_ClearEntity(uint32_t nument) {
+    centity_t *ent = &cl.ents[nument];
+    /* Clear membership unconditionally: the current model may already be
+     * zero (a prior delta replaced it with a sound/event), so gating on
+     * old.model leaves a stale active-list entry behind. */
+    CL_RemoveActiveEntity(nument);
+    ent->presentation_generation++;
+    if (!ent->presentation_generation) ent->presentation_generation++;
+    memset(&ent->current, 0, sizeof(ent->current));
+    memset(&ent->prev, 0, sizeof(ent->prev));
+    ent->tint = COLOR32_WHITE;
+    ent->tint_valid = false;
+    CL_ListModelless(nument);
+}
+
+/* Snapshots the client has applied, so a delta against an older acknowledged frame can be rebuilt after packet loss
+ * (Q2 cl.frames[]). Only lossy transports need it; the lossless ones always delta against the previous frame. */
+typedef struct {
+    bool valid;
+    int serverframe;
+    uint32_t count;
+    entityState_t *entities;
+    player_t playerstate;
+} frameHistory_t;
+static frameHistory_t cl_frame_history[UPDATE_BACKUP];
+static uint32_t cl_frame_history_next; /* oldest slot, replaced first: frames arrive in increasing order */
+static bool cl_frame_discard;          /* the frame being parsed deltas against a frame not held: read past it */
+static bool cl_nodelta_requested;      /* "nodelta" sent; cleared once a full frame arrives */
+
+static frameHistory_t *CL_FindFrameHistory(int serverframe) {
+    FOR_LOOP(i, UPDATE_BACKUP) {
+        if (cl_frame_history[i].valid && cl_frame_history[i].serverframe == serverframe) return &cl_frame_history[i];
+    }
+    return NULL;
+}
+
+void CL_ResetFrameHistory(void) {
+    FOR_LOOP(i, UPDATE_BACKUP) {
+        free(cl_frame_history[i].entities);
+        cl_frame_history[i] = (frameHistory_t){ 0 };
+    }
+    cl_frame_history_next = 0;
+    cl_frame_discard = cl_nodelta_requested = false;
+    cl.frame.valid = false;
+}
+
+/* Keep every entity the snapshot carried. Saving only the model ones (active_entities) lost sound/event-only
+ * entities, so the next delta against a rebuilt frame decoded them from their spawn baselines. */
+static void CL_SaveFrameHistory(void) {
+    frameHistory_t *slot = &cl_frame_history[cl_frame_history_next++ % UPDATE_BACKUP];
+    uint32_t const count = cl.num_active + cl.num_modelless;
+    entityState_t *states = realloc(slot->entities, MAX(1u, count) * sizeof(*states));
+    if (!states) { slot->valid = false; return; }
+    slot->entities = states;
+    slot->count = count;
+    FOR_LOOP(i, count) {
+        uint32_t const number = i < cl.num_active ? cl.active_entities[i] : cl.modelless_entities[i - cl.num_active];
+        states[i] = cl.ents[number].current;
+        states[i].number = number; // the table index is the identity; do not trust the decoded copy
+    }
+    slot->playerstate = cl.playerstate;
+    slot->serverframe = cl.frame.serverframe;
+    slot->valid = true;
+}
+
+/* Put the entity table and player state back to what they were after frame `base`, the frame the next delta is
+ * against. base == -1 is a full snapshot: start from nothing. Returns false if that frame is no longer held. */
+static bool CL_RestoreDeltaBase(int base) {
+    uint32_t const ui_state = cl.playerstate.client_ui_state; /* the one player-state field the client owns */
+    frameHistory_t const *slot = base == -1 ? NULL : CL_FindFrameHistory(base);
+    if (base != -1 && !slot) return false;
+    while (cl.num_active) CL_ClearEntity(cl.active_entities[cl.num_active - 1]);
+    while (cl.num_modelless) CL_ClearEntity(cl.modelless_entities[cl.num_modelless - 1]);
+    if (!slot) {
+        memset(&cl.playerstate, 0, sizeof(cl.playerstate));
+    } else {
+        cl.playerstate = slot->playerstate;
+        FOR_LOOP(i, slot->count) {
+            entityState_t const *state = &slot->entities[i];
+            centity_t *ent = &cl.ents[state->number % MAX_CLIENT_ENTITIES];
+            ent->current = ent->prev = *state;
+            ent->serverframe = base;
+            ent->presentation_generation++;
+            if (!ent->presentation_generation) ent->presentation_generation++;
+            CL_AddActiveEntity(state->number % MAX_CLIENT_ENTITIES);
+            CL_ListModelless(state->number % MAX_CLIENT_ENTITIES);
+        }
+    }
+    cl.playerstate.client_ui_state = ui_state;
+    return true;
+}
+
+static void CL_ReadPacketEntities(sizeBuf_t *msg) {
+    int count = 0;
+    int previous = 0;
+    int debug_entities = Cvar_Integer("cl_debug_entities", 0);
+    int added = 0;
+    int removed = 0;
+    int changed = 0;
+
+    while (true) {
+        uint32_t bits = 0;
+        if (msg->readcount + sizeof(uint32_t) + sizeof(uint16_t) > msg->cursize) {
+            break;
+        }
+        int nument = MSG_ReadEntityBits(msg, &bits);
+        if (nument == 0 && bits == 0)
+            break;
+        if (nument < 0 || nument >= MAX_CLIENT_ENTITIES) {
+            fprintf(stderr,
+                    "CL_ReadPacketEntities: bad entity %d bits=0x%x count=%d previous=%d read=%u size=%u frame=%d\n",
+                    nument,
+                    (unsigned)bits,
+                    count,
+                    previous,
+                    (unsigned)msg->readcount,
+                    (unsigned)msg->cursize,
+                    cl.frame.serverframe);
+            msg->readcount = msg->cursize;
+            break;
+        }
+        previous = nument;
+        count++;
+        centity_t *ent = &cl.ents[nument];
+        entityState_t old = ent->current;
+        if (cl_frame_discard) { /* consume the update without applying it */
+            if (!(bits & (1u << U_REMOVE))) MSG_ReadDeltaEntity(msg, &old, nument, bits);
+            continue;
+        }
+        if (bits & (1u << U_REMOVE)) {
+            if (debug_entities && old.model) {
+                fprintf(stderr,
+                        "CL entity remove frame=%d ent=%d model=%u class=%u origin=(%.1f %.1f %.1f)\n",
+                        cl.frame.serverframe,
+                        nument,
+                        (unsigned)old.model,
+                        (unsigned)old.class_id,
+                        old.origin.x,
+                        old.origin.y,
+                        old.origin.z);
+            }
+            CL_ClearEntity(nument);
+            removed++;
+            continue;
+        }
+        /* An entity new to the snapshot is encoded against its baseline, one already in it against its previous state.
+         * Testing the model alone sent sound/event-only entities back to their baseline on every delta. */
+        if (!CL_InSnapshot(&old)) {
+            ent->current = ent->baseline;
+        }
+        ent->prev = ent->current;
+        MSG_ReadDeltaEntity(msg, &ent->current, nument, bits);
+        /* Keep the active list in sync with current.model on both transitions:
+         * a model-less entity may gain a model (add) or lose it to a sound/event
+         * (remove) without a U_REMOVE. */
+        if (!old.model && ent->current.model) {
+            ent->presentation_generation++;
+            if (!ent->presentation_generation) ent->presentation_generation++;
+            CL_AddActiveEntity(nument);
+        } else if (old.model && !ent->current.model) {
+            CL_RemoveActiveEntity(nument);
+        }
+        CL_ListModelless(nument);
+        if (ent->current.event)
+            CL_EntityEvent(&ent->current);
+        if (debug_entities) {
+            if (!old.model && ent->current.model) {
+                fprintf(stderr,
+                        "CL entity add frame=%d ent=%d model=%u class=%u origin=(%.1f %.1f %.1f) radius=%.1f\n",
+                        cl.frame.serverframe,
+                        nument,
+                        (unsigned)ent->current.model,
+                        (unsigned)ent->current.class_id,
+                        ent->current.origin.x,
+                        ent->current.origin.y,
+                        ent->current.origin.z,
+                        ent->current.radius);
+                added++;
+            } else if (old.model && ent->current.model &&
+                       (old.model != ent->current.model ||
+                        old.class_id != ent->current.class_id)) {
+                fprintf(stderr,
+                        "CL entity change frame=%d ent=%d model=%u->%u class=%u->%u\n",
+                        cl.frame.serverframe,
+                        nument,
+                        (unsigned)old.model,
+                        (unsigned)ent->current.model,
+                        (unsigned)old.class_id,
+                        (unsigned)ent->current.class_id);
+                changed++;
+            }
+        }
+        if (ent->serverframe != cl.frame.serverframe - 1) {
+            ent->prev = ent->current;
+        }
+        ent->serverframe = cl.frame.serverframe;
+    }
+    cl.num_entities = MAX_CLIENT_ENTITIES;
+    if (cl_frame_discard) {
+        cl_frame_discard = false;
+        return;
+    }
+    if (cl.frame.oldclientframe == -1) cl_nodelta_requested = false;
+    if (cls.netchan.remote_address.type == NA_IP) CL_SaveFrameHistory();
+    if (debug_entities > 1 && (added || removed || changed)) {
+        fprintf(stderr,
+                "CL entity summary frame=%d packet=%d add=%d remove=%d change=%d\n",
+                cl.frame.serverframe,
+                count,
+                added,
+                removed,
+                changed);
+    }
+}
+
+static void CL_ParseConfigString(sizeBuf_t *msg) {
+    static PATHSTR last_world;
+    PATHSTR olds;
+    int const index = MSG_ReadShort(msg);
+    if (index < 0 || index >= MAX_CONFIGSTRINGS) {
+        Com_Error(ERR_DROP, "configstring %d > MAX_CONFIGSTRINGS", index);
+        return;
+    }
+    olds[0] = '\0';
+    if (index == CS_STATUSBAR) {
+        if (!MSG_Read(msg, cl.configstrings[index], sizeof(*cl.configstrings))) {
+            Com_Error(ERR_DROP, "Truncated binary configstring %d", index);
+            return;
+        }
+    } else {
+        snprintf(olds, sizeof(olds), "%s", cl.configstrings[index]);
+        MSG_ReadString(msg, cl.configstrings[index]);
+    }
+    if (index >= CS_GENERAL && index < CS_GENERAL + CS_MAX_NAMES / ENT_NAMES_PER_CS)
+        entity_name_pool_decode(cl.configstrings[index]);
+    if (cl.refresh_prepped)
+        CL_UpdateConfigString(index, olds);
+    if (index == CS_MINIMAP && cl.refresh_prepped && strcmp(olds, cl.configstrings[index]))
+        CL_UpdateMinimapModel();
+    if (index == CS_WORLD && cl.configstrings[index][0] &&
+        strcmp(last_world, cl.configstrings[index])) {
+        strlcpy(last_world, cl.configstrings[index], sizeof(last_world));
+        CL_BeginLoadingMap(cl.configstrings[index]);
+    }
+}
+
+static void CL_ParseBaseline(sizeBuf_t *msg) {
+    uint32_t bits = 0;
+    uint32_t index = MSG_ReadEntityBits(msg, &bits);
+    if (index >= MAX_CLIENT_ENTITIES) {
+        fprintf(stderr, "CL_ParseBaseline: bad entity %u\n", (unsigned)index);
+        msg->readcount = msg->cursize;
+        return;
+    }
+    centity_t *cent = &cl.ents[index];
+    memset(&cent->baseline, 0, sizeof(entityState_t));
+    /* Zero is not a valid default model scale.  A dynamic replacement can
+     * delta against an empty baseline, so seed omitted scale fields at 1. */
+    cent->baseline.scale = 1.0f;
+    MSG_ReadDeltaEntity(msg, &cent->baseline, index, bits);
+    memcpy(&cent->current, &cent->baseline, sizeof(entityState_t));
+    memcpy(&cent->prev, &cent->baseline, sizeof(entityState_t));
+    if (cent->current.model) {
+        CL_AddActiveEntity(index);
+    }
+    CL_ListModelless(index);
+}
+
+static bool CL_EnsureTerrainMaskSize(uint32_t width, uint32_t height, vec2_t origin, float cell_size) {
+    uint32_t cells;
+
+    if (!width || !height || !cell_size || height > UINT_MAX / width) return false;
+    if (cl.terrain_mask.width == width && cl.terrain_mask.height == height &&
+        cl.terrain_mask.origin.x == origin.x && cl.terrain_mask.origin.y == origin.y &&
+        cl.terrain_mask.cell_size == cell_size && cl.terrain_mask.cells)
+        return true;
+    cells = width * height;
+    SAFE_DELETE(cl.terrain_mask.cells, MemFree);
+    cl.terrain_mask.cells = MemAlloc(cells);
+    if (!cl.terrain_mask.cells) {
+        cl.terrain_mask.width = cl.terrain_mask.height = 0;
+        fprintf(stderr, "CL_ParseFrame: failed to allocate %u-cell terrain mask\n", (unsigned)cells);
+        return false;
+    }
+    memset(cl.terrain_mask.cells, 0, cells);
+    cl.terrain_mask.width = width; cl.terrain_mask.height = height;
+    cl.terrain_mask.origin = origin; cl.terrain_mask.cell_size = cell_size;
+    cl.terrain_mask.generation++;
+    return true;
+}
+
+typedef struct { uint32_t first_row, width; bool *changed; } maskUnpackCtx_t;
+
+static void CL_MaskUnpackRun(uint32_t index, uint8_t value, uint32_t count, void *ctx) {
+    maskUnpackCtx_t *c = ctx;
+    uint8_t *dst = cl.terrain_mask.cells + c->first_row * c->width + index;
+    FOR_LOOP(i, count) if (dst[i] != value) { dst[i] = value; *c->changed = true; }
+}
+
+static bool CL_ParseTerrainMaskChunk(sizeBuf_t *msg) {
+    terrainMaskChunk_t chunk;
+    uint8_t const *payload;
+    uint32_t row_cells, decoded;
+    bool changed = false;
+    maskUnpackCtx_t ctx;
+
+    if (msg->cursize - msg->readcount < sizeof(chunk)) return false;
+    MSG_Read(msg, &chunk, sizeof(chunk));
+    row_cells = (uint32_t)chunk.width * chunk.row_count;
+    if (!chunk.width || !chunk.height || !chunk.row_count ||
+        chunk.first_row >= chunk.height || chunk.row_count > chunk.height - chunk.first_row ||
+        chunk.cell_size <= 0.0f || chunk.payload_bytes > msg->cursize - msg->readcount) {
+        fprintf(stderr, "CL_ParseFrame: invalid terrain-mask chunk %ux%u first=%u rows=%u payload=%u\n",
+            (unsigned)chunk.width, (unsigned)chunk.height, (unsigned)chunk.first_row,
+            (unsigned)chunk.row_count, (unsigned)chunk.payload_bytes);
+        return false;
+    }
+    payload = msg->data + msg->readcount;
+    /* Validate before touching client state: a good header with a bad payload must not resize the mask.
+     * RLE payload size no longer implies row_cells, so the header alone sizes the allocation. */
+    if ((uint32_t)chunk.width * chunk.height > TERRAIN_MASK_MAX_CELLS ||
+        !MSG_ValidateRLE(payload, chunk.payload_bytes, row_cells)) {
+        fprintf(stderr, "CL_ParseFrame: invalid terrain-mask RLE %ux%u first=%u rows=%u payload=%u\n",
+            (unsigned)chunk.width, (unsigned)chunk.height, (unsigned)chunk.first_row,
+            (unsigned)chunk.row_count, (unsigned)chunk.payload_bytes);
+        return false;
+    }
+    if (!CL_EnsureTerrainMaskSize(chunk.width, chunk.height,
+            (vec2_t){ chunk.min_x, chunk.min_y }, chunk.cell_size)) return false;
+    ctx = (maskUnpackCtx_t){ chunk.first_row, cl.terrain_mask.width, &changed };
+    decoded = MSG_DecodeRLE(payload, chunk.payload_bytes, row_cells, CL_MaskUnpackRun, &ctx);
+    assert(decoded == row_cells); /* validated above, so the decode cannot fail */
+    msg->readcount += chunk.payload_bytes;
+    if (changed) cl.terrain_mask.generation++;
+    return true;
+}
+
+/* Handle the svc_frame header and its game-owned datagram, then snapshot entity
+ * states into "prev" so the renderer can interpolate the current scene. */
+void CL_ParseFrame(sizeBuf_t *msg) {
+    int const previous_frame = cl.frame.serverframe;
+    bool const had_frame = cl.frame.valid;
+    cl.frame.serverframe = MSG_ReadLong(msg);
+    cl.frame.servertime = MSG_ReadLong(msg);
+    cl.frame.oldclientframe = MSG_ReadLong(msg);
+    cl.frame.valid = true;
+    cl.time = cl.frame.servertime;
+    cl_frame_discard = false;
+    /* The server deltas against the newest frame it saw acknowledged. If packets were lost that is older than the last
+     * frame applied here, so rebuild that frame's state first. A first frame or a full snapshot (-1) starts empty. */
+    if ((cl.frame.oldclientframe == -1 ? had_frame : (!had_frame || cl.frame.oldclientframe != previous_frame)) &&
+        !CL_RestoreDeltaBase(cl.frame.oldclientframe)) {
+        fprintf(stderr, "CL_ParseFrame: delta base frame %d is not held (last applied %d)\n", cl.frame.oldclientframe, previous_frame);
+        /* Lossless transports keep no history; their base is always the frame just applied. Over UDP the frame is
+         * undecodable (Q2 marks it invalid and asks for -1). Applying it onto the current state, as this used to,
+         * built a corrupt frame that was kept as a base and acknowledged. Read past its player state and entities
+         * instead, stay on the last good frame, and ask once, reliably, for a full one. */
+        if (Netchan_IsSequenced(&cls.netchan)) {
+            cl.frame.serverframe = previous_frame;
+            cl.frame.valid = had_frame;
+            cl_frame_discard = true;
+            if (!cl_nodelta_requested) {
+                MSG_WriteByte(Netchan_Reliable(&cls.netchan), clc_stringcmd);
+                MSG_WriteString(Netchan_Reliable(&cls.netchan), "nodelta");
+                cl_nodelta_requested = true;
+            }
+        }
+    }
+    
+    if (cls.state != ca_active && cl.refresh_prepped) {
+        cls.state = ca_active;
+        /* Our client becomes active on its first snapshot, after begin; forwarding is safe here. */
+        Cbuf_InsertFromDefer();
+        cl.playerstate.client_ui_state = CLIENT_UI_GAME;
+        SCR_EndLoadingPlaque();
+        SAFE_DELETE(cl.layout[LAYER_LOADING], MemFree);
+        SCR_ClearLayoutLayer(LAYER_LOADING);
+        CL_SetGameplayInput();
+    }
+    
+    FOR_LOOP(i, cl.num_active) {
+        centity_t *ce = &cl.ents[cl.active_entities[i]];
+        ce->prev = ce->current;
+    }
+    uint32_t header = (uint16_t)MSG_ReadShort(msg);
+    bool const has_entity_tints = (header & BZ_GAME_DATAGRAM_ENTITY_TINTS) != 0;
+    bool const has_terrain_mask = (header & BZ_GAME_DATAGRAM_TERRAIN_MASK) != 0;
+    bool const has_lightning = (header & BZ_GAME_DATAGRAM_LIGHTNING) != 0;
+    uint32_t count = header & BZ_GAME_DATAGRAM_COUNT_MASK;
+    if (count > MAX_WEATHER_EFFECTS || msg->readcount + count * sizeof(wc3WeatherEffect_t) > msg->cursize) {
+        fprintf(stderr, "CL_ParseFrame: invalid weather snapshot count=%u\n", (unsigned)count);
+        msg->readcount = msg->cursize;
+        return;
+    }
+    cl.viewDef.weather_effects = cl.weather_effects;
+    cl.viewDef.num_weather_effects = count;
+    cl.num_weather_effects = count;
+    FOR_LOOP(i, count) MSG_Read(msg, &cl.weather_effects[i], sizeof(wc3WeatherEffect_t));
+    cl.viewDef.lightning_effects = cl.lightning_effects;
+    cl.viewDef.num_lightning_effects = 0;
+    cl.num_lightning_effects = 0;
+    if (has_lightning) {
+        uint32_t lightning_count;
+        if (msg->readcount + sizeof(uint16_t) > msg->cursize) {
+            msg->readcount = msg->cursize;
+            return;
+        }
+        lightning_count = (uint16_t)MSG_ReadShort(msg);
+        if (lightning_count > MAX_LIGHTNING_EFFECTS ||
+            msg->readcount + lightning_count * sizeof(lightningEffect_t) > msg->cursize) {
+            msg->readcount = msg->cursize;
+            return;
+        }
+        cl.viewDef.num_lightning_effects = lightning_count;
+        cl.num_lightning_effects = lightning_count;
+        FOR_LOOP(i, lightning_count) MSG_Read(msg, &cl.lightning_effects[i], sizeof(lightningEffect_t));
+    }
+    if (has_entity_tints) {
+        uint32_t tint_count = (uint16_t)MSG_ReadShort(msg);
+        uint32_t const tint_wire_size = sizeof(uint16_t) + sizeof(color32_t);
+        if (tint_count > MAX_CLIENT_ENTITIES || msg->readcount + tint_count * tint_wire_size > msg->cursize) {
+            msg->readcount = msg->cursize;
+            return;
+        }
+        FOR_LOOP(i, cl.num_active) cl.ents[cl.active_entities[i]].tint_valid = false;
+        FOR_LOOP(i, tint_count) {
+            uint32_t number = (uint16_t)MSG_ReadShort(msg);
+            color32_t color;
+            MSG_Read(msg, &color, sizeof(color));
+            if (number >= MAX_CLIENT_ENTITIES) continue;
+            cl.ents[number].tint = color;
+            cl.ents[number].tint_valid = true;
+        }
+    }
+    if (has_terrain_mask && !CL_ParseTerrainMaskChunk(msg)) {
+        msg->readcount = msg->cursize;
+        return;
+    }
+}
+
+void CL_ParsePlayerInfo(sizeBuf_t *msg) {
+    uint32_t bits;
+    uint32_t plnum = MSG_ReadPlayerBits(msg, &bits);
+    if (cl_frame_discard) { /* part of an undecodable frame: consume it only */
+        player_t skip = cl.playerstate;
+        MSG_ReadDeltaPlayerState(msg, &skip, plnum, bits);
+        return;
+    }
+    MSG_ReadDeltaPlayerState(msg, &cl.playerstate, plnum, bits);
+    if (Cvar_Integer("ui_layout_debug", 0) >= 2) {
+        static uint32_t last_timed_status = ~0u;
+        uint32_t const timed_status = cl.playerstate.stats[UI_PLAYERSTAT_SELECTION_TIMED_STATUS];
+        if (timed_status != last_timed_status) {
+            fprintf(stderr,
+                    "UI_TIMED_STATUS playerinfo player=%u raw=%u fraction=%.4f bits=0x%08x\n",
+                    (unsigned)plnum, (unsigned)timed_status,
+                    timed_status / 65535.0f, (unsigned)bits);
+            last_timed_status = timed_status;
+        }
+    }
+    if (cl.playerstate.client_ui_state == CLIENT_UI_GAME &&
+        cls.key_dest != key_console && cls.key_dest != key_menu) {
+        CL_SetGameplayInput();
+    }
+
+    cl.viewDef.camerastate[1] = cl.viewDef.camerastate[0];
+    cl.viewDef.camerastate[0].origin = cl.playerstate.vieworigin;
+    cl.viewDef.camerastate[0].viewangles = cl.playerstate.viewangles;
+    cl.viewDef.camerastate[0].viewoffset = cl.playerstate.viewoffset;
+    cl.viewDef.camerastate[0].eyeoffset = cl.playerstate.eyeoffset;
+    cl.viewDef.camerastate[0].distance = cl.playerstate.distance;
+    cl.viewDef.camerastate[0].fov = cl.playerstate.fov;
+    cl.viewDef.camerastate[0].znear = cl.playerstate.znear;
+    cl.viewDef.camerastate[0].zfar = cl.playerstate.zfar;
+
+    /* Prediction expires if a game rejects/clamps input, and yields immediately to scripted UI ownership. */
+    if (cl.playerstate.client_ui_state != CLIENT_UI_GAME)
+        cl.camera_prediction.active = cl.camera_prediction.view = false;
+    if (cl.time - cl.camera_prediction.focus_ms > BZ_INPUT_MAX_MSEC) cl.camera_prediction.active = false;
+    if (cl.time - cl.camera_prediction.view_ms > BZ_INPUT_MAX_MSEC) cl.camera_prediction.view = false;
+    if (cl.camera_prediction.view) {
+        if (!memcmp(&cl.playerstate.viewangles, &cl.camera_prediction.angles, sizeof(vec3_t)) &&
+            cl.playerstate.distance == cl.camera_prediction.distance) {
+            cl.camera_prediction.view = false;
+        } else {
+            FOR_LOOP(i, 2) {
+                cl.viewDef.camerastate[i].viewangles = cl.camera_prediction.angles;
+                cl.viewDef.camerastate[i].distance = cl.camera_prediction.distance;
+            }
+        }
+    }
+    if (cl.camera_prediction.active) {
+        cl.camera_prediction.origin = CL_ClampCameraPosition(cl.camera_prediction.origin);
+        if (cl.playerstate.vieworigin.x == cl.camera_prediction.origin.x &&
+            cl.playerstate.vieworigin.y == cl.camera_prediction.origin.y) {
+            cl.camera_prediction.active = false;
+        } else {
+            CL_PredictCameraPosition(cl.camera_prediction.origin);
+        }
+    }
+}
+
+/* Receive an svc_layout message from the server.  The server serializes the
+ * entire UI frame tree as a binary blob; the client stores the raw blob and
+ * passes it to the renderer each frame without interpreting the contents.
+ *
+ * Wire contract: ONE message carries exactly ONE layer — header (svc_layout +
+ * layer byte), frames, then a terminator (int32_t 0 + int16_t 0 read by
+ * MSG_ReadEntityBits).  After the terminator the outer packet loop reads the
+ * next byte as a new message id, so server frames written outside a layer (no
+ * svc_layout header) are never attributed to any layer and are silently dropped
+ * as an unknown message.  The server must open a layer before writing frames
+ * (see UI_WriteStart/UI_WriteEnd in games/world-of-warcraft/game/g_ui.c). */
+void CL_ParseLayout(sizeBuf_t *msg) {
+    uint32_t layer = MSG_ReadByte(msg);
+    uint32_t payload_size = 0;
+    bool terminated = false;
+    bool has_frames = false;
+
+    if (layer >= MAX_LAYOUT_LAYERS) {
+        fprintf(stderr, "CL_ParseLayout: bad layer %u\n", (unsigned)layer);
+        msg->readcount = msg->cursize;
+        return;
+    }
+
+    if (Cvar_Integer("ui_layout_debug", 0)) {
+        fprintf(stderr, "UI_LAYOUT_DEBUG begin layer=%u packet_read=%u packet_size=%u uiflags=0x%08x hidden=%u\n",
+            (unsigned)layer, (unsigned)msg->readcount, (unsigned)msg->cursize,
+            (unsigned)cl.playerstate.uiflags,
+            (unsigned)((cl.playerstate.uiflags & (1u << layer)) != 0));
+    }
+
+    SCR_ClearLayoutLayer(layer);
+    SAFE_DELETE(cl.layout[layer], MemFree);
+    uint32_t start = msg->readcount;
+    while (true) {
+        uiFrame_t ent = { 0 };
+        uint32_t bits = 0;
+        if (msg->readcount + sizeof(uint32_t) + sizeof(uint16_t) > msg->cursize) {
+            break;
+        }
+        uint32_t nument = MSG_ReadEntityBits(msg, &bits);
+        if (nument == 0 && bits == 0) {
+            terminated = true;
+            break;
+        }
+        has_frames = true;
+        MSG_ReadDeltaUIFrame(msg, &ent, nument, bits);
+        has_frames = true;
+        if (msg->readcount + sizeof(uint8_t) > msg->cursize) {
+            break;
+        }
+        /* Buffer length is an unsigned wire byte; MSG_ReadByte retains signed-char sentinels for legacy callers. */
+        ent.buffer.size = (uint8_t)MSG_ReadByte(msg);
+        if (msg->readcount > msg->cursize ||
+            ent.buffer.size > msg->cursize - msg->readcount) {
+            break;
+        }
+
+        msg->readcount += ent.buffer.size;
+    }
+    if (!terminated) {
+        fprintf(stderr, "CL_ParseLayout: malformed layer %u\n", (unsigned)layer);
+        msg->readcount = msg->cursize;
+        return;
+    }
+    if (start > msg->cursize || msg->readcount > msg->cursize ||
+        msg->readcount < start) { /* guard against malformed data and wraparound */
+        msg->readcount = msg->cursize;
+        return;
+    }
+    /* An empty svc_layout is the wire-level clear operation.  Do not retain an
+     * allocated terminator-only blob: callers use a non-NULL layer as evidence
+     * that the layer exists, including generic modal ownership. */
+    if (!has_frames) {
+        SCR_ReleaseLayoutCameraEvents(layer);
+        if (Cvar_Integer("ui_layout_debug", 0)) {
+            fprintf(stderr, "UI_LAYOUT_DEBUG clear layer=%u\n", (unsigned)layer);
+        }
+        return;
+    }
+    payload_size = msg->readcount - start;
+    /* A terminator-only payload is the server's layer-clear operation. Keep
+     * the client slot NULL so modal ownership and hit testing end immediately. */
+    if (!has_frames) {
+        return;
+    }
+    cl.layout[layer] = MemAlloc(sizeof(uint32_t) + payload_size);
+    memcpy(cl.layout[layer], &payload_size, sizeof(payload_size));
+    memcpy((uint8_t *)cl.layout[layer] + sizeof(payload_size), msg->data + start, payload_size);
+    SCR_SetLayoutLayer(layer, cl.layout[layer]);
+    if (layer == LAYER_INFOPANEL && Cvar_Integer("ui_layout_debug", 0) >= 2) {
+        bool found = false;
+        SCR_Clear(cl.layout[layer]);
+        FOR_LOOP(i, SCR_NumFrames()) {
+            uiFrame_t const *frame = SCR_Frame(i);
+            if (!frame || frame->stat != UI_STAT_SELECTION_TIMED_STATUS) continue;
+            found = true;
+            fprintf(stderr,
+                    "UI_TIMED_STATUS layout frame=%u parent=%u type=%u stat=%u value=%.4f size=(%.4f,%.4f) tex=%u border=%u layer_hidden=%u\n",
+                    (unsigned)frame->number, (unsigned)frame->parent,
+                    (unsigned)frame->flags.type, (unsigned)frame->stat, frame->value,
+                    frame->size.width, frame->size.height,
+                    (unsigned)frame->tex.index, (unsigned)frame->tex.index2,
+                    (unsigned)((cl.playerstate.uiflags & (1u << layer)) != 0));
+        }
+        if (!found) {
+            fprintf(stderr,
+                    "UI_TIMED_STATUS layout missing stat=%u frames=%u layer_hidden=%u raw=%u\n",
+                    (unsigned)UI_STAT_SELECTION_TIMED_STATUS, (unsigned)SCR_NumFrames(),
+                    (unsigned)((cl.playerstate.uiflags & (1u << layer)) != 0),
+                    (unsigned)cl.playerstate.stats[UI_PLAYERSTAT_SELECTION_TIMED_STATUS]);
+        }
+    }
+    if (Cvar_Integer("ui_layout_debug", 0)) {
+        fprintf(stderr, "UI_LAYOUT_DEBUG stored layer=%u payload=%u uiflags=0x%08x hidden=%u\n",
+            (unsigned)layer, (unsigned)payload_size, (unsigned)cl.playerstate.uiflags,
+            (unsigned)((cl.playerstate.uiflags & (1u << layer)) != 0));
+    }
+#ifdef BZ_TESTS
+    {
+        static bool quest_layout_screenshot_done;
+        if (!quest_layout_screenshot_done && layer == LAYER_QUESTDIALOG
+            && Cvar_Integer("wc3_quest_layout_test", 0)) {
+            quest_layout_screenshot_done = true;
+            Cbuf_AddText("screenshot 5\nquit\n");
+        }
+    }
+#endif
+}
+
+void CL_ParseCursor(sizeBuf_t *msg) {
+    uint32_t bits = 0;
+    SAFE_DELETE(cl.cursorEntity, MemFree);
+    cl.cursorEntity = MemAlloc(sizeof(entityState_t));
+    MSG_ReadEntityBits(msg, &bits);
+    MSG_ReadDeltaEntity(msg, cl.cursorEntity, 0, bits);
+    if (cl.cursorEntity->model == 0) {
+        SAFE_DELETE(cl.cursorEntity, MemFree);
+    }
+}
+
+void CL_ParseCursorSplat(sizeBuf_t *msg) {
+    cl.cursor_splat.image = MSG_ReadShort(msg);
+    cl.cursor_splat.radius = MSG_ReadFloat(msg);
+    if (!cl.cursor_splat.image || cl.cursor_splat.radius <= 0.0f ||
+        cl.cursor_splat.image >= MAX_IMAGES) {
+        memset(&cl.cursor_splat, 0, sizeof(cl.cursor_splat));
+    }
+}
+
+static bool CL_EnsureFogOfWarSize(uint32_t width, uint32_t height) {
+    uint32_t cells;
+
+    if (!width || !height) {
+        return false;
+    }
+    if (cl.fow.width == width && cl.fow.height == height &&
+        cl.fow.visible && cl.fow.explored && cl.fow.texture)
+    {
+        return true;
+    }
+
+    SAFE_DELETE(cl.fow.visible, MemFree);
+    SAFE_DELETE(cl.fow.explored, MemFree);
+    SAFE_DELETE(cl.fow.texture, MemFree);
+    cl.fow.width = width;
+    cl.fow.height = height;
+    cells = width * height;
+    cl.fow.visible = MemAlloc(cells);
+    cl.fow.explored = MemAlloc(cells);
+    cl.fow.texture = MemAlloc(cells);
+    if (!cl.fow.visible || !cl.fow.explored || !cl.fow.texture) {
+        SAFE_DELETE(cl.fow.visible, MemFree);
+        SAFE_DELETE(cl.fow.explored, MemFree);
+        SAFE_DELETE(cl.fow.texture, MemFree);
+        cl.fow.width = 0;
+        cl.fow.height = 0;
+        return false;
+    }
+    memset(cl.fow.visible, 0, cells);
+    memset(cl.fow.explored, 0, cells);
+    memset(cl.fow.texture, 0, cells);
+    cl.fow.generation++;
+    return true;
+}
+
+static void CL_ClearFogRows(uint8_t *plane, uint32_t first_row, uint32_t row_count) {
+    if (!plane || first_row >= cl.fow.height) {
+        return;
+    }
+    row_count = MIN(row_count, cl.fow.height - first_row);
+    memset(plane + first_row * cl.fow.width, 0, row_count * cl.fow.width);
+}
+
+/* Rebuild only the rows carried by this message; the old path rescanned the whole map after every RLE chunk. */
+static void CL_UpdateFogTextureRows(uint32_t first_row, uint32_t row_count) {
+    uint8_t *texture, *visible, *explored;
+    uint32_t first, cells;
+
+    if (!cl.fow.texture || !cl.fow.visible || !cl.fow.explored || first_row >= cl.fow.height) {
+        return;
+    }
+    first = first_row * cl.fow.width;
+    cells = MIN(row_count, cl.fow.height - first_row) * cl.fow.width;
+    texture = cl.fow.texture + first;
+    visible = cl.fow.visible + first;
+    explored = cl.fow.explored + first;
+    FOR_LOOP(i, cells)
+        texture[i] = visible[i] ? 255 : (explored[i] ? 128 : 0);
+}
+
+static uint8_t *CL_FogPlaneForStreamIndex(uint32_t flags, uint32_t stream_index) {
+    uint32_t index = 0;
+
+    if (flags & FOW_MSG_VISIBLE_PLANE) {
+        if (stream_index == index) {
+            return cl.fow.visible;
+        }
+        index++;
+    }
+    if (flags & FOW_MSG_EXPLORED_PLANE) {
+        if (stream_index == index) {
+            return cl.fow.explored;
+        }
+    }
+    return NULL;
+}
+
+/* Decode whole contiguous runs; the stream concatenates compact row ranges for each requested plane. */
+typedef struct { uint32_t flags, first_row, plane_bits; } fogUnpackCtx_t;
+
+static void CL_FogUnpackRun(uint32_t index, uint8_t value, uint32_t count, void *ctx) {
+    fogUnpackCtx_t *c = ctx;
+    uint32_t off = index;
+    while (count) {
+        uint32_t n = MIN(count, c->plane_bits - off % c->plane_bits);
+        uint8_t *plane = CL_FogPlaneForStreamIndex(c->flags, off / c->plane_bits);
+        if (plane) memset(plane + c->first_row * cl.fow.width + off % c->plane_bits, value, n);
+        off += n; count -= n;
+    }
+}
+
+/* Apply one validated wire chunk and report whether the caller must publish the assembled texture. */
+static bool CL_ParseFogOfWar(sizeBuf_t *msg) {
+    uint32_t flags = MSG_ReadByte(msg);
+    uint32_t width = MSG_ReadShort(msg);
+    uint32_t height = MSG_ReadShort(msg);
+    uint32_t first_row = MSG_ReadShort(msg);
+    uint32_t row_count = MSG_ReadShort(msg);
+    uint32_t payload_bytes = MSG_ReadShort(msg);
+    uint32_t plane_count = 0;
+    uint32_t expected_bits;
+    uint32_t decoded;
+    uint8_t const *payload;
+
+    if (flags & FOW_MSG_VISIBLE_PLANE) {
+        plane_count++;
+    }
+    if (flags & FOW_MSG_EXPLORED_PLANE) {
+        plane_count++;
+    }
+    expected_bits = width * row_count * plane_count;
+    if (!plane_count || !width || !height || !(flags & FOW_MSG_RLE) ||
+        first_row >= height || row_count > height - first_row ||
+        payload_bytes > msg->cursize - msg->readcount)
+    {
+        msg->readcount = MIN(msg->cursize, msg->readcount + payload_bytes);
+        return false;
+    }
+    payload = msg->data + msg->readcount;
+    if (!MSG_ValidateRLE(payload, payload_bytes, expected_bits)) {
+        msg->readcount = MIN(msg->cursize, msg->readcount + payload_bytes);
+        return false;
+    }
+    if (!CL_EnsureFogOfWarSize(width, height)) {
+        msg->readcount = MIN(msg->cursize, msg->readcount + payload_bytes);
+        return false;
+    }
+
+    if (flags & FOW_MSG_FULL) {
+        CL_ClearFogRows(cl.fow.visible, first_row, row_count);
+        CL_ClearFogRows(cl.fow.explored, first_row, row_count);
+    }
+    /* Validated above, so the decode cannot fail; the assert documents the contract. */
+    decoded = MSG_DecodeRLE(payload, payload_bytes, expected_bits, CL_FogUnpackRun,
+        &(fogUnpackCtx_t){ flags, first_row, cl.fow.width * row_count });
+    assert(decoded == expected_bits);
+    msg->readcount += payload_bytes;
+    CL_UpdateFogTextureRows(first_row, row_count);
+    cl.fow.generation++;
+    return true;
+}
+
+/* Publish only a complete loading layout; offsets reject missing, reordered, or mismatched chunks. */
+static void CL_ParseLoadingScreen(sizeBuf_t *netmsg) {
+    uint8_t *buf;
+    uLongf size = MAX_MSGLEN;
+    if (netmsg->cursize - netmsg->readcount < BZ_LOADING_HEADER_SIZE - 1) goto invalid;
+    uint32_t total = MSG_ReadLong(netmsg), pos = MSG_ReadLong(netmsg), len = MSG_ReadLong(netmsg);
+    if (!total || total > MAX_MSGLEN || pos >= total || !len || len > total - pos ||
+        len > netmsg->cursize - netmsg->readcount) goto invalid;
+    if (!pos) {
+        SAFE_DELETE(cl.loading.data, MemFree);
+        SZ_Init(&cl.loading, MemAlloc(total), total);
+    }
+    if (!cl.loading.data || cl.loading.maxsize != total || cl.loading.cursize != pos) goto invalid;
+    MSG_Read(netmsg, cl.loading.data + pos, len);
+    cl.loading.cursize += len;
+    if (cl.loading.cursize < total) return;
+    /* A full loading layout may be up to MAX_MSGLEN bytes after inflate.
+     * Keep this scratch buffer off the limited WebAssembly pthread stack. */
+    buf = MemAlloc(MAX_MSGLEN);
+    int err = uncompress(buf, &size, cl.loading.data, total);
+    SAFE_DELETE(cl.loading.data, MemFree);
+    SZ_Clear(&cl.loading);
+    if (err != Z_OK || size < 7 || buf[0] != LAYER_LOADING) {
+        MemFree(buf);
+        goto invalid;
+    }
+    if (cl.refresh_prepped) {
+        MemFree(buf);
+        return;
+    }
+    sizeBuf_t msg = { .data = buf, .cursize = size, .maxsize = MAX_MSGLEN };
+    CL_ParseLayout(&msg);
+    if (!cl.layout[LAYER_LOADING] || msg.readcount != msg.cursize) {
+        MemFree(buf);
+        Com_Error(ERR_DROP, "Incomplete loading screen layout");
+        return;
+    }
+    CL_PrepLoading();
+    MemFree(buf);
+    return;
+invalid:
+    SAFE_DELETE(cl.loading.data, MemFree);
+    SZ_Clear(&cl.loading);
+    netmsg->readcount = netmsg->cursize;
+    Com_Error(ERR_DROP, "Invalid loading screen payload");
+}
+
+void CL_MirrorMessage(sizeBuf_t *msg) {
+    char buf[256] = { 0 };
+    MSG_ReadString(msg, buf);
+    if (!strcmp(buf, "begin")) {
+        return;
+    }
+    /* Paged baselines must finish before registration can queue begin and enable gameplay snapshots. */
+    if (!strcmp(buf, "precache")) { cl.precache_ready = true; return; }
+    MSG_WriteByte(&cls.netchan.message, clc_stringcmd);
+    MSG_WriteString(&cls.netchan.message, buf);
+}
+
+static void CL_ParseLobbySetup(sizeBuf_t *msg) {
+    lobbyState_t state;
+    int slot_count;
+    int local_slot;
+
+    memset(&state, 0, sizeof(state));
+    state.active = true;
+    MSG_ReadStringN(msg, state.map_path, sizeof(state.map_path));
+    MSG_ReadStringN(msg, state.map_name, sizeof(state.map_name));
+    state.game_speed = (uint32_t)MSG_ReadByte(msg);
+    slot_count = MSG_ReadByte(msg);
+    local_slot = MSG_ReadByte(msg);
+    state.revision = (uint32_t)MSG_ReadLong(msg);
+    if (slot_count < 0) {
+        slot_count = 0;
+    }
+    if (slot_count > MAX_PLAYERS) {
+        slot_count = MAX_PLAYERS;
+    }
+    state.slot_count = (uint32_t)slot_count;
+    state.local_slot = local_slot >= 0 && local_slot < MAX_PLAYERS ? (uint32_t)local_slot : MAX_PLAYERS;
+    FOR_LOOP(i, state.slot_count) {
+        lobbySlot_t *slot = &state.slots[i];
+        int client;
+        int map_player;
+
+        slot->visible = MSG_ReadByte(msg) != 0;
+        {
+            int const flags = MSG_ReadByte(msg);
+            slot->occupied = (flags & 1) != 0;
+            slot->ready = (flags & 3) == 3;
+        }
+        client = MSG_ReadByte(msg);
+        map_player = MSG_ReadByte(msg);
+        slot->client = client >= 0 && client < MAX_CLIENTS ? (uint32_t)client : MAX_CLIENTS;
+        slot->map_player = map_player >= 0 && map_player < MAX_PLAYERS ? (uint32_t)map_player : MAX_PLAYERS;
+        slot->type = (lobbySlotType_t)MSG_ReadByte(msg);
+        slot->race = (playerRace_t)MSG_ReadByte(msg);
+        slot->team = (uint32_t)MSG_ReadByte(msg);
+        slot->color = (uint32_t)MSG_ReadByte(msg);
+        MSG_ReadStringN(msg, slot->name, sizeof(slot->name));
+    }
+    fprintf(stderr,
+            "CL_ParseLobbySetup: map=\"%s\" name=\"%s\" speed=%u slots=%u local_slot=%u revision=%u\n",
+            state.map_path,
+            state.map_name,
+            (unsigned)state.game_speed,
+            (unsigned)state.slot_count,
+            (unsigned)state.local_slot,
+            (unsigned)state.revision);
+    FOR_LOOP(i, state.slot_count) {
+        lobbySlot_t const *slot = &state.slots[i];
+
+        if (!slot->visible) {
+            continue;
+        }
+        fprintf(stderr,
+                "  client lobby slot %u%s: occupied=%d client=%u map_player=%u type=%s race=%s team=%u color=%u name=\"%s\"\n",
+                (unsigned)i,
+                i == state.local_slot ? " local" : "",
+                slot->occupied ? 1 : 0,
+                (unsigned)slot->client,
+                (unsigned)slot->map_player,
+                CL_LobbySlotTypeName(slot->type),
+                CL_PlayerRaceName(slot->race),
+                (unsigned)slot->team,
+                (unsigned)slot->color,
+                slot->name);
+    }
+    if (!state.map_path[0]) {
+        return;
+    }
+    if (CL_MenuActive()) menu.UpdateLobbySetup(&state);
+}
+
+static void CL_ParseConsolePrint(sizeBuf_t *msg) {
+    char text[MAX_CONSOLE_MESSAGE_LEN] = { 0 };
+
+    MSG_ReadStringN(msg, text, sizeof(text));
+    if (text[0]) CON_printf("%s", text);
+}
+
+#ifdef BZ_TESTS
+void (*cl_test_lobby_chat)(cstring_t text, bool own);
+#endif
+static void CL_ParseLobbyChat(sizeBuf_t *msg) {
+    char text[512] = { 0 };
+    char command[sizeof(text) + 32];
+    int own;
+
+    own = MSG_ReadByte(msg);
+    MSG_ReadStringN(msg, text, sizeof(text));
+    if (!text[0]) {
+        return;
+    }
+    snprintf(command, sizeof(command), "menu_game_setup_chat %u %s", own ? 1u : 0u, text);
+    Cbuf_AddText(command);
+    Cbuf_AddText("\n");
+#ifdef BZ_TESTS
+    if (cl_test_lobby_chat) cl_test_lobby_chat(text, own);
+#endif
+}
+
+/* Apply an authoritative server selection to the client cache and refresh the active unit UI.
+ * The payload is a count-prefixed array of entity numbers; malformed or oversized payloads are rejected. */
+static void CL_ParseSetSelection(sizeBuf_t *msg) {
+    uint32_t count = MSG_ReadByte(msg), selected = 0;
+
+    if (msg->readcount + count * sizeof(uint32_t) > msg->cursize) {
+        fprintf(stderr, "CL: invalid set_selection payload (%u bytes)\n",
+                (unsigned)(msg->cursize - msg->readcount));
+        msg->readcount = msg->cursize;
+        return;
+    }
+    if (count > MAX_SELECTED_ENTITIES) {
+        fprintf(stderr, "CL: oversized set_selection payload (%u entities)\n",
+                (unsigned)count);
+        msg->readcount = msg->cursize;
+        return;
+    }
+
+    FOR_LOOP(i, count) {
+        uint32_t const number = (uint32_t)MSG_ReadLong(msg);
+        if (number > 0 && number < MAX_CLIENT_ENTITIES) {
+            cl.selection.entity_nums[selected++] = number;
+        }
+    }
+    cl.selection.num_selected = selected;
+}
+
+/* Read the Quake 2 sound packet contract and resolve entity-relative origins
+ * from the current client snapshot before handing playback to the mixer. */
+static void CL_ParseSound(sizeBuf_t *msg) {
+    uint32_t flags = (uint32_t)MSG_ReadByte(msg);
+    int sound_index = MSG_ReadShort(msg), channel = 0, entity = 0;
+    float volume = DEFAULT_SOUND_PACKET_VOLUME, attenuation = DEFAULT_SOUND_PACKET_ATTENUATION, timeofs = 0.0f;
+    vec3_t origin = { 0 };
+    cstring_t path;
+    soundPolicy_t policy = {0};
+
+    if (flags & SND_VOLUME) volume = MSG_ReadByte(msg) / 255.0f;
+    if (flags & SND_ATTENUATION) attenuation = MSG_ReadByte(msg) / 64.0f;
+    if (flags & SND_OFFSET) timeofs = MSG_ReadByte(msg) / 1000.0f;
+    if (flags & SND_PRIORITY) channel = CHAN_PRIORITY((uint16_t)MSG_ReadShort(msg));
+    if (flags & SND_POLICY) {
+        policy.priority = (uint32_t)MSG_ReadLong(msg);
+        policy.user = (uint32_t)MSG_ReadLong(msg);
+        policy.request = (uint32_t)MSG_ReadLong(msg);
+        policy.flags = (uint16_t)MSG_ReadShort(msg);
+        policy.cooldown_ms = (uint16_t)MSG_ReadShort(msg);
+        policy.group = MSG_ReadByte(msg);
+        policy.max_channel = MSG_ReadByte(msg);
+        policy.max_total = MSG_ReadByte(msg);
+        policy.max_duplicates = MSG_ReadByte(msg);
+    }
+    if (flags & SND_ENT) {
+        /* Entity/channel is an unsigned bitfield; sign extension rejected
+         * valid campaign entities 4096..8191 as negative entity numbers. */
+        uint16_t packed = (uint16_t)MSG_ReadShort(msg);
+        entity = packed >> 3;
+        channel |= packed & 7;
+        if (entity <= 0 || entity >= MAX_CLIENT_ENTITIES) {
+            fprintf(stderr, "CL_ParseSound: bad entity=%d sound=%d\n", entity, sound_index);
+            return;
+        }
+        origin = cl.ents[entity].current.origin;
+    }
+    if (flags & SND_POS) MSG_ReadPos(msg, &origin);
+    if (sound_index <= 0 || sound_index >= MAX_SOUNDS) {
+        fprintf(stderr, "CL_ParseSound: bad sound=%d flags=0x%x\n", sound_index, (unsigned)flags);
+        return;
+    }
+    path = cl.configstrings[CS_SOUNDS + sound_index];
+    if (flags & SND_POLICY) S_PlaySoundPolicy(path, &origin, flags & (SND_POS | SND_ENT), channel, volume, attenuation, timeofs, &policy);
+    else if (path && path[0]) S_PlaySoundPacket(path, &origin, flags & (SND_POS | SND_ENT), channel, volume, attenuation, timeofs);
+}
+
+#if defined(BZ_TESTS) && defined(BZ_CLIENT_WORLD)
+#include "shared/test.h"
+#include "sound/s_local.h"
+
+/* High entity numbers set the packed short's sign bit; playback must retain all 13 entity bits. */
+TEST(client_sound, packed_entity_above_4095_reaches_mixer) {
+    static uint32_t const entities[] = { 4095, 4096, 4257, 8191 };
+    sState_t *saved = malloc(sizeof(s));
+    sfxcache_t sample = { .length = 1, .loopstart = -1, .data = { 1000 } };
+    PATHSTR path;
+    uint8_t data[32];
+    sizeBuf_t msg;
+
+    T_NOT_NULL(saved);
+    if (!saved) return;
+    *saved = s;
+    memcpy(path, cl.configstrings[CS_SOUNDS + 1], sizeof(path));
+    memset(&s, 0, sizeof(s));
+    s.initialized = true; s.num_sfx = 1;
+    strlcpy(s.known_sfx[0].path, "packet-test.wav", sizeof(s.known_sfx[0].path));
+    s.known_sfx[0].cache = &sample;
+    strlcpy(cl.configstrings[CS_SOUNDS + 1], "packet-test.wav", sizeof(path));
+    FOR_LOOP(i, sizeof(entities) / sizeof(*entities)) {
+        uint32_t entity = entities[i];
+        vec3_t origin = cl.ents[entity].current.origin;
+        cl.ents[entity].current.origin = (vec3_t){ 123, 456, 0 };
+        memset(s.channels, 0, sizeof(s.channels));
+        SZ_Init(&msg, data, sizeof(data));
+        MSG_WriteByte(&msg, SND_ENT | SND_POS | (i ? SND_PRIORITY : 0));
+        MSG_WriteShort(&msg, 1);
+        if (i) MSG_WriteShort(&msg, 1731);
+        MSG_WriteShort(&msg, (entity << 3) | CHAN_WEAPON);
+        MSG_WritePos(&msg, &cl.ents[entity].current.origin);
+        CL_ParseSound(&msg);
+        T_EQ(msg.readcount, msg.cursize);
+        T_ASSERT(s.channels[0].active);
+        T_EQ(s.channels[0].channel, CHAN_WEAPON);
+        T_EQ(s.channels[0].priority, i ? 1731 : 0);
+        T_FEQ(s.channels[0].origin.x, 123, 0.001f);
+        cl.ents[entity].current.origin = origin;
+    }
+    /* Owner-local policy retains identity and all 32 priority bits without
+     * turning the sound into an entity-relative positional source. */
+    memset(s.channels, 0, sizeof(s.channels));
+    SZ_Init(&msg, data, sizeof(data));
+    MSG_WriteByte(&msg, SND_POLICY);
+    MSG_WriteShort(&msg, 1);
+    MSG_WriteLong(&msg, 0xf1234567u);
+    MSG_WriteLong(&msg, 511);
+    MSG_WriteLong(&msg, 0xfedc1234u);
+    MSG_WriteShort(&msg, SOUND_NO_DUPLICATE_USERS | SOUND_CHANNEL_PREEMPT);
+    MSG_WriteShort(&msg, 250);
+    MSG_WriteByte(&msg, 15); MSG_WriteByte(&msg, 2);
+    MSG_WriteByte(&msg, 24); MSG_WriteByte(&msg, 4);
+    CL_ParseSound(&msg);
+    T_EQ(msg.readcount, msg.cursize);
+    T_ASSERT(s.channels[0].active);
+    T_ASSERT(!s.channels[0].is_positional);
+    T_EQ(s.channels[0].priority, 0xf1234567u);
+    T_EQ(s.channels[0].policy.user, 511);
+    T_EQ(s.channels[0].policy.request, 0xfedc1234u);
+    T_EQ(s.channels[0].policy.flags, SOUND_NO_DUPLICATE_USERS | SOUND_CHANNEL_PREEMPT);
+    T_EQ(s.channels[0].policy.cooldown_ms, 250);
+    T_EQ(s.channels[0].policy.group, 15);
+    T_EQ(s.channels[0].policy.max_channel, 2);
+    T_EQ(s.channels[0].policy.max_total, 24);
+    T_EQ(s.channels[0].policy.max_duplicates, 4);
+    memcpy(cl.configstrings[CS_SOUNDS + 1], path, sizeof(path));
+    s = *saved; free(saved);
+}
+#endif
+
+static void CL_ParseWindow(sizeBuf_t *msg) {
+    uiWindowDef_t def;
+    uint32_t op = MSG_ReadByte(msg), start, frame_end, text_size, size;
+    bool terminated = false;
+    sizeBuf_t scan, validate;
+    handle_t layout;
+    cstring_t text;
+
+    def.id = MSG_ReadLong(msg);
+    if (op == UI_WINDOW_CLOSE) {
+        CL_WindowClose(def.id);
+        return;
+    }
+    if (op != UI_WINDOW_OPEN) {
+        fprintf(stderr, "CL_ParseWindow: bad operation %u\n", (unsigned)op);
+        msg->readcount = msg->cursize;
+        return;
+    }
+    def.class_id = MSG_ReadLong(msg); def.flags = MSG_ReadLong(msg);
+    start = msg->readcount;
+    scan = *msg;
+    while (scan.readcount + sizeof(uint32_t) + sizeof(uint16_t) <= scan.cursize) {
+        uiFrame_t frame = { 0 };
+        uint32_t bits, number = MSG_ReadEntityBits(&scan, &bits);
+        if (!number && !bits) { terminated = true; break; }
+        if (!MSG_ReadDeltaUIWindowFrame(&scan, &frame, number, bits) || scan.readcount >= scan.cursize)
+            goto malformed_window;
+        uint32_t payload = (uint8_t)MSG_ReadByte(&scan);
+        if (payload > scan.cursize - scan.readcount) goto malformed_window;
+        scan.readcount += payload;
+    }
+    if (!terminated) goto malformed_window;
+    frame_end = scan.readcount;
+    if (scan.readcount + sizeof(uint32_t) > scan.cursize) goto malformed_window;
+    text_size = MSG_ReadLong(&scan);
+    if (!text_size || text_size > scan.cursize - scan.readcount) goto malformed_window;
+    text = (cstring_t)(scan.data + scan.readcount);
+    if (text[0]) goto malformed_window;
+    validate = *msg; validate.cursize = frame_end; terminated = false;
+    while (validate.readcount + sizeof(uint32_t) + sizeof(uint16_t) <= validate.cursize) {
+        uiFrame_t frame = { 0 };
+        uint32_t bits, number = MSG_ReadEntityBits(&validate, &bits);
+        if (!number && !bits) { terminated = true; break; }
+        if (!MSG_ReadDeltaUIWindowFrame(&validate, &frame, number, bits) || validate.readcount >= validate.cursize)
+            goto malformed_window;
+        cstring_t refs[] = { frame.text, frame.tooltip, frame.onclick };
+        FOR_LOOP(i, 3) {
+            uint32_t offset = (uint32_t)(uintptr_t)refs[i];
+            if (offset && (offset >= text_size || !memchr(text + offset, '\0', text_size - offset))) goto malformed_window;
+        }
+        uint32_t payload = (uint8_t)MSG_ReadByte(&validate);
+        if (payload > validate.cursize - validate.readcount) goto malformed_window;
+        validate.readcount += payload;
+    }
+    if (!terminated || validate.readcount != frame_end) goto malformed_window;
+    scan.readcount += text_size;
+    size = scan.readcount - start;
+    layout = MemAlloc(sizeof(uint32_t) + size);
+    memcpy(layout, &size, sizeof(size)); memcpy((uint8_t *)layout + sizeof(size), msg->data + start, size);
+    msg->readcount = scan.readcount;
+    CL_WindowOpen(&def, layout);
+    return;
+
+malformed_window:
+    fprintf(stderr, "CL_ParseWindow: malformed window %u\n", (unsigned)def.id);
+    msg->readcount = msg->cursize;
+}
+
+static void CL_ParseMusic(sizeBuf_t *msg) {
+    musicCommand_t command = (musicCommand_t)MSG_ReadByte(msg);
+    char playlist[2048];
+
+    switch (command) {
+        case MUSIC_CMD_SET_MAP: {
+            bool random = MSG_ReadByte(msg) != 0;
+            int32_t index = MSG_ReadLong(msg);
+            uint32_t session_id = (uint32_t)MSG_ReadLong(msg);
+            MSG_ReadStringN(msg, playlist, sizeof(playlist));
+            CL_MusicSetMap(playlist, random, index, session_id);
+            break;
+        }
+        case MUSIC_CMD_CLEAR_MAP:
+            CL_MusicClearMap();
+            break;
+        case MUSIC_CMD_PLAY: {
+            bool random = MSG_ReadByte(msg) != 0;
+            int32_t index = MSG_ReadLong(msg);
+            int32_t start_ms = MSG_ReadLong(msg);
+            int32_t fade_ms = MSG_ReadLong(msg);
+            uint32_t played_mask = (uint32_t)MSG_ReadLong(msg);
+            uint32_t session_id = (uint32_t)MSG_ReadLong(msg);
+            MSG_ReadStringN(msg, playlist, sizeof(playlist));
+            CL_MusicPlay(playlist, random, index, start_ms, fade_ms, played_mask, session_id);
+            break;
+        }
+        case MUSIC_CMD_STOP:
+            CL_MusicStop(MSG_ReadByte(msg) != 0);
+            break;
+        case MUSIC_CMD_RESUME:
+            CL_MusicResume();
+            break;
+        case MUSIC_CMD_PLAY_THEMATIC: {
+            int32_t index = MSG_ReadLong(msg);
+            int32_t start_ms = MSG_ReadLong(msg);
+            uint32_t session_id = (uint32_t)MSG_ReadLong(msg);
+            MSG_ReadStringN(msg, playlist, sizeof(playlist));
+            CL_MusicPlayThematic(playlist, index, start_ms, session_id);
+            break;
+        }
+        case MUSIC_CMD_END_THEMATIC:
+            CL_MusicEndThematic();
+            break;
+        case MUSIC_CMD_SET_VOLUME:
+            CL_MusicSetVolume(MSG_ReadLong(msg));
+            break;
+        case MUSIC_CMD_SET_POSITION:
+            CL_MusicSetPosition(MSG_ReadLong(msg));
+            break;
+        case MUSIC_CMD_SET_THEMATIC_VOLUME:
+            CL_MusicSetThematicVolume(MSG_ReadLong(msg));
+            break;
+        case MUSIC_CMD_SET_THEMATIC_POSITION:
+            CL_MusicSetThematicPosition(MSG_ReadLong(msg));
+            break;
+        default:
+            msg->readcount = msg->cursize;
+            break;
+    }
+}
+
+static void CL_ParseUIWindow(sizeBuf_t *msg) {
+    char window_id[64];
+    MSG_ReadStringN(msg, window_id, sizeof(window_id));
+    int show = MSG_ReadByte(msg);
+    fprintf(stderr, "CL_ParseUIWindow: obsolete menu window %s (%d); use svc_window\n", window_id, show);
+}
+
+/* Dispatch loop for a complete server message buffer.  Each iteration reads
+ * one message-type byte and calls the matching handler.  An unknown type
+ * stops processing and prints an error to stderr. */
+void CL_ParseServerMessage(sizeBuf_t *msg) {
+    uint8_t pack_id = 0;
+    while (MSG_Read(msg, &pack_id, 1)) {
+        switch (pack_id) {
+            case svc_nop:
+                break;
+            case svc_bad:
+                goto done;
+            case svc_playerinfo:
+                CL_ParsePlayerInfo(msg);
+                break;
+            case svc_spawnbaseline:
+                CL_ParseBaseline(msg);
+                break;
+            case svc_packetentities:
+                CL_ReadPacketEntities(msg);
+                break;
+            case svc_loading_screen:
+                CL_ParseLoadingScreen(msg);
+                break;
+            case svc_configstring:
+                CL_ParseConfigString(msg);
+                break;
+            case svc_frame:
+                CL_ParseFrame(msg);
+                break;
+            case svc_layout:
+                CL_ParseLayout(msg);
+                break;
+            case svc_cursor:
+                CL_ParseCursor(msg);
+                break;
+            case svc_cursor_splat:
+                CL_ParseCursorSplat(msg);
+                break;
+            case svc_sound:
+                CL_ParseSound(msg);
+                break;
+            case svc_music:
+                CL_ParseMusic(msg);
+                break;
+            case svc_minimap_ping:
+                CL_ParseMinimapPing(msg);
+                break;
+            case svc_mirror:
+                CL_MirrorMessage(msg);
+                break;
+            case svc_lobby_setup:
+                CL_ParseLobbySetup(msg);
+                break;
+            case svc_lobby_chat:
+                CL_ParseLobbyChat(msg);
+                break;
+            case svc_set_selection:
+                CL_ParseSetSelection(msg);
+                break;
+            case svc_console_print:
+                CL_ParseConsolePrint(msg);
+                break;
+            case svc_fogofwar:
+                CL_ParseFogOfWar(msg);
+                break;
+            case svc_temp_entity:
+                CL_ParseTEnt(msg);
+                break;                
+            // Phase 8: Unit UI data
+            case svc_unit_ui:
+                CL_ParseUnitUI(msg);
+                break;
+            case svc_window:
+                CL_ParseWindow(msg);
+                break;
+            case svc_ui_window:
+                CL_ParseUIWindow(msg);
+                break;
+            case svc_disconnect:
+                CL_Disconnect("Server disconnected.", true);
+                msg->readcount = msg->cursize;
+                goto done;
+            default:
+                fprintf(stderr, "Unknown message %d\n", pack_id);
+                goto done;
+        }
+    }
+done:
+    cl_frame_discard = false; /* a discarded frame never reaches into the next message */
+    return;
+}
+
+#if defined(BZ_TESTS) && defined(BZ_CLIENT_WORLD)
+static void test_frame_header(sizeBuf_t *msg, int frame, int base) {
+    MSG_WriteLong(msg, frame);
+    MSG_WriteLong(msg, frame * 100);
+    MSG_WriteLong(msg, base);
+    MSG_WriteShort(msg, 0); /* empty game datagram */
+}
+
+static void test_frame_entity(sizeBuf_t *msg, entityState_t const *from, uint32_t number, float x) {
+    entityState_t const to = { .number = number, .model = 1, .origin = { x, 0, 0 } };
+    MSG_WriteDeltaEntity(msg, from, &to, false);
+}
+
+static void test_apply_frame(sizeBuf_t *msg) {
+    MSG_WriteEntityBits(msg, 0, 0);
+    msg->readcount = 0;
+    CL_ParseFrame(msg);
+    CL_ReadPacketEntities(msg);
+}
+
+static bool test_entity_is(uint32_t number, float x) {
+    return cl.ents[number].current.model && fabsf(cl.ents[number].current.origin.x - x) < 0.01f;
+}
+
+/* Over UDP the server deltas against the newest frame it saw acknowledged, which may be older than the last frame
+ * this client applied. The client must rebuild that frame first or entities from the skipped frames linger. */
+TEST(client_frames, delta_against_older_acknowledged_frame_rebuilds_that_frame) {
+    struct client_state *saved = malloc(sizeof(cl));
+    struct client_static saved_cls = cls;
+    uint8_t data[512];
+    sizeBuf_t msg;
+    entityState_t const none = { 0 }, a1 = { .number = 5, .model = 1, .origin = { 10, 0, 0 } };
+
+    T_NOT_NULL(saved);
+    if (!saved) return;
+    memcpy(saved, &cl, sizeof(cl));
+    memset(&cl, 0, sizeof(cl));
+    cls.netchan.remote_address.type = NA_IP;
+    CL_ResetFrameHistory();
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 1: full snapshot of entities 5 and 6 */
+    test_frame_header(&msg, 1, -1);
+    test_frame_entity(&msg, &none, 5, 10); test_frame_entity(&msg, &none, 6, 20);
+    test_apply_frame(&msg);
+    T_EQ(cl.num_active, 2);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 2 (base 1): entity 7 appears, entity 5 moves */
+    test_frame_header(&msg, 2, 1);
+    test_frame_entity(&msg, &a1, 5, 11); test_frame_entity(&msg, &none, 7, 30);
+    test_apply_frame(&msg);
+    T_EQ(cl.num_active, 3);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 3 (base 1): the server never saw frame 2 acknowledged */
+    test_frame_header(&msg, 3, 1);
+    test_frame_entity(&msg, &a1, 5, 12);
+    test_apply_frame(&msg);
+    T_EQ(cl.num_active, 2);
+    T_ASSERT(test_entity_is(5, 12)); T_ASSERT(test_entity_is(6, 20)); T_ASSERT(!cl.ents[7].current.model);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 4 (base 3): ordinary delta, entity 6 removed */
+    test_frame_header(&msg, 4, 3);
+    MSG_WriteLong(&msg, 1u << U_REMOVE); MSG_WriteShort(&msg, 6);
+    test_apply_frame(&msg);
+    T_EQ(cl.num_active, 1);
+    T_ASSERT(test_entity_is(5, 12));
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 5 (-1): the client fell too far behind and gets a full snapshot */
+    test_frame_header(&msg, 5, -1);
+    test_frame_entity(&msg, &none, 9, 90);
+    test_apply_frame(&msg);
+    T_EQ(cl.num_active, 1);
+    T_ASSERT(test_entity_is(9, 90)); T_ASSERT(!cl.ents[5].current.model);
+
+    CL_ResetFrameHistory();
+    cls = saved_cls;
+    memcpy(&cl, saved, sizeof(cl));
+    free(saved);
+}
+
+/* A delta whose base this client does not hold cannot be decoded. The frame is read past and dropped, never applied
+ * or kept as a base (the netchan acknowledges its packet regardless), and the client asks once for a full frame. */
+TEST(client_frames, delta_against_missing_frame_is_discarded_and_requests_full_frame) {
+    struct client_state *saved = malloc(sizeof(cl));
+    struct client_static saved_cls = cls;
+    uint8_t data[512];
+    sizeBuf_t msg, *reliable;
+    entityState_t const none = { 0 }, a1 = { .number = 5, .model = 1, .origin = { 10, 0, 0 } };
+
+    T_NOT_NULL(saved);
+    if (!saved) return;
+    memcpy(saved, &cl, sizeof(cl));
+    memset(&cl, 0, sizeof(cl));
+    cls.netchan.remote_address.type = NA_IP;
+    reliable = Netchan_Reliable(&cls.netchan);
+    SZ_Clear(reliable);
+    CL_ResetFrameHistory();
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 1: full snapshot of entity 5 */
+    test_frame_header(&msg, 1, -1);
+    test_frame_entity(&msg, &none, 5, 10);
+    test_apply_frame(&msg);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 3 (base 2): frame 2 never reached this client */
+    test_frame_header(&msg, 3, 2);
+    test_frame_entity(&msg, &a1, 5, 99); test_frame_entity(&msg, &none, 7, 30);
+    test_apply_frame(&msg);
+    T_EQ(msg.readcount, msg.cursize); /* read past, so later messages in the packet still parse */
+    T_EQ(cl.frame.serverframe, 1);
+    T_EQ(cl.num_active, 1);
+    T_ASSERT(test_entity_is(5, 10)); T_ASSERT(!cl.ents[7].current.model);
+    T_ASSERT(reliable->cursize > 0);
+    uint32_t const request = reliable->cursize;
+    reliable->readcount = 0;
+    T_EQ(MSG_ReadByte(reliable), clc_stringcmd);
+    T_STREQ(MSG_ReadString2(reliable), "nodelta");
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 4 (base 3): the discarded frame is no base either; no second request */
+    test_frame_header(&msg, 4, 3);
+    test_frame_entity(&msg, &a1, 5, 98);
+    test_apply_frame(&msg);
+    T_EQ(cl.frame.serverframe, 1);
+    T_ASSERT(test_entity_is(5, 10));
+    T_EQ(reliable->cursize, request);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 5 (-1): the requested full frame */
+    test_frame_header(&msg, 5, -1);
+    test_frame_entity(&msg, &none, 5, 50);
+    test_apply_frame(&msg);
+    T_ASSERT(test_entity_is(5, 50));
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 6 (base 5): deltas resume */
+    test_frame_header(&msg, 6, 5);
+    test_frame_entity(&msg, &cl.ents[5].current, 5, 51);
+    test_apply_frame(&msg);
+    T_ASSERT(test_entity_is(5, 51));
+    T_EQ(cl.frame.serverframe, 6);
+
+    CL_ResetFrameHistory();
+    cls = saved_cls;
+    memcpy(&cl, saved, sizeof(cl));
+    free(saved);
+}
+
+/* A snapshot also carries entities that have only a looping sound or an event (SV_BuildClientFrame). Their deltas
+ * are against their previous state, which a rebuilt delta base must restore; a full frame drops them. */
+TEST(client_frames, entities_without_a_model_survive_delta_base_rebuild) {
+    struct client_state *saved = malloc(sizeof(cl));
+    struct client_static saved_cls = cls;
+    uint8_t data[512];
+    sizeBuf_t msg;
+    entityState_t const none = { 0 }, a1 = { .number = 5, .model = 1, .origin = { 10, 0, 0 } };
+    entityState_t s1 = { .number = 8, .sound = 3, .origin = { 40, 0, 0 } }, s2 = s1, s3 = s1;
+
+    T_NOT_NULL(saved);
+    if (!saved) return;
+    memcpy(saved, &cl, sizeof(cl));
+    memset(&cl, 0, sizeof(cl));
+    cls.netchan.remote_address.type = NA_IP;
+    CL_ResetFrameHistory();
+    s2.origin.x = 41; s3.origin.x = 42;
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 1: full snapshot, a unit and a sound-only emitter */
+    test_frame_header(&msg, 1, -1);
+    test_frame_entity(&msg, &none, 5, 10); MSG_WriteDeltaEntity(&msg, &none, &s1, false);
+    test_apply_frame(&msg);
+    T_EQ(cl.ents[8].current.sound, 3);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 2 (base 1) */
+    test_frame_header(&msg, 2, 1);
+    test_frame_entity(&msg, &a1, 5, 11);
+    test_apply_frame(&msg);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 3 (base 1): rebuild frame 1, then only the emitter's origin changes */
+    test_frame_header(&msg, 3, 1);
+    MSG_WriteDeltaEntity(&msg, &s1, &s2, false);
+    test_apply_frame(&msg);
+    T_EQ(cl.ents[8].current.sound, 3); T_FEQ(cl.ents[8].current.origin.x, 41, 0.01f);
+    T_ASSERT(test_entity_is(5, 10));
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 4 (base 3): an ordinary delta against the emitter's current state */
+    test_frame_header(&msg, 4, 3);
+    MSG_WriteDeltaEntity(&msg, &s2, &s3, false);
+    test_apply_frame(&msg);
+    T_EQ(cl.ents[8].current.sound, 3); T_FEQ(cl.ents[8].current.origin.x, 42, 0.01f);
+
+    SZ_Init(&msg, data, sizeof(data)); /* frame 5 (-1): a full snapshot without the emitter drops it */
+    test_frame_header(&msg, 5, -1);
+    test_frame_entity(&msg, &none, 5, 12);
+    test_apply_frame(&msg);
+    T_EQ(cl.ents[8].current.sound, 0);
+
+    CL_ResetFrameHistory();
+    cls = saved_cls;
+    memcpy(&cl, saved, sizeof(cl));
+    free(saved);
+}
+#endif

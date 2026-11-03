@@ -1,0 +1,158 @@
+#ifndef net_h
+#define net_h
+
+#include "common/rle.h"
+
+#define MAX_MSGLEN 256 * 1024
+
+#define BZ_LOADING_HEADER_SIZE 13 // bytes; opcode and three 32-bit lengths; bounds loading-screen chunks
+
+#define BZ_XSTR(x) BZ_STR(x)
+#define BZ_STR(x) #x
+
+#ifdef WOW
+#define PORT_SERVER 27911
+#else
+#define PORT_SERVER 27910
+#endif
+#define PORT_SERVER_STRING BZ_XSTR(PORT_SERVER)
+#define BZ_PROTOCOL_VERSION 24 // v24 lobby slot ready flag; v23 cinematic filter UVs and wrap flags; v22 cinematic filter blend mode; v21 cinematic filter player state; v20 sequenced UDP netchan
+
+
+typedef struct entityState_s entityState_t;
+
+typedef enum {
+    NA_LOOPBACK,
+    NA_BROADCAST,
+    NA_IP,
+    NA_EOS,
+    NA_IPX,
+    NA_BROADCAST_IPX
+} netadrtype_t;
+
+typedef enum {
+    NS_CLIENT, NS_SERVER
+} NETSOURCE;
+
+typedef struct sizeBuf_s {
+    uint8_t *data;
+    uint32_t maxsize;
+    uint32_t cursize;
+    uint32_t readcount;
+    bool overflowed;
+} sizeBuf_t;
+
+typedef struct {
+    netadrtype_t type;
+    uint8_t ip[4];
+    uint8_t ipx[10];
+    unsigned short port;        // stored in network byte order
+    char peer[33];              // EOS Product User ID, lowercase hex; never an IP alias
+} netadr_t;
+
+#define NETCHAN_HEADER_SIZE 8 // bytes; sequence word then acknowledge word, on sequenced (NA_IP) packets only
+#define NETCHAN_RELIABLE_MAX (16 * 1024) // bytes; one reliable message in flight plus one being built
+
+/* Quake 2 netchan. message is the unreliable stream (frames, sounds, layouts): sent once, never resent. reliable
+ * is the reliable stream (live configstrings, a client's "nodelta"): resent until the peer acknowledges it. Only
+ * NA_IP is sequenced; loopback and EOS (reliable-ordered) deliver every packet in order, so they carry no header and
+ * the reliable stream rides in front of the message, or in its own packet just before it when both do not fit. */
+struct netchan {
+    netadr_t remote_address;    // where packets are sent/expected from
+    sizeBuf_t message;
+    uint8_t message_buf[MAX_MSGLEN];
+    sizeBuf_t reliable;         // lazily initialised by Netchan_Reliable
+    uint8_t reliable_buf[NETCHAN_RELIABLE_MAX];
+    uint8_t inflight_buf[NETCHAN_RELIABLE_MAX];
+    uint32_t inflight_length;
+    uint32_t outgoing_sequence, incoming_sequence, incoming_acknowledged;
+    uint32_t last_reliable_sequence;
+    uint32_t unreliable_sequence; // the last packet that carried the unreliable message
+    uint32_t dropped;           // packets lost between the last two accepted packets
+    uint8_t reliable_sequence, incoming_reliable_sequence, incoming_reliable_acknowledged; // alternating 0/1 bits
+    bool ack_owed;              // the last accepted packet carried data the peer is waiting to hear acknowledged
+};
+
+// Initialise loopback state. UDP sockets are opened lazily by NET_Config().
+void NET_Init(void);
+void NET_Config(bool multiplayer);
+void NET_ConfigSource(NETSOURCE netsrc, bool open);
+bool NET_IsConfigured(NETSOURCE netsrc);
+void NET_Shutdown(void);
+
+// Parse "host", "host:port" or "eos:<ProductUserId>" into a netadr_t. default_port is used
+// when no port is present in the string.  Returns true on success.
+bool NET_StringToAdr(cstring_t s, unsigned short default_port, netadr_t *adr);
+cstring_t NET_AdrToString(netadr_t const *adr);
+bool NET_CompareAdr(netadr_t const *a, netadr_t const *b);
+// LAN discovery targets on this host's private IPv4 networks: every other address of each
+// interface's /24 (narrower masks keep their own range) plus its directed broadcast. Unicast
+// works where limited broadcast is filtered (iPadOS without the multicast entitlement).
+uint32_t NET_LANDiscoveryTargets(unsigned short port, netadr_t *out, uint32_t max);
+
+// Send a packet.  Routes to the loopback buffer (NA_LOOPBACK) or the
+// UDP socket (NA_IP / NA_BROADCAST) or EOS P2P (NA_EOS), based on to.type.
+void NET_SendPacket(NETSOURCE netsrc, int length, void const *data, netadr_t to);
+
+// Receive one packet.  Checks the loopback buffer first, then the UDP
+// socket.  Fills *from with the sender's address.  Returns packet size
+// (> 0) on success, 0 when no packet is available.
+int NET_GetPacket(NETSOURCE netsrc, netadr_t *from, sizeBuf_t *msg);
+int NET_GetLoopPacket(NETSOURCE netsrc, netadr_t *from, sizeBuf_t *msg);
+void NET_ClearLoopPackets(NETSOURCE netsrc);
+
+uint32_t Netchan_Transmit(NETSOURCE netsrc, struct netchan *netchan); // bytes sent, headers included
+// Tests divert every outgoing packet (any address type) into a simulated link; NULL restores real routing.
+void NET_SetPacketHook(void (*hook)(NETSOURCE netsrc, int length, void const *data, netadr_t to));
+uint32_t Netchan_BuildPacket(struct netchan *netchan, uint8_t *out, uint32_t out_size);
+sizeBuf_t *Netchan_Reliable(struct netchan *netchan);
+bool Netchan_IsSequenced(struct netchan const *netchan);
+void Netchan_Reset(struct netchan *netchan);
+bool Netchan_Process(struct netchan *netchan, sizeBuf_t *msg); // false: stale, duplicate or malformed; drop it
+void Netchan_OutOfBand(NETSOURCE netsrc, netadr_t adr, uint32_t length, uint8_t *data);
+void Netchan_OutOfBandPrint(NETSOURCE netsrc, netadr_t adr, cstring_t format, ...);
+
+void MSG_Write(sizeBuf_t *buf, void const *value, uint32_t size);
+void MSG_WriteByte(sizeBuf_t *buf, int value);
+void MSG_WriteShort(sizeBuf_t *buf, int value);
+void MSG_WriteLong(sizeBuf_t *buf, int value);
+void MSG_WriteFloat(sizeBuf_t *buf, float value);
+void MSG_WriteFloat2(sizeBuf_t *buf, float value);
+void MSG_WriteString(sizeBuf_t *buf, cstring_t value);
+void MSG_WriteDeltaEntity(sizeBuf_t *buf, entityState_t const *from, entityState_t const *to, bool force);
+void MSG_WriteDeltaUIFrame(sizeBuf_t *msg, uiFrame_t const *from, uiFrame_t const *to, bool force);
+void MSG_WriteDeltaUIWindowFrame(sizeBuf_t *msg, uiFrame_t const *from, uiFrame_t const *to, bool force);
+void MSG_WriteDeltaPlayerState(sizeBuf_t *msg, player_t const *from, player_t const *to);
+void MSG_WriteEntityBits(sizeBuf_t *buf, uint32_t bits, uint32_t number);
+void MSG_WritePlayerBits(sizeBuf_t *buf, uint32_t bits, uint32_t number);
+void MSG_WriteInput(sizeBuf_t *buf, inputCmd_t const *cmd);
+bool MSG_ReadInput(sizeBuf_t *buf, inputCmd_t *cmd);
+void MSG_WritePos(sizeBuf_t *buf, vec3_t const *pos);
+void MSG_WriteDir(sizeBuf_t *buf, vec3_t const *dir);
+void MSG_WriteAngle(sizeBuf_t *buf, float f);
+
+int MSG_Read(sizeBuf_t *buf, handle_t value, uint32_t size);
+int MSG_ReadByte(sizeBuf_t *buf);
+int MSG_ReadShort(sizeBuf_t *buf);
+int MSG_ReadLong(sizeBuf_t *buf);
+float MSG_ReadFloat(sizeBuf_t *buf);
+void MSG_ReadString(sizeBuf_t *buf, string_t value);
+void MSG_ReadStringN(sizeBuf_t *buf, string_t value, int maxlen);
+void MSG_ReadPos(sizeBuf_t *buf, vec3_t *pos);
+void MSG_ReadDir(sizeBuf_t *buf, vec3_t *dir);
+float MSG_ReadAngle(sizeBuf_t *buf);
+cstring_t MSG_ReadString2(sizeBuf_t *buf);
+void MSG_ReadDeltaEntity(sizeBuf_t *buf, entityState_t *edict, int number, int bits);
+void MSG_ReadDeltaUIFrame(sizeBuf_t *msg, uiFrame_t *edict, int number, int bits);
+bool MSG_ReadDeltaUIWindowFrame(sizeBuf_t *msg, uiFrame_t *edict, int number, int bits);
+void MSG_ReadDeltaPlayerState(sizeBuf_t *msg, player_t *edict, int number, int bits);
+int MSG_ReadEntityBits(sizeBuf_t *msg, uint32_t *bits);
+int MSG_ReadPlayerBits(sizeBuf_t *msg, uint32_t *bits);
+
+handle_t SZ_GetSpace(sizeBuf_t *buf, uint32_t length);
+void SZ_Write(sizeBuf_t *buf, void const *data, uint32_t length);
+void SZ_Printf(sizeBuf_t *msg, cstring_t fmt, ...);
+void SZ_Init(sizeBuf_t *buf, uint8_t *data, uint32_t length);
+void SZ_Clear(sizeBuf_t *buf);
+
+#endif

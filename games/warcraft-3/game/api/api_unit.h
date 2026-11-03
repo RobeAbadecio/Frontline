@@ -1,0 +1,1436 @@
+extern player_t *currentplayer;
+
+static uint32_t const order_ugol = BZ_WC3_UNIT_HAUNTED_GOLD_MINE;
+static uint32_t const unit_ngol = BZ_WC3_UNIT_GOLD_MINE;
+
+#define UNIT_TYPED_ACCESS(NAME, FIELD, TYPE) \
+uint32_t SetUnit##NAME(jass_t *j) {  \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");  \
+    if (whichUnit) { \
+        memcpy(&whichUnit->FIELD, jass_checkhandle(j, 2, #TYPE), sizeof(whichUnit->FIELD)); \
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty(); \
+        gi.LinkEntity(whichUnit); \
+    } \
+    return 0; \
+}  \
+uint32_t GetUnit##NAME(jass_t *j) {  \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");  \
+    return whichUnit ? jass_pushlighthandle(j, &whichUnit->FIELD, #TYPE) : jass_pushnullhandle(j, #TYPE); \
+}
+
+#define UNIT_ACCESS(NAME, FIELD) \
+uint32_t SetUnit##NAME(jass_t *j) {  \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");  \
+    if (whichUnit) { \
+        whichUnit->FIELD = jass_checknumber(j, 2); \
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty(); \
+    } \
+    return 0; \
+}  \
+uint32_t GetUnit##NAME(jass_t *j) {  \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");  \
+    return jass_pushnumber(j, whichUnit ? whichUnit->FIELD : 0); \
+}
+
+#define UNITINFO_ACCESS(FIELD) UNIT_ACCESS(FIELD, unitinfo.FIELD)
+
+#define UNIT_POSITION_ACCESS(NAME, FIELD) \
+uint32_t SetUnit##NAME(jass_t *j) { \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit"); \
+    if (whichUnit) { \
+        vec2_t old_position = whichUnit->s.origin2; \
+        whichUnit->FIELD = jass_checknumber(j, 2); \
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty(); \
+        gi.LinkEntity(whichUnit); \
+        G_UnitPositionChanged(whichUnit, &old_position); \
+    } \
+    return 0; \
+} \
+uint32_t GetUnit##NAME(jass_t *j) { \
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit"); \
+    return jass_pushnumber(j, whichUnit ? whichUnit->FIELD : 0); \
+}
+
+UNIT_POSITION_ACCESS(X, s.origin.x);
+UNIT_POSITION_ACCESS(Y, s.origin.y);
+#undef UNIT_POSITION_ACCESS
+
+uint32_t SetUnitPositionLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    vec2_t const *whichLocation = jass_checkhandle(j, 2, "location");
+    vec2_t position;
+
+    if (whichUnit && whichLocation) {
+        vec2_t old_position = whichUnit->s.origin2;
+        G_FindUnitUnstuckPosition(whichUnit, whichLocation, &position);
+        whichUnit->s.origin.x = position.x;
+        whichUnit->s.origin.y = position.y;
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+        gi.LinkEntity(whichUnit);
+        G_UnitPositionChanged(whichUnit, &old_position);
+    }
+    return 0;
+}
+uint32_t GetUnitPositionLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return whichUnit ? jass_pushlighthandle(j, &whichUnit->s.origin2, "location") : jass_pushnullhandle(j, "location");
+}
+UNITINFO_ACCESS(MoveSpeed);
+
+uint32_t SetUnitFlyHeight(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float const newHeight = jass_checknumber(j, 2);
+    (void)jass_checknumber(j, 3); /* Warsmash currently ignores rate too. */
+    if (whichUnit) {
+        whichUnit->unitinfo.FlyHeight = newHeight;
+        M_CheckGround(whichUnit);
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+        gi.LinkEntity(whichUnit);
+    }
+    return 0;
+}
+
+uint32_t GetUnitFlyHeight(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit ? whichUnit->unitinfo.FlyHeight : 0);
+}
+UNITINFO_ACCESS(TurnSpeed);
+UNITINFO_ACCESS(AcquireRange);
+
+/* UnitData.uprw is authored in degrees, while the native setter/getter use
+ * radians. Keep the runtime value in native units for movement and JASS. */
+uint32_t SetUnitPropWindow(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (whichUnit) whichUnit->unitinfo.PropWindow = (float)jass_checknumber(j, 2);
+    return 0;
+}
+uint32_t GetUnitPropWindow(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit ? whichUnit->unitinfo.PropWindow : 0);
+}
+
+uint32_t GetUnitFacing(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (!whichUnit) {
+        return jass_pushnumber(j, 0);
+    }
+    float facingAngle = whichUnit->s.angle;
+    jass_pushnumber(j, RAD2DEG(facingAngle));
+    return 1;
+}
+
+uint32_t SetUnitFacing(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float facingAngle = jass_checknumber(j, 2);
+    if (whichUnit) whichUnit->s.angle = DEG2RAD(facingAngle);
+    return 0;
+}
+
+uint32_t SetUnitFacingTimed(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float facingAngle = jass_checknumber(j, 2);
+//    float duration = jass_checknumber(j, 3);
+    if (whichUnit) whichUnit->s.angle = DEG2RAD(facingAngle);
+    return 0;
+}
+
+uint32_t KillUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    /* KillUnit is a death transition, not a raw life write; unit_die owns the death animation, events, and cleanup. */
+    if (whichUnit && whichUnit->inuse && !(whichUnit->svflags & SVF_DEADMONSTER)) {
+        unit_die(whichUnit, NULL);
+    }
+    return 0;
+}
+uint32_t RemoveUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (whichUnit) {
+        gameClient_t *owner = G_GetPlayerClientByNumber(whichUnit->s.player);
+        if (owner && owner->ps.number == whichUnit->s.player) G_InvalidateCommands(owner);
+        G_DeferFreeEdict(whichUnit);
+    }
+    return 0;
+}
+uint32_t ShowUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool show = jass_checkboolean(j, 2);
+    bool was_hidden;
+    bool is_hidden;
+    if (!whichUnit) {
+        return 0;
+    }
+    if (show && !G_UnitIsWorldActive(whichUnit)) {
+        return 0;
+    }
+    was_hidden = !!(whichUnit->s.renderfx & RF_HIDDEN);
+    if (show) {
+        whichUnit->s.renderfx &= ~RF_HIDDEN;
+    } else {
+        whichUnit->s.renderfx |= RF_HIDDEN;
+    }
+    is_hidden = !!(whichUnit->s.renderfx & RF_HIDDEN);
+    if (was_hidden != is_hidden) {
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+        /* Visibility is part of both Hero-shortcut and idle-worker eligibility.
+         * Rebuild only on a real transition; the shared hook cheaply rejects
+         * ordinary non-Hero/non-worker units. */
+        G_InvalidateUnitShortcuts(G_GetPlayerClientByNumber(whichUnit->s.player));
+    }
+    return 0;
+}
+
+uint32_t SetUnitState(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    UNITSTATE *whichUnitState = jass_checkhandle(j, 2, "unitstate");
+    float newVal = jass_checknumber(j, 3);
+    float oldLife;
+    bool was_dead;
+    if (!whichUnit || !whichUnitState) {
+        return 0;
+    }
+    was_dead = M_IsDead(whichUnit);
+    oldLife = whichUnit->health.value;
+    if (*whichUnitState == WC3_UNIT_STATE_LIFE) {
+        G_SetHealth(whichUnit, newVal);
+        /* A JASS life write to zero is a death transition. G_SetHealth updates
+         * the value and state-limit events; unit_die owns death events,
+         * animation, cleanup, and campaign triggers that react to death. */
+        if (oldLife > 0.0f && newVal <= 0.0f && !(whichUnit->svflags & SVF_DEADMONSTER) && whichUnit->die)
+            whichUnit->die(whichUnit, NULL);
+    } else if (*whichUnitState == WC3_UNIT_STATE_MAX_LIFE) {
+        float const old_max = whichUnit->health.max_value;
+        float const ratio = old_max > 0.0f ? whichUnit->health.value / old_max : 0.0f;
+        whichUnit->health.max_value = MAX(0.0f, newVal);
+        G_SetHealth(whichUnit, MIN(whichUnit->health.max_value, whichUnit->health.max_value * ratio));
+    } else if (*whichUnitState == WC3_UNIT_STATE_MANA) {
+        whichUnit->mana.value = MAX(0.0f, MIN(whichUnit->mana.max_value, newVal));
+    } else if (*whichUnitState == WC3_UNIT_STATE_MAX_MANA) {
+        float const old_max = whichUnit->mana.max_value;
+        float const ratio = old_max > 0.0f ? whichUnit->mana.value / old_max : 0.0f;
+        whichUnit->mana.max_value = MAX(0.0f, newVal);
+        whichUnit->mana.value = whichUnit->mana.max_value * ratio;
+    }
+    if ((whichUnit->s.flags & EF_FOW_BLOCKER) && was_dead != M_IsDead(whichUnit)) G_FowMarkBlockersDirty();
+    return 0;
+}
+//uint32_t SetUnitState(jass_t *j) {
+//    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+//    UNITSTATE *whichUnitState = jass_checkhandle(j, 2, "unitstate");
+//    float newVal = jass_checknumber(j, 3);
+//    (&whichUnit->health.value)[*whichUnitState] = newVal;
+//    return 0;
+//}
+uint32_t GetUnitState(jass_t *j) {
+    handle_t first = jass_checkhandle(j, 1, "unit");
+    handle_t second = jass_checkhandle(j, 2, "unitstate");
+    edict_t *whichUnit = NULL;
+    UNITSTATE *whichUnitState = NULL;
+    float value = 0.0f;
+
+    /* Some retail scripts pass (unitstate, unit) to this native via the
+     * Blizzard GetUnitStateSwap wrapper. Identify live edict handles by
+     * membership before dereferencing either argument as a unit. */
+    FILTER_EDICTS(ent, true) {
+        if ((handle_t)ent == first) whichUnit = ent;
+        if ((handle_t)ent == second) whichUnit = ent;
+    }
+    if (whichUnit == (edict_t *)first) whichUnitState = second;
+    else if (whichUnit == (edict_t *)second) whichUnitState = first;
+
+    if (whichUnit && whichUnitState) {
+        switch (*whichUnitState) {
+        case WC3_UNIT_STATE_LIFE: value = whichUnit->health.value; break;
+        case WC3_UNIT_STATE_MAX_LIFE: value = whichUnit->health.max_value; break;
+        case WC3_UNIT_STATE_MANA: value = whichUnit->mana.value; break;
+        case WC3_UNIT_STATE_MAX_MANA: value = whichUnit->mana.max_value; break;
+        }
+    }
+    return jass_pushnumber(j, value);
+}
+uint32_t SetUnitPosition(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    vec2_t requested = MAKE(vec2_t, jass_checknumber(j, 2), jass_checknumber(j, 3));
+    vec2_t position;
+
+    if (whichUnit) {
+        vec2_t old_position = whichUnit->s.origin2;
+        G_FindUnitUnstuckPosition(whichUnit, &requested, &position);
+        whichUnit->s.origin.x = position.x;
+        whichUnit->s.origin.y = position.y;
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+        gi.LinkEntity(whichUnit);
+        G_UnitPositionChanged(whichUnit, &old_position);
+    }
+    return 0;
+}
+uint32_t GetUnitDefaultAcquireRange(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit ? whichUnit->unitinfo.AcquireRange : 0);
+}
+uint32_t GetUnitDefaultTurnSpeed(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit ? whichUnit->unitinfo.TurnSpeed : 0);
+}
+uint32_t GetUnitDefaultPropWindow(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit && whichUnit->data.UnitData
+        ? whichUnit->data.UnitData->propWin : 0);
+}
+uint32_t GetUnitDefaultFlyHeight(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushnumber(j, whichUnit && whichUnit->data.UnitData
+        ? whichUnit->data.UnitData->moveHeight : 0);
+}
+uint32_t SetUnitOwner(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t const *whichPlayer = jass_checkhandle(j, 2, "player");
+    bool change_color = jass_checkboolean(j, 3);
+    if (whichUnit && whichPlayer) {
+        uint32_t const previous_player = whichUnit->s.player;
+        uint32_t const previous_color = G_GetUnitTeamColor(whichUnit);
+        if (G_UnitIsHero(whichUnit) && previous_player != PLAYER_NUM(whichPlayer))
+            BZ_WC3_SCORE_LOG("score hero lifecycle event=owner_change rawcode=%08x entity=%u from=%u to=%u level=%u xp=%u",
+                whichUnit->class_id, whichUnit->s.number, previous_player,
+                PLAYER_NUM(whichPlayer), whichUnit->unit_state->hero.level, whichUnit->unit_state->hero.xp);
+        G_SetUnitPlayer(whichUnit, PLAYER_NUM(whichPlayer));
+        if (change_color) {
+            G_ClearUnitColorOverride(whichUnit);
+            G_SetUnitTeamColor(whichUnit, whichPlayer->color);
+        } else if (previous_player != PLAYER_NUM(whichPlayer)) {
+            G_SetUnitColorOverride(whichUnit, previous_color);
+        }
+    }
+    return 0;
+}
+uint32_t SetUnitColor(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t *pColor = jass_checkhandle(j, 2, "playercolor");
+    if (whichUnit && pColor) G_SetUnitColorOverride(whichUnit, *pColor);
+    return 0;
+}
+uint32_t SetUnitScale(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float scaleX = jass_checknumber(j, 2);
+    (void)jass_checknumber(j, 3);
+    (void)jass_checknumber(j, 4);
+    if (whichUnit) {
+        /* Warsmash applies WC3's XYZ API as uniform model scale from X. */
+        whichUnit->s.scale = scaleX;
+        if (whichUnit->s.flags & EF_FOW_BLOCKER) G_FowMarkBlockersDirty();
+    }
+    return 0;
+}
+uint32_t SetUnitTimeScale(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float timeScale = jass_checknumber(j, 2);
+
+    if (whichUnit) whichUnit->animation_speed = MAX(0.0f, timeScale);
+    return 0;
+}
+uint32_t SetUnitBlendTime(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //float blendTime = jass_checknumber(j, 2);
+    return 0;
+}
+/* Store the clamped persistent RGBA override consumed by the WC3 presentation datagram. */
+uint32_t SetUnitVertexColor(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t red = jass_checkinteger(j, 2);
+    int32_t green = jass_checkinteger(j, 3);
+    int32_t blue = jass_checkinteger(j, 4);
+    int32_t alpha = jass_checkinteger(j, 5);
+    if (whichUnit) {
+        whichUnit->vertex_color = MAKE(color32_t,
+            BZ_CLAMP_U8(red), BZ_CLAMP_U8(green), BZ_CLAMP_U8(blue), BZ_CLAMP_U8(alpha));
+        G_SetUnitFlag(whichUnit, UNIT_FLAG_VERTEX_COLOR_SET, true);
+        G_SetUnitFlag(whichUnit, UNIT_FLAG_VERTEX_COLOR_OVERRIDE_SET, true);
+    }
+    return 0;
+}
+uint32_t SetUnitUserData(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (whichUnit) whichUnit->user_data = jass_checkinteger(j, 2);
+    return 0;
+}
+uint32_t GetUnitUserData(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? whichUnit->user_data : 0);
+}
+/* BZ_COMPAT_GUESS: retail does not document the return contract for null or
+ * repeated requests.  For a valid unit, report success.  The getter always
+ * reports the stored flag; this only mutes alarms, never retaliation/damage. */
+uint32_t UnitIgnoreAlarm(jass_t *j) {
+    edict_t *unit = jass_checkhandle(j, 1, "unit");
+    bool ignore = jass_checkboolean(j, 2);
+    if (unit && unit->inuse) G_SetUnitFlag(unit, UNIT_FLAG_IGNORE_ALARM, ignore);
+    return jass_pushboolean(j, unit && unit->inuse);
+}
+uint32_t UnitIgnoreAlarmToggled(jass_t *j) {
+    edict_t *unit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, unit && unit->inuse && G_UnitHasFlag(unit, UNIT_FLAG_IGNORE_ALARM));
+}
+uint32_t UnitSetUsesAltIcon(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (whichUnit) G_SetUnitFlag(whichUnit, UNIT_FLAG_USES_ALT_ICON, jass_checkboolean(j, 2));
+    return 0;
+}
+uint32_t QueueUnitAnimation(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //cstring_t whichAnimation = jass_checkstring(j, 2);
+    return 0;
+}
+uint32_t SetUnitAnimation(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t whichAnimation = jass_checkstring(j, 2);
+    if (whichUnit) G_SetUnitAnimation(whichUnit, whichAnimation);
+    return 0;
+}
+uint32_t SetUnitAnimationByIndex(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //int32_t whichAnimation = jass_checkinteger(j, 2);
+    return 0;
+}
+uint32_t SetUnitAnimationWithRarity(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t whichAnimation = jass_checkstring(j, 2);
+    uint32_t *rarity = jass_checkhandle(j, 3, "raritycontrol");
+    animation_t const *animation;
+
+    if (whichUnit && whichAnimation) {
+        animation = G_GetAnimationVariant(whichUnit->s.model, whichAnimation, rarity && *rarity == 1);
+        G_SetUnitAnimation(whichUnit, whichAnimation);
+        if (animation) {
+            whichUnit->animation = animation;
+            whichUnit->s.frame = animation->interval[0];
+            G_SetUnitFlag(whichUnit, UNIT_FLAG_ANIMATION_OVERRIDE, true);
+        }
+    }
+    return 0;
+}
+uint32_t AddUnitAnimationProperties(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t animProperties = jass_checkstring(j, 2);
+    bool add = jass_checkboolean(j, 3);
+    if (whichUnit) G_AddUnitAnimationProperties(whichUnit, animProperties, add);
+    return 0;
+}
+
+//JASS_API(SetUnitLookAt,
+//(EDICT, whichUnit, "unit"),
+//(string, whichBone),
+//(EDICT, lookAtTarget, "unit"),
+//(number, offsetX),
+//(number, offsetY),
+//(number, offsetZ))
+//{
+//}
+uint32_t SetUnitLookAt(jass_t *j) {
+//    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+//    cstring_t whichBone = jass_checkstring(j, 2);
+//    handle_t lookAtTarget = jass_checkhandle(j, 3, "unit");
+//    float offsetX = jass_checknumber(j, 4);
+//    float offsetY = jass_checknumber(j, 5);
+//    float offsetZ = jass_checknumber(j, 6);
+    return 0;
+}
+uint32_t ResetUnitLookAt(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return 0;
+}
+uint32_t SetUnitRescuable(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t byWhichPlayer = jass_checkhandle(j, 2, "player");
+    //bool flag = jass_checkboolean(j, 3);
+    return 0;
+}
+uint32_t SetUnitRescueRange(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //float range = jass_checknumber(j, 2);
+    return 0;
+}
+uint32_t SetHeroStr(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t newStr = jass_checkinteger(j, 2);
+//    bool permanent = jass_checkboolean(j, 3);
+    if (whichHero) { G_InitUnitState(whichHero); whichHero->unit_state->hero.str = (uint32_t)MAX(0, newStr); G_RecomputeHeroStats(whichHero); }
+    return 0;
+}
+uint32_t SetHeroAgi(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t newAgi = jass_checkinteger(j, 2);
+//    bool permanent = jass_checkboolean(j, 3);
+    if (whichHero) { G_InitUnitState(whichHero); whichHero->unit_state->hero.agi = (uint32_t)MAX(0, newAgi); G_RecomputeHeroStats(whichHero); }
+    return 0;
+}
+uint32_t SetHeroInt(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t newInt = jass_checkinteger(j, 2);
+//    bool permanent = jass_checkboolean(j, 3);
+    if (whichHero) { G_InitUnitState(whichHero); whichHero->unit_state->hero.intel = (uint32_t)MAX(0, newInt); G_RecomputeHeroStats(whichHero); }
+    return 0;
+}
+uint32_t GetHeroXP(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichHero && whichHero->unit_state ? (int32_t)whichHero->unit_state->hero.xp : 0);
+}
+uint32_t SetHeroXP(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t newXpVal = jass_checkinteger(j, 2);
+//    bool showEyeCandy = jass_checkboolean(j, 3);
+    if (whichHero && !whichHero->unit_state->hero.suspend_xp) {
+        G_HeroSetXP(whichHero, (uint32_t)MAX(0, newXpVal));
+    }
+    return 0;
+}
+uint32_t GetHeroSkillPoints(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t const points = whichHero && whichHero->data.UnitBalance && G_UnitIsHero(whichHero)
+        ? (int32_t)whichHero->unit_state->hero.skillpoints : 0;
+    return jass_pushinteger(j, points);
+}
+uint32_t UnitModifySkillPoints(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t const delta = jass_checkinteger(j, 2);
+    bool const result = G_HeroModifySkillPoints(whichHero, delta);
+    return jass_pushboolean(j, result);
+}
+uint32_t AddHeroXP(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t xpToAdd = jass_checkinteger(j, 2);
+//    bool showEyeCandy = jass_checkboolean(j, 3);
+    if (whichHero && !whichHero->unit_state->hero.suspend_xp && xpToAdd > 0) {
+        uint32_t add = (uint32_t)xpToAdd;
+        uint32_t cur = whichHero->unit_state->hero.xp;
+        /* Cap at INT32_MAX so GetHeroXP (signed return) never reads negative. */
+        uint32_t sum = cur + add;
+        G_HeroSetXP(whichHero, (sum < cur || sum > (uint32_t)INT32_MAX) ? (uint32_t)INT32_MAX : sum);
+    }
+    return 0;
+}
+uint32_t UnitStripHeroLevel(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t const levels = jass_checkinteger(j, 2);
+    return jass_pushboolean(j, levels > 0 && G_HeroStripLevels(whichHero, (uint32_t)levels));
+}
+uint32_t SetHeroLevelBJ(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t const newLevel = jass_checkinteger(j, 2);
+    /* The Blizzard.j wrapper uses SetHeroLevel for raises and the strip
+     * native for reductions. The third showEyeCandy argument applies only
+     * to the raise path and is currently a presentation TODO. */
+    if (!whichHero || !G_UnitIsHero(whichHero)) return 0;
+    if (newLevel < (int32_t)whichHero->unit_state->hero.level) {
+        int64_t const remove = (int64_t)whichHero->unit_state->hero.level - newLevel;
+        G_HeroStripLevels(whichHero, (uint32_t)MIN(remove, (int64_t)UINT32_MAX));
+    } else if (newLevel > (int32_t)whichHero->unit_state->hero.level) {
+        uint32_t const target = MIN((uint32_t)newLevel, G_MaxHeroLevel());
+        G_HeroSetXPForLevel(whichHero, MAX(whichHero->unit_state->hero.xp, G_HeroXPForLevel(target)));
+    }
+    return 0;
+}
+uint32_t SetHeroLevel(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t level = jass_checkinteger(j, 2);
+//    bool showEyeCandy = jass_checkboolean(j, 3);
+    if (whichHero && level > (int32_t)whichHero->unit_state->hero.level) {
+        /* WC3 SetHeroLevel raises the level by granting enough XP to reach it
+         * (level only increases). Route through the XP transition so skill
+         * points and both Hero-level event families per crossed level stay
+         * identical to ordinary XP gains. */
+        uint32_t const target = MIN((uint32_t)level, G_MaxHeroLevel());
+        uint32_t const need = G_HeroXPForLevel(target);
+        G_HeroSetXPForLevel(whichHero, MAX(whichHero->unit_state->hero.xp, need));
+    }
+    return 0;
+}
+uint32_t GetHeroLevel(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichHero ? whichHero->unit_state->hero.level : 0);
+}
+uint32_t SuspendHeroXP(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    bool flag = jass_checkboolean(j, 2);
+    if (whichHero) { G_InitUnitState(whichHero); whichHero->unit_state->hero.suspend_xp = flag; }
+    return 0;
+}
+uint32_t IsSuspendedXP(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichHero && whichHero->unit_state->hero.suspend_xp);
+}
+uint32_t SelectHeroSkill(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    int32_t abilcode = jass_checkinteger(j, 2);
+    if (whichHero) {
+        G_HeroLearnSkill(whichHero, (uint32_t)abilcode);
+    }
+    return 0;
+}
+uint32_t GetUnitAbilityLevel(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t abilcode = jass_checkinteger(j, 2);
+    return jass_pushinteger(j, whichUnit ? (int32_t)G_UnitAbilityLevel(whichUnit, (uint32_t)abilcode) : 0);
+}
+uint32_t SetUnitAbilityLevel(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t abilcode = jass_checkinteger(j, 2);
+    int32_t level = jass_checkinteger(j, 3);
+    return jass_pushinteger(j, whichUnit ? (int32_t)G_UnitSetAbilityLevel(whichUnit, (uint32_t)abilcode, level) : 0);
+}
+uint32_t IncUnitAbilityLevel(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t abilcode = jass_checkinteger(j, 2);
+    uint32_t cur;
+    if (!whichUnit) return jass_pushinteger(j, 0);
+    cur = G_UnitAbilityLevel(whichUnit, (uint32_t)abilcode);
+    if (!cur) return jass_pushinteger(j, 0);
+    return jass_pushinteger(j, (int32_t)G_UnitSetAbilityLevel(whichUnit, (uint32_t)abilcode, (int32_t)cur + 1));
+}
+uint32_t GetHeroStr(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    bool includeBonuses = jass_checkboolean(j, 2);
+    (void)includeBonuses; /* TODO: attribute bonuses from items/auras are not tracked separately yet. */
+    return jass_pushinteger(j, whichHero && whichHero->unit_state ? (int32_t)whichHero->unit_state->hero.str : 0);
+}
+uint32_t GetHeroAgi(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    bool includeBonuses = jass_checkboolean(j, 2);
+    (void)includeBonuses;
+    return jass_pushinteger(j, whichHero && whichHero->unit_state ? (int32_t)whichHero->unit_state->hero.agi : 0);
+}
+uint32_t GetHeroInt(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    bool includeBonuses = jass_checkboolean(j, 2);
+    (void)includeBonuses;
+    return jass_pushinteger(j, whichHero && whichHero->unit_state ? (int32_t)whichHero->unit_state->hero.intel : 0);
+}
+uint32_t GetUnitLevel(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (!whichUnit) return jass_pushinteger(j, 0);
+    if (G_UnitIsHero(whichUnit)) return jass_pushinteger(j, (int32_t)whichUnit->unit_state->hero.level);
+    return jass_pushinteger(j, whichUnit->data.UnitBalance ? whichUnit->data.UnitBalance->level : 0);
+}
+uint32_t GetUnitCurrentOrder(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? (int32_t)G_GetCurrentOrderId(whichUnit) : 0);
+}
+uint32_t UnitInventorySize(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? (int32_t)G_InventoryCapacity(whichUnit) : 0);
+}
+uint32_t UnitDropItemPoint(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichItem = jass_checkhandle(j, 2, "item");
+    float x = jass_checknumber(j, 3);
+    float y = jass_checknumber(j, 4);
+    int32_t slot;
+    if (!whichUnit || !G_IsItem(whichItem) || whichItem->item->carrier != whichUnit)
+        return jass_pushboolean(j, 0);
+    slot = whichItem->item->inventory_slot;
+    if (slot < 0) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, G_DropItemAtScripted(whichUnit, (uint32_t)slot, &MAKE(vec2_t, x, y)));
+}
+uint32_t UnitDropItemTarget(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichItem = jass_checkhandle(j, 2, "item");
+    edict_t *target = jass_checkhandle(j, 3, "widget");
+    return jass_pushboolean(j, G_OrderGiveItemTarget(whichUnit, whichItem, target));
+}
+uint32_t UnitDamageTarget(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *target = jass_checkhandle(j, 2, "widget");
+    float amount = jass_checknumber(j, 3);
+    /* attack/ranged/attackType/damageType/weaponType are accepted but not yet modeled. */
+    (void)jass_checkboolean(j, 4);
+    (void)jass_checkboolean(j, 5);
+    (void)jass_checkhandle(j, 6, "attacktype");
+    (void)jass_checkhandle(j, 7, "damagetype");
+    (void)jass_checkhandle(j, 8, "weapontype");
+    if (!whichUnit || !target || amount <= 0.0f) return jass_pushboolean(j, 0);
+    if (G_UnitHasFlag(target, UNIT_FLAG_INVULNERABLE) || M_IsDead(target)) return jass_pushboolean(j, 0);
+    T_Damage(target, whichUnit, (int)amount);
+    return jass_pushboolean(j, 1);
+}
+uint32_t UnitAddType(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t *whichUnitType = jass_checkhandle(j, 2, "unittype");
+    if (!whichUnit || !whichUnitType || *whichUnitType >= 32) return jass_pushboolean(j, 0);
+    whichUnit->script_unit_types |= (1u << *whichUnitType);
+    return jass_pushboolean(j, 1);
+}
+uint32_t UnitRemoveType(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t *whichUnitType = jass_checkhandle(j, 2, "unittype");
+    if (!whichUnit || !whichUnitType || *whichUnitType >= 32) return jass_pushboolean(j, 0);
+    whichUnit->script_unit_types &= ~(1u << *whichUnitType);
+    return jass_pushboolean(j, 1);
+}
+uint32_t UnitCountBuffsEx(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool timedLife;
+    int32_t count = 0;
+    /* TODO: positive/negative/magic/physical/aura/autoDispel filters need buff-type metadata. */
+    (void)jass_checkboolean(j, 2); (void)jass_checkboolean(j, 3);
+    (void)jass_checkboolean(j, 4); (void)jass_checkboolean(j, 5);
+    timedLife = jass_checkboolean(j, 6);
+    (void)jass_checkboolean(j, 7); (void)jass_checkboolean(j, 8);
+    if (!whichUnit) return jass_pushinteger(j, 0);
+    FOR_LOOP(i, whichUnit->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t const *s = whichUnit->unit_state->statuses + i;
+        if (!s->level) continue;
+        if (timedLife && s->code != MAKEFOURCC('B', 'T', 'L', 'F')) continue;
+        count++;
+    }
+    return jass_pushinteger(j, count);
+}
+uint32_t UnitPauseTimedLife(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool flag = jass_checkboolean(j, 2);
+    uint32_t now;
+    if (!whichUnit || G_UnitHasFlag(whichUnit, UNIT_FLAG_TIMED_LIFE_PAUSED) == flag) return 0;
+    now = G_Time();
+    FOR_LOOP(i, whichUnit->unit_state ? MAX_UNIT_STATUSES : 0) {
+        heroabilitystatus_t *s = whichUnit->unit_state->statuses + i;
+        if (!s->level || s->code != MAKEFOURCC('B', 'T', 'L', 'F')) continue;
+        if (flag) {
+            s->data = s->timestamp > now ? s->timestamp - now : 0;
+            s->timestamp = 0;
+        } else if (s->data) {
+            s->timestamp = now + s->data;
+            s->data = 0;
+        }
+    }
+    G_SetUnitFlag(whichUnit, UNIT_FLAG_TIMED_LIFE_PAUSED, flag);
+    return 0;
+}
+uint32_t UnitResetCooldown(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    S_SpellResetCooldowns(whichUnit);
+    return 0;
+}
+
+uint32_t BlzGetUnitAbilityCooldownRemaining(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t const abilityId = (uint32_t)jass_checkinteger(j, 2);
+    return jass_pushnumber(j, S_SpellCooldownRemaining(whichUnit, abilityId));
+}
+
+uint32_t BlzEndUnitAbilityCooldown(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t const abilityId = (uint32_t)jass_checkinteger(j, 2);
+    S_SpellEndCooldown(whichUnit, abilityId);
+    return 0;
+}
+
+uint32_t BlzStartUnitAbilityCooldown(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t const abilityId = (uint32_t)jass_checkinteger(j, 2);
+    float const cooldown = jass_checknumber(j, 3);
+    S_SpellStartCooldownDuration(whichUnit, abilityId, cooldown);
+    return 0;
+}
+
+uint32_t ReviveHero(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    float x = jass_checknumber(j, 2);
+    float y = jass_checknumber(j, 3);
+    //bool doEyecandy = jass_checkboolean(j, 4);
+    return jass_pushboolean(j, G_ReviveHero(whichHero, x, y));
+}
+uint32_t ReviveHeroLoc(jass_t *j) {
+    edict_t *whichHero = jass_checkhandle(j, 1, "unit");
+    vec2_t const *location = jass_checkhandle(j, 2, "location");
+    //bool doEyecandy = jass_checkboolean(j, 3);
+    return jass_pushboolean(j, whichHero && location &&
+        G_ReviveHero(whichHero, location->x, location->y));
+}
+uint32_t SetUnitExploded(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool exploded = jass_checkboolean(j, 2);
+    if (whichUnit && !(whichUnit->svflags & SVF_DEADMONSTER)) {
+        if (exploded) whichUnit->aiflags |= AI_SCRIPT_EXPLODED;
+        else whichUnit->aiflags &= ~AI_SCRIPT_EXPLODED;
+    }
+    return 0;
+}
+uint32_t SetUnitInvulnerable(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool flag = jass_checkboolean(j, 2);
+    if (whichUnit) G_SetUnitFlag(whichUnit, UNIT_FLAG_INVULNERABLE, flag);
+    return 0;
+}
+uint32_t PauseUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool flag = jass_checkboolean(j, 2);
+    if (whichUnit) G_SetUnitFlag(whichUnit, UNIT_FLAG_PAUSED, flag);
+    return 0;
+}
+uint32_t IsUnitPaused(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichUnit && G_UnitHasFlag(whichUnit, UNIT_FLAG_PAUSED));
+}
+uint32_t SetUnitPathing(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool flag = jass_checkboolean(j, 2);
+    if (whichUnit) G_SetUnitFlag(whichUnit, UNIT_FLAG_NO_PATHING, !flag);
+    return 0;
+}
+uint32_t GetUnitPointValue(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, 0);
+}
+uint32_t GetUnitPointValueByType(jass_t *j) {
+    //int32_t unitType = jass_checkinteger(j, 1);
+    return jass_pushinteger(j, 0);
+}
+uint32_t UnitAddItem(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichItem = jass_checkhandle(j, 2, "item");
+    if (!whichUnit || !whichItem) return jass_pushboolean(j, false);
+    if (G_ItemAbilityScriptedReattach(whichUnit, whichItem)) return jass_pushboolean(j, true);
+    if (G_IsItem(whichItem) && !whichItem->item->in_world)
+        return jass_pushboolean(j, G_TransferCarriedItem(whichUnit, whichItem));
+    return jass_pushboolean(j, G_PickupItem(whichUnit, whichItem));
+}
+uint32_t UnitAddItemById(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t itemId = jass_checkinteger(j, 2);
+    if (!whichUnit) return jass_pushnullhandle(j, "item");
+    edict_t *item = SP_SpawnAtLocation(itemId, whichUnit->s.player, &whichUnit->s.origin2);
+    if (item && G_PickupItem(whichUnit, item)) {
+        return jass_pushlighthandle(j, item, "item");
+    } else {
+        if (item) G_RemoveItem(item);
+        return jass_pushnullhandle(j, "item");
+    }
+}
+uint32_t UnitAddItemToSlotById(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t itemId = jass_checkinteger(j, 2);
+    int32_t itemSlot = jass_checkinteger(j, 3);
+    if (!whichUnit || itemSlot < 0 || (uint32_t)itemSlot >= G_InventoryCapacity(whichUnit)) {
+        return jass_pushboolean(j, false);
+    }
+    edict_t *item = SP_SpawnAtLocation(itemId, whichUnit->s.player, &whichUnit->s.origin2);
+    if (item && G_AddItemToSlot(whichUnit, item, (uint32_t)itemSlot)) {
+        return jass_pushboolean(j, true);
+    } else {
+        if (item) G_RemoveItem(item);
+        return jass_pushboolean(j, false);
+    }
+}
+uint32_t UnitRemoveItem(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichItem = jass_checkhandle(j, 2, "item");
+    if (!whichUnit || !whichItem) {
+        return 0;
+    }
+    FOR_LOOP(i, MAX_INVENTORY) {
+        if (G_InventoryItem(whichUnit, i) == whichItem) {
+            if (!G_ItemAbilityScriptedRemove(whichUnit, whichItem))
+                G_DropItemAtScripted(whichUnit, i, &whichUnit->s.origin2);
+            break;
+        }
+    }
+    return 0;
+}
+uint32_t UnitRemoveItemFromSlot(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t itemSlot = jass_checkinteger(j, 2);
+    if (!whichUnit || itemSlot < 0 || (uint32_t)itemSlot >= G_InventoryCapacity(whichUnit)) {
+        return jass_pushnullhandle(j, "item");
+    }
+    edict_t *item = G_InventoryItem(whichUnit, itemSlot);
+    if (!item) return jass_pushnullhandle(j, "item");
+    if (!G_ItemAbilityScriptedRemove(whichUnit, item) &&
+        !G_DropItemAtScripted(whichUnit, (uint32_t)itemSlot, &whichUnit->s.origin2)) {
+        return jass_pushnullhandle(j, "item");
+    }
+    return jass_pushlighthandle(j, item, "item");
+}
+uint32_t UnitHasItem(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichItem = jass_checkhandle(j, 2, "item");
+    if (!whichUnit || !whichItem) return jass_pushboolean(j, 0);
+    FOR_LOOP(i, MAX_INVENTORY) {
+        if (G_InventoryItem(whichUnit, i) == whichItem) return jass_pushboolean(j, 1);
+    }
+    return jass_pushboolean(j, 0);
+}
+uint32_t UnitItemInSlot(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t itemSlot = jass_checkinteger(j, 2);
+    if (!whichUnit || itemSlot < 0 || (uint32_t)itemSlot >= G_InventoryCapacity(whichUnit)) {
+        return jass_pushnullhandle(j, "item");
+    }
+    edict_t *item = G_InventoryItem(whichUnit, itemSlot);
+    if (!item) return jass_pushnullhandle(j, "item");
+    return jass_pushlighthandle(j, item, "item");
+}
+uint32_t UnitUseItem(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichItem = jass_checkhandle(j, 2, "item");
+    return jass_pushboolean(j, 0);
+}
+uint32_t UnitUseItemPoint(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichItem = jass_checkhandle(j, 2, "item");
+    //float x = jass_checknumber(j, 3);
+    //float y = jass_checknumber(j, 4);
+    return jass_pushboolean(j, 0);
+}
+uint32_t UnitUseItemTarget(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichItem = jass_checkhandle(j, 2, "item");
+    //handle_t target = jass_checkhandle(j, 3, "widget");
+    return jass_pushboolean(j, 0);
+}
+uint32_t GetUnitRallyPoint(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    API_ALLOC(vec2_t, location);
+    if (whichUnit) {
+        G_ResolveRallyTarget(whichUnit, location, NULL);
+    }
+    return 1;
+}
+uint32_t GetUnitRallyUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *target = NULL;
+    rallyTargetType_t type;
+
+    if (!whichUnit) return jass_pushnullhandle(j, "unit");
+    type = G_ResolveRallyTarget(whichUnit, NULL, &target);
+    if ((type == RALLY_TARGET_SELF || type == RALLY_TARGET_ENTITY) &&
+        target && (target->svflags & SVF_MONSTER)) {
+        return jass_pushlighthandle(j, target, "unit");
+    }
+    return jass_pushnullhandle(j, "unit");
+}
+uint32_t GetUnitRallyDestructable(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *target = NULL;
+    rallyTargetType_t type;
+
+    if (!whichUnit) return jass_pushnullhandle(j, "destructable");
+    type = G_ResolveRallyTarget(whichUnit, NULL, &target);
+    if (type == RALLY_TARGET_ENTITY && target && G_IsDestructable(target)) {
+        return jass_pushlighthandle(j, target, "destructable");
+    }
+    return jass_pushnullhandle(j, "destructable");
+}
+uint32_t GetUnitLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    API_ALLOC(vec2_t, location);
+    if (whichUnit) {
+        *location = whichUnit->s.origin2;
+    }
+    return 1;
+}
+uint32_t GetUnitDefaultMoveSpeed(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    /* The unit type's speed, not the current one: SetUnitMoveSpeed changes
+     * unitinfo.MoveSpeed, so returning it let "default * 1.35" effects compound
+     * every tick (Frontline road boost grew a worker's speed to 3e20). */
+    float speed = 0;
+    if (whichUnit) {
+        speed = whichUnit->data.UnitBalance && whichUnit->data.UnitBalance->speed > 0
+            ? whichUnit->data.UnitBalance->speed : whichUnit->unitinfo.MoveSpeed;
+    }
+    return jass_pushnumber(j, speed);
+}
+uint32_t GetOwningPlayer(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    if (!whichUnit) {
+        return jass_pushnullhandle(j, "player");
+    }
+    return jass_pushlighthandle(j, G_GetPlayerByNumber(whichUnit->s.player), "player");
+}
+uint32_t GetUnitTypeId(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? (int32_t)whichUnit->class_id : 0);
+}
+static uint32_t JassPushRaceHandle(jass_t *j, int32_t value);
+uint32_t GetUnitRace(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t race = whichUnit && whichUnit->data.UnitData
+        ? WC3_JassRaceFromString(whichUnit->data.UnitData->race) : 0;
+    return JassPushRaceHandle(j, race);
+}
+uint32_t GetUnitName(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t name = whichUnit ? G_UnitName(whichUnit->class_id) : NULL;
+    return jass_pushstring(j, name ? name : "");
+}
+uint32_t GetUnitFoodUsed(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? whichUnit->data.UnitBalance->foodUsed : 0);
+}
+uint32_t GetUnitFoodMade(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? whichUnit->data.UnitBalance->foodMade : 0);
+}
+uint32_t IsUnitInGroup(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    ggroup_t *whichGroup = jass_checkhandle(j, 2, "group");
+    if (!whichUnit || !whichGroup) return jass_pushboolean(j, 0);
+    FOR_LOOP(i, whichGroup->num_units) {
+        if (whichGroup->units[i] == whichUnit) return jass_pushboolean(j, 1);
+    }
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnitInForce(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t *whichForce = jass_checkhandle(j, 2, "force");
+    if (!whichUnit || !whichForce) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, (*whichForce) & (1 << whichUnit->s.player));
+}
+uint32_t IsUnitOwnedByPlayer(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, whichUnit->s.player == PLAYER_NUM(whichPlayer));
+}
+uint32_t IsUnitAlly(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j,
+        G_PlayerTreatsPlayerAsAlly(PLAYER_NUM(whichPlayer), whichUnit->s.player));
+}
+uint32_t IsUnitEnemy(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j,
+        !G_PlayerTreatsPlayerAsAlly(PLAYER_NUM(whichPlayer), whichUnit->s.player));
+}
+uint32_t IsUnitVisible(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichPlayer = jass_checkhandle(j, 2, "player");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnitDetected(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, S_UnitIsDetectedByPlayer(whichUnit, PLAYER_NUM(whichPlayer)));
+}
+uint32_t IsUnitInvisible(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, S_UnitIsInvisibleToPlayer(whichUnit, PLAYER_NUM(whichPlayer)));
+}
+uint32_t IsUnitFogged(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichPlayer = jass_checkhandle(j, 2, "player");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnitMasked(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichPlayer = jass_checkhandle(j, 2, "player");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnitSelected(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    if (!whichUnit || !whichPlayer) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, (whichUnit->selected >> PLAYER_NUM(whichPlayer)) & 1);
+}
+uint32_t IsUnitRace(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //handle_t whichRace = jass_checkhandle(j, 2, "race");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnitType(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t *whichUnitType = jass_checkhandle(j, 2, "unittype");
+    if (!whichUnit || !whichUnitType) return jass_pushboolean(j, 0);
+    if (*whichUnitType == WC3_UNIT_TYPE_STRUCTURE)
+        return jass_pushboolean(j, G_UnitIsStructure(whichUnit));
+    if (*whichUnitType < 32 && (whichUnit->script_unit_types & (1u << *whichUnitType)))
+        return jass_pushboolean(j, 1);
+    if (*whichUnitType == WC3_UNIT_TYPE_GROUND)
+        return jass_pushboolean(j, !(whichUnit->aiflags & AI_FLYING));
+    if (*whichUnitType == 0) /* UNIT_TYPE_HERO */
+        return jass_pushboolean(j, G_UnitIsHero(whichUnit));
+    if (*whichUnitType == 1) /* UNIT_TYPE_DEAD */
+        return jass_pushboolean(j, M_IsDead(whichUnit));
+    if (*whichUnitType == WC3_UNIT_TYPE_POLYMORPHED)
+        return jass_pushboolean(j, S_UnitPolymorphed(whichUnit));
+    if (*whichUnitType == 23) /* UNIT_TYPE_SLEEPING */
+        return jass_pushboolean(j, G_UnitIsSleeping(whichUnit));
+    if (*whichUnitType == 11) /* UNIT_TYPE_STUNNED */
+        return jass_pushboolean(j, unit_hasstatusstate(whichUnit, WC3_STATUS_STATE_STUNNED));
+    if (*whichUnitType == 3) /* UNIT_TYPE_FLYING */
+        return jass_pushboolean(j, whichUnit->aiflags & AI_FLYING);
+    if (*whichUnitType == 10) /* UNIT_TYPE_SUMMONED */
+        return jass_pushboolean(j, whichUnit->summon_ability != 0);
+    if (*whichUnitType == 14) /* UNIT_TYPE_UNDEAD */
+        return jass_pushboolean(j, whichUnit->data.UnitData &&
+            WC3_RaceFromString(whichUnit->data.UnitData->race) == RACE_UNDEAD);
+    return jass_pushboolean(j, 0);
+}
+uint32_t IsUnit(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichSpecifiedUnit = jass_checkhandle(j, 2, "unit");
+    return jass_pushboolean(j, whichUnit != NULL && whichUnit == whichSpecifiedUnit);
+}
+uint32_t IsUnitInRange(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *otherUnit = jass_checkhandle(j, 2, "unit");
+    float distance = jass_checknumber(j, 3);
+    if (!whichUnit || !otherUnit) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, Vector2_distance(&whichUnit->s.origin2, &otherUnit->s.origin2) <= distance);
+}
+uint32_t IsUnitInRangeXY(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    float x = jass_checknumber(j, 2);
+    float y = jass_checknumber(j, 3);
+    float distance = jass_checknumber(j, 4);
+    if (!whichUnit) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, Vector2_distance(&whichUnit->s.origin2, &MAKE(vec2_t, x, y)) <= distance);
+}
+uint32_t IsUnitInRangeLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    vec2_t const *whichLocation = jass_checkhandle(j, 2, "location");
+    float distance = jass_checknumber(j, 3);
+    if (!whichUnit || !whichLocation) return jass_pushboolean(j, 0);
+    return jass_pushboolean(j, Vector2_distance(&whichUnit->s.origin2, whichLocation) <= distance);
+}
+uint32_t IsUnitHidden(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichUnit && (whichUnit->s.renderfx & RF_HIDDEN));
+}
+uint32_t IsUnitIllusion(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichUnit && (whichUnit->aiflags & AI_ILLUSION));
+}
+uint32_t IsUnitInTransport(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    edict_t *whichTransport = jass_checkhandle(j, 2, "unit");
+    return jass_pushboolean(j, whichUnit && whichTransport &&
+                              S_CargoTransportForUnit(whichUnit) == whichTransport);
+}
+uint32_t IsUnitLoaded(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichUnit && S_CargoTransportForUnit(whichUnit) != NULL);
+}
+uint32_t IsHeroUnitId(jass_t *j) {
+    //int32_t unitId = jass_checkinteger(j, 1);
+    return jass_pushboolean(j, 0);
+}
+uint32_t UnitShareVision(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    player_t *whichPlayer = jass_checkhandle(j, 2, "player");
+    bool share = jass_checkboolean(j, 3);
+    if (whichUnit && whichPlayer)
+        G_SetUnitSharedVision(whichUnit, PLAYER_NUM(whichPlayer), share);
+    return 0;
+}
+uint32_t UnitSuspendDecay(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //bool suspend = jass_checkboolean(j, 2);
+    return 0;
+}
+uint32_t UnitAddAbility(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t abilityId = jass_checkinteger(j, 2);
+    return jass_pushboolean(j, G_ActorAddSkill(whichUnit, abilityId));
+}
+uint32_t UnitRemoveAbility(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t abilityId = jass_checkinteger(j, 2);
+    return jass_pushboolean(j, G_ActorRemoveSkill(whichUnit, abilityId));
+}
+uint32_t UnitMakeAbilityPermanent(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool permanent = jass_checkboolean(j, 2);
+    uint32_t abilityId = jass_checkinteger(j, 3);
+    return jass_pushboolean(j, G_ActorSetSkillPermanent(whichUnit, abilityId, permanent));
+}
+uint32_t UnitRemoveBuffs(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool removePositive = jass_checkboolean(j, 2);
+    bool removeNegative = jass_checkboolean(j, 3);
+    unit_removebuffs(whichUnit, removePositive, removeNegative, true, true, false, false, false);
+    return 0;
+}
+uint32_t UnitRemoveBuffsEx(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool removePositive = jass_checkboolean(j, 2);
+    bool removeNegative = jass_checkboolean(j, 3);
+    bool magic = jass_checkboolean(j, 4);
+    bool physical = jass_checkboolean(j, 5);
+    bool timedLife = jass_checkboolean(j, 6);
+    bool aura = jass_checkboolean(j, 7);
+    bool autoDispel = jass_checkboolean(j, 8);
+    unit_removebuffs(whichUnit, removePositive, removeNegative, magic, physical,
+                     timedLife, aura, autoDispel);
+    return 0;
+}
+uint32_t UnitAddSleep(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    bool add = jass_checkboolean(j, 2);
+    G_UnitSetCanSleep(whichUnit, add);
+    return 0;
+}
+uint32_t UnitCanSleep(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, G_UnitCanSleep(whichUnit));
+}
+uint32_t UnitAddSleepPerm(jass_t *j) {
+    /* Sleep Always (Asla) has separate ability-owned semantics (including its
+     * Sleep Once/Allow On Any Player Slot data). Keep this native conservative
+     * until that ability is represented instead of aliasing it to night sleep. */
+    (void)j;
+    return 0;
+}
+uint32_t UnitCanSleepPerm(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, whichUnit && G_ActorHasSkill(whichUnit, "Asla"));
+}
+uint32_t UnitIsSleeping(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, G_UnitIsSleeping(whichUnit));
+}
+uint32_t UnitWakeUp(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    G_UnitWakeUp(whichUnit);
+    return 0;
+}
+uint32_t UnitApplyTimedLife(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //int32_t buffId = jass_checkinteger(j, 2);
+    //float duration = jass_checknumber(j, 3);
+    return 0;
+}
+uint32_t IssueImmediateOrder(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t order = jass_checkstring(j, 2);
+    return jass_pushboolean(j, unit_issueimmediateorder(whichUnit, order));
+}
+uint32_t IssueImmediateOrderById(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t order = (uint32_t)jass_checkinteger(j, 2);
+    return jass_pushboolean(j, unit_issueimmediateorder(whichUnit, G_OrderId2String(order)));
+}
+uint32_t IssuePointOrder(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t order = jass_checkstring(j, 2);
+    float x = jass_checknumber(j, 3);
+    float y = jass_checknumber(j, 4);
+    bool ret = unit_issueorder(whichUnit, order, &MAKE(vec2_t, x, y));
+    return jass_pushboolean(j, ret);
+}
+uint32_t IssuePointOrderLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t order = jass_checkstring(j, 2);
+    vec2_t const *whichLocation = jass_checkhandle(j, 3, "location");
+    bool ret = unit_issueorder(whichUnit, order, whichLocation);
+    return jass_pushboolean(j, ret);
+}
+uint32_t IssuePointOrderById(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t order = (uint32_t)jass_checkinteger(j, 2);
+    vec2_t point = { jass_checknumber(j, 3), jass_checknumber(j, 4) };
+
+    /* Building rawcodes are valid point-order ids, but they are not entries in
+     * the canonical Warcraft order table. Keep construction on the existing
+     * authoritative build path and leave ordinary ids to the generic router. */
+    if (G_UnitIsBuilding(order))
+        return jass_pushboolean(j, G_IssueBuildOrder(whichUnit, order, &point));
+    return jass_pushboolean(j, unit_issueorder(whichUnit, G_OrderId2String(order), &point));
+}
+uint32_t IssuePointOrderByIdLoc(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t order = (uint32_t)jass_checkinteger(j, 2);
+    vec2_t const *whichLocation = jass_checkhandle(j, 3, "location");
+
+    if (G_UnitIsBuilding(order))
+        return jass_pushboolean(j, G_IssueBuildOrder(whichUnit, order, whichLocation));
+    return jass_pushboolean(j, unit_issueorder(whichUnit, G_OrderId2String(order), whichLocation));
+}
+uint32_t IssueTargetOrder(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    cstring_t order = jass_checkstring(j, 2);
+    edict_t *targetWidget = jass_checkhandle(j, 3, "widget");
+    return jass_pushboolean(j, unit_issuetargetorder(whichUnit, order, targetWidget));
+}
+uint32_t IssueTargetOrderById(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    uint32_t order = (uint32_t)jass_checkinteger(j, 2);
+    edict_t *targetWidget = jass_checkhandle(j, 3, "widget");
+    cstring_t order_name = G_OrderId2String(order);
+    bool accepted;
+
+    /* Blizzard.j routes IssueBuildOrderByIdLocBJ('ugol') through this target
+     * native after finding the neutral ngol. Translate that retail-specific
+     * target order into the shared build path so the Acolyte walks to the mine
+     * and construction performs the normal overlay binding on arrival. */
+    if (order == order_ugol && targetWidget && targetWidget->class_id == unit_ngol)
+        accepted = G_IssueBuildOrder(whichUnit, order, &targetWidget->s.origin2);
+    else
+        accepted = unit_issuetargetorder(whichUnit, order_name, targetWidget);
+
+    /* The numeric argument is an order id, not a unit rawcode. Build-on-mine
+     * placement uses the explicit ugol target case above; other ids remain
+     * ordinary order ids and must not be interpreted as unit rawcodes. */
+    return jass_pushboolean(j, accepted);
+}
+uint32_t IssueInstantTargetOrder(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //cstring_t order = jass_checkstring(j, 2);
+    //handle_t targetWidget = jass_checkhandle(j, 3, "widget");
+    //handle_t instantTargetWidget = jass_checkhandle(j, 4, "widget");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IssueInstantTargetOrderById(jass_t *j) {
+    //edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    //int32_t order = jass_checkinteger(j, 2);
+    //handle_t targetWidget = jass_checkhandle(j, 3, "widget");
+    //handle_t instantTargetWidget = jass_checkhandle(j, 4, "widget");
+    return jass_pushboolean(j, 0);
+}
+uint32_t IssueBuildOrder(jass_t *j) {
+    return jass_pushboolean(j, 0);
+}
+uint32_t IssueBuildOrderById(jass_t *j) {
+    edict_t *whichPeon = jass_checkhandle(j, 1, "unit");
+    uint32_t unitId = (uint32_t)jass_checkinteger(j, 2);
+    vec2_t point = { jass_checknumber(j, 3), jass_checknumber(j, 4) };
+    bool accepted;
+
+    accepted = G_IssueBuildOrder(whichPeon, unitId, &point);
+    return jass_pushboolean(j, accepted);
+}
+uint32_t SetResourceAmount(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t amount = jass_checkinteger(j, 2);
+    if (whichUnit) S_GoldMineSetResourceAmount(whichUnit, MAX(0, amount));
+    return 0;
+}
+uint32_t AddResourceAmount(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t amount = jass_checkinteger(j, 2);
+    if (whichUnit) whichUnit->resources += amount;
+    return 0;
+}
+uint32_t GetResourceAmount(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    return jass_pushinteger(j, whichUnit ? whichUnit->resources : 0);
+}
+uint32_t WaygateGetDestinationX(jass_t *j) {
+    edict_t *waygate = jass_checkhandle(j, 1, "unit");
+    vec2_t destination = {0};
+    S_WaygateGetDestination(waygate, &destination);
+    return jass_pushnumber(j, destination.x);
+}
+uint32_t WaygateGetDestinationY(jass_t *j) {
+    edict_t *waygate = jass_checkhandle(j, 1, "unit");
+    vec2_t destination = {0};
+    S_WaygateGetDestination(waygate, &destination);
+    return jass_pushnumber(j, destination.y);
+}
+uint32_t WaygateSetDestination(jass_t *j) {
+    edict_t *waygate = jass_checkhandle(j, 1, "unit");
+    vec2_t destination = { jass_checknumber(j, 2), jass_checknumber(j, 3) };
+    S_WaygateSetDestination(waygate, &destination);
+    return 0;
+}
+uint32_t WaygateActivate(jass_t *j) {
+    edict_t *waygate = jass_checkhandle(j, 1, "unit");
+    bool activate = jass_checkboolean(j, 2);
+    S_WaygateSetActive(waygate, activate);
+    return 0;
+}
+uint32_t WaygateIsActive(jass_t *j) {
+    edict_t *waygate = jass_checkhandle(j, 1, "unit");
+    return jass_pushboolean(j, S_WaygateIsActive(waygate));
+}
+uint32_t UnitAddIndicator(jass_t *j) {
+    edict_t *whichUnit = jass_checkhandle(j, 1, "unit");
+    int32_t red = jass_checkinteger(j, 2);
+    int32_t green = jass_checkinteger(j, 3);
+    int32_t blue = jass_checkinteger(j, 4);
+    int32_t alpha = jass_checkinteger(j, 5);
+    color32_t color = MAKE(color32_t,
+        (uint8_t)MAX(0, MIN(255, red)),
+        (uint8_t)MAX(0, MIN(255, green)),
+        (uint8_t)MAX(0, MIN(255, blue)),
+        (uint8_t)MAX(0, MIN(255, alpha)));
+
+    G_SendWidgetIndicator(whichUnit, color, currentplayer);
+    return 0;
+}
+/* Creep leash opt-in/out is separate from AI's replaceable guard-post roster. */
+uint32_t SetUnitCreepGuard(jass_t *j) {
+    edict_t *unit = jass_checkhandle(j, 1, "unit");
+    bool enabled = jass_checkboolean(j, 2);
+    if (unit) G_CreepGuardSetEnabled(unit, enabled);
+    return 0;
+}
+uint32_t RemoveGuardPosition(jass_t *j) {
+    edict_t *unit = jass_checkhandle(j, 1, "unit");
+    if (unit) G_BotRemoveGuardPosition(unit);
+    return 0;
+}
+uint32_t RecycleGuardPosition(jass_t *j) {
+    edict_t *unit = jass_checkhandle(j, 1, "unit");
+    if (unit) G_BotRecycleGuardPosition(unit);
+    return 0;
+}
+uint32_t CreateUnit(jass_t *j) {
+    player_t *player = jass_checkhandle(j, 1, "player");
+    uint32_t unitid = jass_checkinteger(j, 2);
+    vec2_t location = MAKE(vec2_t, jass_checknumber(j, 3), jass_checknumber(j, 4));
+    float facing = jass_checknumber(j, 5);
+    if (!player) {
+        return jass_pushnullhandle(j, "unit");
+    }
+    edict_t *unit = unit_create(PLAYER_NUM(player), unitid, &location, facing);
+    return jass_pushlighthandle(j, unit, "unit");
+}
+uint32_t CreateUnitByName(jass_t *j) {
+    //handle_t whichPlayer = jass_checkhandle(j, 1, "player");
+    //cstring_t unitname = jass_checkstring(j, 2);
+    //float x = jass_checknumber(j, 3);
+    //float y = jass_checknumber(j, 4);
+    //float face = jass_checknumber(j, 5);
+    return jass_pushnullhandle(j, "unit");
+}
+uint32_t CreateUnitAtLoc(jass_t *j) {
+    player_t *player = jass_checkhandle(j, 1, "player");
+    uint32_t unitid = jass_checkinteger(j, 2);
+    vec2_t const *location = jass_checkhandle(j, 3, "location");
+    float facing = jass_checknumber(j, 4);
+    if (!player || !location) {
+        return jass_pushnullhandle(j, "unit");
+    }
+    edict_t *unit = unit_create(PLAYER_NUM(player), unitid, location, facing);
+    return jass_pushlighthandle(j, unit, "unit");
+}
+uint32_t CreateUnitAtLocByName(jass_t *j) {
+    //handle_t id = jass_checkhandle(j, 1, "player");
+    //cstring_t unitname = jass_checkstring(j, 2);
+    //handle_t whichLocation = jass_checkhandle(j, 3, "location");
+    //float face = jass_checknumber(j, 4);
+    return jass_pushnullhandle(j, "unit");
+}
+uint32_t CreateCorpse(jass_t *j) {
+    //handle_t whichPlayer = jass_checkhandle(j, 1, "player");
+    //int32_t unitid = jass_checkinteger(j, 2);
+    //float x = jass_checknumber(j, 3);
+    //float y = jass_checknumber(j, 4);
+    //float face = jass_checknumber(j, 5);
+    return jass_pushnullhandle(j, "unit");
+}
+uint32_t CreateBlightedGoldmine(jass_t *j) {
+    player_t *player = jass_checkhandle(j, 1, "player");
+    vec2_t origin = MAKE(vec2_t, jass_checknumber(j, 2), jass_checknumber(j, 3));
+    float facing = jass_checknumber(j, 4);
+    edict_t *mine;
+
+    if (!player || !(mine = S_CreateBlightedGoldmine(PLAYER_NUM(player), &origin, facing)))
+        return jass_pushnullhandle(j, "unit");
+    return jass_pushlighthandle(j, mine, "unit");
+}

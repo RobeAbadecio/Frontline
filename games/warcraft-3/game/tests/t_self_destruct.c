@@ -1,0 +1,420 @@
+#ifdef BZ_TESTS
+#include "test.h"
+#include "../skills/s_skills.h"
+
+#define BZ_ASDG MAKEFOURCC('A', 's', 'd', 'g') // rawcode; Clockwerk Self Destruct L1
+#define BZ_ASD2 MAKEFOURCC('A', 's', 'd', '2') // rawcode; Clockwerk Self Destruct L2
+#define BZ_ASD3 MAKEFOURCC('A', 's', 'd', '3') // rawcode; Clockwerk Self Destruct L3
+#define BZ_ASDS MAKEFOURCC('A', 's', 'd', 's') // rawcode; shared Self Destruct code=
+#define BZ_BTLF MAKEFOURCC('B', 'T', 'L', 'F') // rawcode; timed life
+#define BZ_ANSY MAKEFOURCC('A', 'N', 's', 'y') // rawcode; Pocket Factory
+#define BZ_OGRU MAKEFOURCC('o', 'g', 'r', 'u') // unitCode; fixture Clockwerk
+
+edict_t *alloc_test_unit(uint32_t class_id, float x, float y);
+void reset_entities(void);
+void setup_test_world(void);
+slkTestData_t *parse_slk_string(char const *text);
+void free_slk_rows(slkTestData_t *rows);
+void G_RunEntities(void);
+bool run_test_jass(cstring_t src);
+
+static void self_destruct_run_frames(uint32_t frames) {
+    bool const started = level.started, scripts_started = level.scriptsStarted;
+    level.started = level.scriptsStarted = true;
+    FOR_LOOP(i, frames) {
+        level.time += FRAMETIME;
+        globals.RunFrame();
+    }
+    level.started = started;
+    level.scriptsStarted = scripts_started;
+}
+
+typedef struct {
+	slkTestData_t *rows, *old;
+	edict_t *goblin, *near_enemy, *far_enemy;
+} sdFix_t;
+
+/* Non-stock DataA/B/C/D/E/F prove death blast reads abilityitem_t.code, not hardcoded Clockwerk values. */
+static char const sd_slk[] =
+	"ID;PWXL;N;EBB;Y4;X14\n"
+	"C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\nC;Y1;X4;K\"targs\"\n"
+	"C;Y1;X5;K\"DataA1\"\nC;Y1;X6;K\"DataB1\"\nC;Y1;X7;K\"DataC1\"\nC;Y1;X8;K\"DataD1\"\n"
+	"C;Y1;X9;K\"DataE1\"\nC;Y1;X10;K\"DataF1\"\nC;Y1;X11;K\"Dur1\"\nC;Y1;X12;K\"HeroDur1\"\n"
+	"C;Y1;X13;K\"Cost1\"\nC;Y1;X14;K\"Area1\"\n"
+	"C;Y2;X1;K\"Asdg\"\nC;Y2;X2;K\"Asds\"\nC;Y2;X3;K\"1\"\n"
+	"C;Y2;X4;K\"ground,structure,debris,enemy,neutral\"\n"
+	"C;Y2;X5;K\"80\"\nC;Y2;X6;K\"40\"\nC;Y2;X7;K\"160\"\nC;Y2;X8;K\"15\"\n"
+	"C;Y2;X9;K\"1\"\nC;Y2;X10;K\"1\"\nC;Y2;X11;K\"0.1\"\nC;Y2;X12;K\"0.1\"\n"
+	"C;Y2;X13;K\"0\"\nC;Y2;X14;K\"0\"\n"
+	"C;Y3;X1;K\"Asd2\"\nC;Y3;X2;K\"Asds\"\nC;Y3;X3;K\"1\"\n"
+	"C;Y3;X4;K\"ground,structure,debris,enemy,neutral\"\n"
+	"C;Y3;X5;K\"80\"\nC;Y3;X6;K\"55\"\nC;Y3;X7;K\"160\"\nC;Y3;X8;K\"20\"\n"
+	"C;Y3;X9;K\"1\"\nC;Y3;X10;K\"1\"\nC;Y3;X11;K\"0.1\"\nC;Y3;X12;K\"0.1\"\n"
+	"C;Y3;X13;K\"0\"\nC;Y3;X14;K\"0\"\n"
+	"C;Y4;X1;K\"Asds\"\nC;Y4;X2;K\"Asds\"\nC;Y4;X3;K\"1\"\n"
+	"C;Y4;X4;K\"ground,structure,debris,tree,ward\"\n"
+	/* Non-stock DataB=175 so Kaboom click cannot pass on retail TFT 250. */
+	"C;Y4;X5;K\"100\"\nC;Y4;X6;K\"175\"\nC;Y4;X7;K\"250\"\nC;Y4;X8;K\"100\"\n"
+	"C;Y4;X9;K\"3\"\nC;Y4;X10;K\"0\"\nC;Y4;X11;K\"0.1\"\nC;Y4;X12;K\"0.1\"\n"
+	"C;Y4;X13;K\"0\"\nC;Y4;X14;K\"0\"\nE\n";
+
+static sdFix_t sd_setup(uint32_t code) {
+	sdFix_t fix;
+	reset_entities(); setup_test_world(); level.time = 1000;
+	((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+	((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+	memset(level.alliances, 0, sizeof(level.alliances));
+	fix.rows = parse_slk_string(sd_slk); fix.old = G_SetSLKRows("AbilityData", fix.rows);
+	fix.goblin = alloc_test_unit(MAKEFOURCC('n', 'c', 'g', 'b'), 0, 0);
+	fix.near_enemy = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 40, 0);
+	fix.far_enemy = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), 300, 0);
+	fix.goblin->s.player = 0; fix.near_enemy->s.player = fix.far_enemy->s.player = 1;
+	fix.goblin->svflags |= SVF_MONSTER; fix.near_enemy->svflags |= SVF_MONSTER; fix.far_enemy->svflags |= SVF_MONSTER;
+	fix.goblin->targtype = fix.near_enemy->targtype = fix.far_enemy->targtype = TARG_GROUND;
+	fix.goblin->health.value = fix.goblin->health.max_value = 100;
+	fix.near_enemy->health.value = fix.near_enemy->health.max_value = 500;
+	fix.far_enemy->health.value = fix.far_enemy->health.max_value = 500;
+	fix.goblin->unit_state->armor_value = 0; fix.near_enemy->unit_state->armor_value = 0; fix.far_enemy->unit_state->armor_value = 0;
+	fix.goblin->die = unit_die;
+	T_ASSERT(G_ActorAddSkill(fix.goblin, code));
+	return fix;
+}
+
+static void sd_done(sdFix_t fix) { G_SetSLKRows("AbilityData", fix.old); free_slk_rows(fix.rows); }
+
+TEST(wc3_spell, self_destruct_aliases_share_procedure) {
+	T_EQ(S_AbilityItem(BZ_ASDG).ability->proc, CAbilitySelfDestruct);
+	T_EQ(S_AbilityItem(BZ_ASD2).ability->proc, CAbilitySelfDestruct);
+	T_EQ(S_AbilityItem(BZ_ASD3).ability->proc, CAbilitySelfDestruct);
+	T_EQ(S_AbilityItem(BZ_ASDS).ability->proc, CAbilitySelfDestruct);
+}
+
+/* Death of a unit that has Asdg deals authored full-radius DataB; units outside DataC are untouched. */
+TEST(wc3_spell, self_destruct_death_deals_authored_area_damage) {
+	sdFix_t fix = sd_setup(BZ_ASDG);
+	unit_die(fix.goblin, NULL);
+	T_ASSERT(M_IsDead(fix.goblin));
+	T_FEQ(fix.near_enemy->health.value, 460, 0.001f);
+	T_FEQ(fix.far_enemy->health.value, 500, 0.001f);
+	sd_done(fix);
+}
+
+/* Asd2 shares the procedure but reads its own DataB through abilityitem_t.code. */
+TEST(wc3_spell, self_destruct_asd2_uses_alias_datab) {
+	sdFix_t fix = sd_setup(BZ_ASD2);
+	unit_die(fix.goblin, NULL);
+	T_FEQ(fix.near_enemy->health.value, 445, 0.001f);
+	T_FEQ(fix.far_enemy->health.value, 500, 0.001f);
+	sd_done(fix);
+}
+
+/* Partial ring uses DataD when distance is between DataA and DataC. */
+TEST(wc3_spell, self_destruct_partial_radius_uses_datad) {
+	sdFix_t fix = sd_setup(BZ_ASDG);
+	fix.near_enemy->s.origin2.x = 100; fix.near_enemy->s.origin.x = 100;
+	unit_die(fix.goblin, NULL);
+	T_FEQ(fix.near_enemy->health.value, 485, 0.001f);
+	sd_done(fix);
+}
+
+/* Asds with DataF=0 must not detonate on death (Goblin Sapper contract). */
+TEST(wc3_spell, self_destruct_asds_without_dataf_does_not_explode_on_death) {
+	sdFix_t fix = sd_setup(BZ_ASDS);
+	unit_die(fix.goblin, NULL);
+	T_FEQ(fix.near_enemy->health.value, 500, 0.001f);
+	sd_done(fix);
+}
+
+/* Kaboom click is a point-target cast: authored DataB blast + caster death, even with DataF=0. */
+TEST(wc3_spell, self_destruct_asds_click_detonates_and_kills_caster) {
+	sdFix_t fix = sd_setup(BZ_ASDS);
+	vec2_t point = { 0, 0 };
+	ability_t const *abil = S_AbilityItem(BZ_ASDS).ability;
+	T_NOT_NULL(abil);
+	T_ASSERT(abil->flags & AB_SPELL);
+	T_ASSERT(abil->flags & AB_AUTOCAST);
+	T_EQ(abil->target_type, SPELL_TARGET_POINT);
+	T_ASSERT(S_CastPointTargetSpell(fix.goblin, BZ_ASDS, &point));
+	T_ASSERT(M_IsDead(fix.goblin));
+	T_FEQ(fix.near_enemy->health.value, 325, 0.001f); /* 500 - 175 */
+	T_FEQ(fix.far_enemy->health.value, 500, 0.001f);
+	sd_done(fix);
+}
+
+/* OrcX01_02's six BTsc support-column destructables use the stock data row:
+ * targType=wall and HP=50. A full-radius Kaboom hit must kill one in a blast. */
+TEST(wc3_spell, self_destruct_asds_destroys_support_column_not_decoration) {
+    sdFix_t fix = sd_setup(BZ_ASDS);
+    edict_t *column = G_Spawn(), *decoration = G_Spawn();
+    vec2_t point = MAKE(vec2_t, 0, 0);
+    /* Stock Asds has DataA=100, DataB=250, DataC=250, DataD=100. */
+    abilityLevel_t *asds = (abilityLevel_t *)G_AbilityLevel(BZ_ASDS, 1);
+    asds->data[0].number = 100;
+    asds->data[1].number = 250;
+    asds->data[2].number = 250;
+    asds->data[3].number = 100;
+    column->class_id = MAKEFOURCC('B', 'T', 's', 'c');
+    column->s.origin2 = MAKE(vec2_t, 45, 0);
+    column->targtype = TARG_WALL;
+    column->health.value = column->health.max_value = 50;
+    column->destructable = G_AllocDestructable();
+    decoration->class_id = MAKEFOURCC('B', '0', '0', '5');
+    decoration->s.origin2 = MAKE(vec2_t, 50, 0);
+    decoration->targtype = TARG_DECORATION;
+    decoration->health.value = decoration->health.max_value = 500;
+    decoration->destructable = G_AllocDestructable();
+    T_ASSERT(S_CastPointTargetSpell(fix.goblin, BZ_ASDS, &point));
+    T_ASSERT(column->destructable->dead);
+    T_FEQ(column->health.value, 0, 0.001f);
+    T_FEQ(decoration->health.value, 500, 0.001f);
+    sd_done(fix);
+}
+
+TEST(wc3_spell, self_destruct_asds_nonstock_debris_uses_authored_damage) {
+    sdFix_t fix = sd_setup(BZ_ASDS);
+    edict_t *debris = G_Spawn();
+    vec2_t point = MAKE(vec2_t, 0, 0);
+    debris->class_id = MAKEFOURCC('B', '0', '0', '4');
+    debris->s.origin2 = MAKE(vec2_t, 45, 0);
+    debris->targtype = TARG_DEBRIS;
+    debris->health.value = debris->health.max_value = 500;
+    debris->destructable = G_AllocDestructable();
+    T_ASSERT(S_CastPointTargetSpell(fix.goblin, BZ_ASDS, &point));
+    T_FEQ(debris->health.value, 325, 0.001f);
+    T_ASSERT(!debris->destructable->dead);
+    sd_done(fix);
+}
+
+/* Kaboom uses an entity target cursor, walks to cast range, then detonates. */
+TEST(wc3_spell, self_destruct_asds_entity_target_walks_and_detonates_in_range) {
+    sdFix_t fix = sd_setup(BZ_ASDS);
+    edict_t *clent = &g_edicts[0], *approach = NULL;
+    gameClient_t *client = &game.clients[0];
+    edict_t *column = G_Spawn();
+    char number[16];
+    cstring_t button[] = { "button", "Asds" };
+    cstring_t select[] = { "select", number };
+
+    ((abilityLevel_t *)G_AbilityLevel(BZ_ASDS, 1))->data[0].number = 100;
+    ((abilityLevel_t *)G_AbilityLevel(BZ_ASDS, 1))->data[1].number = 250;
+
+    clent->client = client;
+    fix.goblin->s.player = client->ps.number;
+    fix.goblin->think = monster_think;
+    fix.goblin->stand = unit_stand;
+    fix.goblin->movetype = MOVETYPE_STEP;
+    fix.goblin->collision = 16.0f;
+    fix.goblin->unitinfo.MoveSpeed = 270.0f;
+    unit_stand(fix.goblin);
+    gi.LinkEntity(fix.goblin);
+    G_SelectEntity(client, fix.goblin);
+    column->class_id = MAKEFOURCC('B', 'T', 's', 'c');
+    column->s.origin2 = MAKE(vec2_t, 200, 0);
+    column->s.origin.x = 200;
+    column->targtype = TARG_WALL;
+    column->health.value = column->health.max_value = 50;
+    column->destructable = G_AllocDestructable();
+
+    G_ClientCommand(clent, 2, button);
+    T_ASSERT(S_SpellEntityTargetMode(clent));
+    T_NOT_NULL(client->menu.on_entity_selected);
+    T_NULL(client->menu.on_location_selected);
+    snprintf(number, sizeof(number), "%u", (unsigned)column->s.number);
+    G_ClientCommand(clent, 2, select);
+
+    T_ASSERT(fix.goblin->health.value > 0);
+    T_ASSERT(!column->destructable->dead);
+    FILTER_EDICTS(ent, ent->inuse && ent->owner == fix.goblin && ent->think == S_SpellTargetApproachThink) {
+        approach = ent;
+        break;
+    }
+    T_NOT_NULL(approach);
+    T_NOT_NULL(fix.goblin->goalentity);
+    if (!approach || !fix.goblin->goalentity) { sd_done(fix); return; }
+    T_FEQ(fix.goblin->goalentity->s.origin2.x, 200, 0.001f);
+
+    T_ASSERT(run_test_jass("function main takes nothing returns nothing\nendfunction\n"));
+    self_destruct_run_frames(100);
+    T_ASSERT(M_IsDead(fix.goblin));
+    T_ASSERT(column->destructable->dead);
+    T_FEQ(column->health.value, 0, 0.001f);
+    sd_done(fix);
+}
+
+/* Right-click autocast toggles on the Asds row; Clockwerk classname rows stay passive. */
+TEST(wc3_spell, self_destruct_asds_autocast_toggle) {
+	sdFix_t fix = sd_setup(BZ_ASDS);
+	ability_t const *asdg = FindAbilityByClassname("Asdg");
+	T_ASSERT(G_SetUnitAutocast(fix.goblin, BZ_ASDS, true));
+	T_ASSERT(G_UnitAutocastIsOn(fix.goblin, BZ_ASDS));
+	T_ASSERT(G_SetUnitAutocast(fix.goblin, BZ_ASDS, false));
+	T_ASSERT(!G_UnitAutocastIsOn(fix.goblin, BZ_ASDS));
+	/* S_AbilityItem(Asdg) follows code=Asds; exact classname rows stay death-only. */
+	T_NOT_NULL(asdg);
+	T_ASSERT(!(asdg->flags & AB_SPELL));
+	T_ASSERT(asdg->flags & AB_PASSIVE);
+	sd_done(fix);
+}
+
+/* BTLF expiry that kills the goblin still detonates when DataF is set. */
+TEST(wc3_spell, self_destruct_btlf_expiry_detonates) {
+	sdFix_t fix = sd_setup(BZ_ASDG);
+	unit_addtimedstatus(fix.goblin, "BTLF", 1, 2.0f);
+	T_EQ(G_UnitStatusLevel(fix.goblin, BZ_BTLF), 1);
+	level.time += 1999; unit_updatestatuses(fix.goblin);
+	T_ASSERT(fix.goblin->health.value > 0);
+	level.time += 1; unit_updatestatuses(fix.goblin);
+	T_ASSERT(M_IsDead(fix.goblin));
+	T_FEQ(fix.near_enemy->health.value, 460, 0.001f);
+	sd_done(fix);
+}
+
+/* Pocket Factory still spawns Clockwerks; Asdg on the goblin detonates when BTLF expires. */
+TEST(wc3_spell, self_destruct_pocket_factory_goblin_btlf_detonates) {
+	static char const both[] =
+		"ID;PWXL;N;EBB;Y3;X16\n"
+		"C;Y1;X1;K\"alias\"\nC;Y1;X2;K\"code\"\nC;Y1;X3;K\"levels\"\nC;Y1;X4;K\"targs\"\n"
+		"C;Y1;X5;K\"Cost1\"\nC;Y1;X6;K\"Cool1\"\nC;Y1;X7;K\"Rng1\"\nC;Y1;X8;K\"Dur1\"\n"
+		"C;Y1;X9;K\"HeroDur1\"\nC;Y1;X10;K\"DataA1\"\nC;Y1;X11;K\"DataB1\"\nC;Y1;X12;K\"DataC1\"\n"
+		"C;Y1;X13;K\"DataD1\"\nC;Y1;X14;K\"DataE1\"\nC;Y1;X15;K\"DataF1\"\nC;Y1;X16;K\"UnitID1\"\n"
+		"C;Y2;X1;K\"ANsy\"\nC;Y2;X2;K\"ANsy\"\nC;Y2;X3;K\"1\"\nC;Y2;X4;K\"\"\n"
+		"C;Y2;X5;K\"0\"\nC;Y2;X6;K\"0\"\nC;Y2;X7;K\"500\"\nC;Y2;X8;K\"25\"\n"
+		"C;Y2;X9;K\"25\"\nC;Y2;X10;K\"2\"\nC;Y2;X11;K\"ogru\"\nC;Y2;X12;K\"8\"\n"
+		"C;Y2;X13;K\"64\"\nC;Y2;X14;K\"1100\"\nC;Y2;X15;K\"0\"\nC;Y2;X16;K\"hfoo\"\n"
+		"C;Y3;X1;K\"Asdg\"\nC;Y3;X2;K\"Asds\"\nC;Y3;X3;K\"1\"\n"
+		"C;Y3;X4;K\"ground,structure,debris,enemy,neutral\"\n"
+		"C;Y3;X5;K\"0\"\nC;Y3;X6;K\"0\"\nC;Y3;X7;K\"0\"\nC;Y3;X8;K\"0.1\"\n"
+		"C;Y3;X9;K\"0.1\"\nC;Y3;X10;K\"80\"\nC;Y3;X11;K\"40\"\nC;Y3;X12;K\"160\"\n"
+		"C;Y3;X13;K\"15\"\nC;Y3;X14;K\"1\"\nC;Y3;X15;K\"1\"\nC;Y3;X16;K\"\"\nE\n";
+	slkTestData_t *rows = parse_slk_string(both), *old;
+	edict_t *caster, *goblin = NULL, *enemy;
+	vec2_t point = { 128, 128 };
+	reset_entities(); setup_test_world(); level.time = 1000;
+	((mapInfo_t *)level.mapinfo)->players[0].playerType = kPlayerTypeHuman;
+	((mapInfo_t *)level.mapinfo)->players[1].playerType = kPlayerTypeHuman;
+	memset(level.alliances, 0, sizeof(level.alliances));
+	old = G_SetSLKRows("AbilityData", rows);
+	caster = alloc_test_unit(MAKEFOURCC('N', 't', 'i', 'n'), 0, 0);
+	caster->s.player = 0; caster->svflags |= SVF_MONSTER; caster->targtype = TARG_GROUND;
+	caster->mana.value = caster->mana.max_value = 500;
+	caster->unit_state->ranks[0] = MAKE(heroability_t, .code = BZ_ANSY, .level = 1);
+	T_ASSERT(S_CastPointTargetSpell(caster, BZ_ANSY, &point));
+	level.time += 2000; G_RunEntities();
+	FILTER_EDICTS(ent, ent->inuse && ent->class_id == BZ_OGRU) goblin = ent;
+	T_NOT_NULL(goblin);
+	/* Test fixtures may omit UnitUI.modelFile, so SP_CallSpawn skips SP_monster_unit. */
+	goblin->die = unit_die;
+	T_ASSERT(G_ActorAddSkill(goblin, BZ_ASDG));
+	goblin->health.value = goblin->health.max_value = 100; goblin->unit_state->armor_value = 0;
+	/* Place the probe after spawn so factory DataD offset cannot miss the full-radius ring. */
+	enemy = alloc_test_unit(MAKEFOURCC('h', 'f', 'o', 'o'), goblin->s.origin2.x + 40, goblin->s.origin2.y);
+	enemy->s.player = 1; enemy->svflags |= SVF_MONSTER; enemy->targtype = TARG_GROUND;
+	enemy->health.value = enemy->health.max_value = 500; enemy->unit_state->armor_value = 0;
+	level.time += 7999; unit_updatestatuses(goblin);
+	T_ASSERT(goblin->health.value > 0);
+	level.time += 1; unit_updatestatuses(goblin);
+	T_ASSERT(M_IsDead(goblin));
+	T_FEQ(enemy->health.value, 460, 0.001f);
+	G_SetSLKRows("AbilityData", old); free_slk_rows(rows);
+}
+
+
+/* Drive the command card and Move scheduler, including the target's lifetime. */
+static sdFix_t self_destruct_select_mobile_target(void) {
+    sdFix_t fix = sd_setup(BZ_ASDS);
+    edict_t *clent = &g_edicts[0];
+    gameClient_t *client = &game.clients[0];
+    char number[16];
+    cstring_t button[] = { "button", "Asds" };
+    cstring_t select[] = { "select", number };
+    clent->client = client;
+    fix.goblin->s.player = client->ps.number;
+    fix.goblin->think = monster_think;
+    fix.goblin->stand = unit_stand;
+    fix.goblin->movetype = MOVETYPE_STEP;
+    fix.goblin->collision = 16;
+    fix.goblin->unitinfo.MoveSpeed = 270;
+    unit_stand(fix.goblin);
+    gi.LinkEntity(fix.goblin);
+    fix.near_enemy->s.origin2 = MAKE(vec2_t, 200, 0);
+    gi.LinkEntity(fix.near_enemy);
+    G_SelectEntity(client, fix.goblin);
+    G_ClientCommand(clent, 2, button);
+    snprintf(number, sizeof(number), "%u", fix.near_enemy->s.number);
+    G_ClientCommand(clent, 2, select);
+    T_ASSERT(!M_IsDead(fix.goblin));
+    T_ASSERT(move_is_active_order_walk(fix.goblin));
+    T_ASSERT(run_test_jass("function main takes nothing returns nothing\nendfunction\n"));
+    return fix;
+}
+
+TEST(wc3_spell, self_destruct_entity_target_tracks_motion) {
+    sdFix_t fix = self_destruct_select_mobile_target();
+    fix.near_enemy->s.origin2 = MAKE(vec2_t, 500, 0);
+    gi.LinkEntity(fix.near_enemy);
+    self_destruct_run_frames(100);
+    T_ASSERT(M_IsDead(fix.goblin));
+    T_ASSERT(fix.near_enemy->health.value < 500);
+    T_ASSERT(Vector2_distance(&fix.goblin->s.origin2, &fix.near_enemy->s.origin2) <= 100);
+    sd_done(fix);
+}
+
+TEST(wc3_spell, self_destruct_entity_target_death_cancels_approach) {
+    sdFix_t fix = self_destruct_select_mobile_target();
+    fix.near_enemy->health.value = 0;
+    self_destruct_run_frames(100);
+    T_ASSERT(!M_IsDead(fix.goblin));
+    T_ASSERT(!move_is_active_order_walk(fix.goblin));
+    sd_done(fix);
+}
+
+TEST(wc3_spell, self_destruct_entity_target_reuse_cancels_approach) {
+    sdFix_t fix = self_destruct_select_mobile_target();
+    fix.near_enemy->spawn_time++;
+    self_destruct_run_frames(100);
+    T_ASSERT(!M_IsDead(fix.goblin));
+    T_ASSERT(!move_is_active_order_walk(fix.goblin));
+    T_FEQ(fix.near_enemy->health.value, 500, 0.001f);
+    sd_done(fix);
+}
+
+TEST(wc3_spell, self_destruct_entity_target_stop_cancels_approach) {
+    sdFix_t fix = self_destruct_select_mobile_target();
+    order_stop(fix.goblin);
+    self_destruct_run_frames(100);
+    T_ASSERT(!M_IsDead(fix.goblin));
+    T_ASSERT(!move_is_active_order_walk(fix.goblin));
+    T_FEQ(fix.near_enemy->health.value, 500, 0.001f);
+    sd_done(fix);
+}
+
+TEST(wc3_spell, self_destruct_entity_target_survives_save_load) {
+    uint32_t const formats[] = { 24, 25 };
+    FOR_LOOP(i, 2) {
+        sdFix_t fix = self_destruct_select_mobile_target();
+        cstring_t filename = Test_TempPath("wc3-sapper-approach.bin");
+        edict_t *approach = NULL;
+        ((mapInfo_t *)level.mapinfo)->fileFormat = formats[i];
+        FILTER_EDICTS(ent, ent->inuse && ent->owner == fix.goblin && ent->think == S_SpellTargetApproachThink)
+            approach = ent;
+        T_NOT_NULL(approach);
+        T_ASSERT(WriteGame(filename));
+        T_ASSERT(ReadGame(filename));
+        if (approach) {
+            T_ASSERT(approach->inuse && approach->think == S_SpellTargetApproachThink);
+            T_ASSERT(S_SpellChannelOwner(approach) == fix.goblin);
+            T_ASSERT(S_SpellChannelTarget(approach) == fix.near_enemy);
+        }
+        T_ASSERT(fix.goblin->goalentity == fix.near_enemy);
+        fix.near_enemy->s.origin2 = MAKE(vec2_t, 500, 0);
+        gi.LinkEntity(fix.near_enemy);
+        self_destruct_run_frames(100);
+        T_ASSERT(M_IsDead(fix.goblin));
+        T_ASSERT(fix.near_enemy->health.value < 500);
+        T_ASSERT(Vector2_distance(&fix.goblin->s.origin2, &fix.near_enemy->s.origin2) <= 100);
+        remove(filename);
+        sd_done(fix);
+    }
+}
+
+#endif

@@ -1,0 +1,266 @@
+/*
+ * ui/screens/main_menu.c — Main menu screen controller.
+ *
+ * This screen displays the main menu with buttons for:
+ * - Realm Select (Battle.net)
+ * - Single Player
+ * - Battle.net
+ * - Local Area Network
+ * - Options
+ * - Credits
+ * - Exit
+ *
+ * The screen loads MainMenu.fdf frame definitions and sends menu commands
+ * to the console command buffer for navigation.
+ */
+
+#include "../menu_local.h"
+#include "../menu_dialog.h"
+#include "../menu_screen.h"
+#include "../generated/main_menu.h"
+
+/* Generated FDF frame references */
+static cstring_t const main_lft[] = {
+    "WarCraftIIILogo",
+    "RealmSelect",
+    NULL,
+};
+
+static MainMenu_t main_menu;
+static uiDialogWar3_t quit_dialog;
+
+/* State */
+static frameDef_t *edition_button;
+
+static bool MainMenu_LoadScreen(void) {
+    return MainMenu_Load(&main_menu);
+}
+
+static void MainMenu_InitQuitDialog(void) {
+    uiDialogWar3Init_t init = {
+        .modal_name = "MainMenuQuitModal",
+        .template_name = "DialogWar3",
+    };
+
+    UI_DialogWar3Init(&quit_dialog, main_menu.MainMenuFrame, &init);
+}
+
+static void MainMenu_ShowQuitDialog(void) {
+    uiDialogWar3Config_t config = {
+        .message = "Do you want to Quit?",
+        .icon = UI_DIALOG_WAR3_ICON_QUESTION,
+        .buttons = UI_DIALOG_WAR3_BUTTONS_YES_NO,
+        .no_command = "menu_main",
+        .yes_command = "quit",
+    };
+
+    UI_DialogWar3Show(&quit_dialog, &config);
+}
+
+static void MainMenu_InitFrames(void) {
+    if (!main_menu.MainMenuFrame) {
+        mi.Printf("ERROR: MainMenuFrame not found\n");
+        return;
+    }
+
+    if (main_menu.RealmSelect) {
+        UI_SetHidden(main_menu.RealmSelect, true);
+    }
+    if (main_menu.ControlLayer) {
+        UI_SetHidden(main_menu.ControlLayer, false);
+    }
+    if (main_menu.WarCraftIIILogo) {
+        uint32_t logo_model = UI_LoadModel("MainMenuLogo", true);
+        if (logo_model) {
+            main_menu.WarCraftIIILogo->Portrait.model = logo_model;
+        }
+        UI_SetPoint(main_menu.WarCraftIIILogo,
+                    FRAMEPOINT_TOPLEFT,
+                    main_menu.MainMenuFrame,
+                    FRAMEPOINT_TOPLEFT,
+                    0.13f,
+                    -0.08f);
+    }
+
+    UI_SetOnClick(main_menu.RealmButton, "menu_realm_select");
+    UI_SetOnClick(main_menu.SinglePlayerButton, "menu_game");
+    UI_SetOnClick(main_menu.BattleNetButton, "menu_online");
+    UI_SetOnClick(main_menu.LocalAreaNetworkButton, "menu_multiplayer");
+    UI_SetOnClick(main_menu.OptionsButton, "menu_options");
+    UI_SetOnClick(main_menu.CreditsButton, "menu_credits");
+    UI_SetOnClick(main_menu.ExitButton, "menu_quit");
+    /* EditionButton exists in Blizzard's native MainMenu FDF but is optional
+     * for reduced/test FDFs, so bind it without making generated-load success
+     * depend on the frame being present. */
+    edition_button = UI_FindChildFrame(main_menu.MainMenuFrame, "EditionButton");
+    if (edition_button) UI_SetOnClick(edition_button, "menu_edition");
+    /* Original offline packs can supply their own match instead of retail's
+     * campaign/profile screens. The destination is authored by their skin. */
+    cstring_t map=Theme_String("OfflineSkirmishMap","Default");
+    if (map && *map && strcmp(map,"OfflineSkirmishMap")) {
+        UI_SetOnClick(main_menu.SinglePlayerButton,"map \"%s\"",map);
+        cstring_t label=Theme_String("OfflineSkirmishLabel","Default");
+        UI_SetText(main_menu.SinglePlayerButtonText,label && strcmp(label,"OfflineSkirmishLabel") ? label : "Start Match");
+        cstring_t alternate=Theme_String("OfflineAlternateSkirmishMap","Default");
+        if (alternate && *alternate && strcmp(alternate,"OfflineAlternateSkirmishMap")) {
+            cstring_t other_label=Theme_String("OfflineAlternateSkirmishLabel","Default");
+            UI_SetOnClick(main_menu.BattleNetButton,"map \"%s\"",alternate);
+            UI_SetText(main_menu.BattleNetButtonText,other_label && strcmp(other_label,"OfflineAlternateSkirmishLabel") ? other_label : "Alternate Match");
+        }
+        /* Packs that name an editor label get the map editor on the otherwise unused Credits slot. */
+        cstring_t editor=Theme_String("OfflineEditorLabel","Default");
+        if (editor && *editor && strcmp(editor,"OfflineEditorLabel")) {
+            UI_SetOnClick(main_menu.CreditsButton,"menu_map_editor");
+            UI_SetText(main_menu.CreditsButtonText,editor);
+        }
+        /* A pack's sandbox match, where the player commands every side, takes the Options slot. */
+        cstring_t sandbox=Theme_String("OfflineSandboxMap","Default");
+        if (sandbox && *sandbox && strcmp(sandbox,"OfflineSandboxMap")) {
+            cstring_t sandbox_label=Theme_String("OfflineSandboxLabel","Default");
+            /* menu_sandbox sets g_command_all to the map; the game honours it only while that map is loaded. */
+            UI_SetOnClick(main_menu.OptionsButton,"menu_sandbox");
+            UI_SetText(main_menu.OptionsButtonText,sandbox_label && strcmp(sandbox_label,"OfflineSandboxLabel") ? sandbox_label : "Sandbox");
+        }
+        UI_SetOnClick(main_menu.ExitButton,"quit");
+        memset(&quit_dialog,0,sizeof(quit_dialog));
+    } else {
+        MainMenu_InitQuitDialog();
+    }
+
+    /* Realm select buttons */
+    if (main_menu.RealmSelect) {
+        UI_SetOnClick(main_menu.RealmSelectOKButton, "menu_main");
+        UI_SetOnClick(main_menu.RealmSelectCancelButton, "menu_main");
+    }
+}
+
+static void MainMenu_Init(void) {
+    mi.Printf("MainMenu_Init\n");
+    edition_button = NULL;
+    MainMenu_InitFrames();
+    MainMenu_ShowMainPanel();
+}
+
+static void MainMenu_Shutdown(void) {
+    edition_button = NULL;
+}
+
+static void MainMenu_ApplyEdition(bool expansion) {
+    handle_t data = NULL;
+    int size;
+
+    mi.Cvar_Set("fs_expansion", expansion ? "1" : "0");
+    if (!expansion) return;
+
+    size = mi.FS_ReadFile("UI\\CampaignStrings_exp.txt", &data);
+    if (data) mi.FS_FreeFile(data);
+    if (size > 0) return;
+
+    mi.Cvar_Set("fs_expansion", "0");
+    mi.Printf("The Frozen Throne data is unavailable.\n");
+}
+
+/* Restart only after both authored Death layers have reached their final pose. */
+static void MainMenu_FinishEditionSwitch(void) {
+    cstring_t expansion = mi.Cvar_String("fs_expansion", "0");
+
+    MainMenu_ApplyEdition(!(expansion && atoi(expansion) != 0));
+    mi.Cmd_ExecuteText("menu_restart\n");
+}
+
+static void MainMenu_Refresh(int msec) {
+    (void)msec;
+}
+
+static void MainMenu_Draw(void) {
+    frameDef_t const *roots[2];
+    uint32_t num_roots = 0;
+
+
+    if (main_menu.MainMenuFrame) {
+        roots[num_roots++] = main_menu.MainMenuFrame;
+    }
+    if (UI_DialogWar3Visible(&quit_dialog)) {
+        roots[num_roots++] = quit_dialog.modal;
+    }
+    if (num_roots > 0) {
+        UI_DrawFrames(roots, num_roots);
+    }
+}
+
+static void MainMenu_KeyEvent(int key, bool down) {
+    /* Handle key presses */
+    (void)key;
+    (void)down;
+}
+
+void MainMenu_BeginEditionSwitch(void) {
+    if (!main_menu.MainMenuFrame) return;
+    UI_DialogWar3Hide(&quit_dialog);
+    M_TransitionToAction(MainMenu_FinishEditionSwitch);
+}
+
+void MainMenu_ShowMainPanel(void) {
+    UI_DialogWar3Hide(&quit_dialog);
+    if (main_menu.MainMenuFrame) {
+        UI_SetHidden(main_menu.MainMenuFrame, false);
+    }
+    if (main_menu.RealmSelect) {
+        UI_SetHidden(main_menu.RealmSelect, true);
+    }
+    if (main_menu.ControlLayer) {
+        UI_SetHidden(main_menu.ControlLayer, false);
+    }
+    if (main_menu.WarCraftIIILogo) {
+        UI_SetHidden(main_menu.WarCraftIIILogo, false);
+    }
+}
+
+void MainMenu_ShowRealmSelect(void) {
+    UI_DialogWar3Hide(&quit_dialog);
+    if (main_menu.RealmSelect) {
+        UI_SetHidden(main_menu.RealmSelect, false);
+    }
+    if (main_menu.ControlLayer) {
+        UI_SetHidden(main_menu.ControlLayer, true);
+    }
+    if (main_menu.WarCraftIIILogo) {
+        UI_SetHidden(main_menu.WarCraftIIILogo, true);
+    }
+}
+
+void MainMenu_ShowQuitConfirm(void) {
+    MainMenu_ShowQuitDialog();
+}
+
+void MainMenu_ShowDisconnected(void) {
+    uiDialogWar3Config_t config = {
+        .message = "You were disconnected from the game.",
+        .icon = UI_DIALOG_WAR3_ICON_MESSAGE,
+        .buttons = UI_DIALOG_WAR3_BUTTONS_OK,
+        .ok_command = "menu_main",
+    };
+
+    if (main_menu.RealmSelect) {
+        UI_SetHidden(main_menu.RealmSelect, true);
+    }
+    if (main_menu.ControlLayer) {
+        UI_SetHidden(main_menu.ControlLayer, false);
+    }
+    if (main_menu.WarCraftIIILogo) {
+        UI_SetHidden(main_menu.WarCraftIIILogo, false);
+    }
+    UI_DialogWar3Show(&quit_dialog, &config);
+}
+
+uiScreen_t mainMenuScreen = {
+    .name = "main",
+    .left = main_lft,
+    .glue = { .panel = UI_GLUE_MAIN_MENU },
+    .load = MainMenu_LoadScreen,
+    .init = MainMenu_Init,
+    .shutdown = MainMenu_Shutdown,
+    .refresh = MainMenu_Refresh,
+    .draw = MainMenu_Draw,
+    .key_event = MainMenu_KeyEvent,
+};

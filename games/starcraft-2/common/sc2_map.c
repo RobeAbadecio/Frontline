@@ -1,0 +1,3319 @@
+#include "sc2_map.h"
+#include "sc2_utils.h"
+#include "common/mpq.h"
+#include "common/tinyxml.h"
+#include <stddef.h>
+#include <stdlib.h>
+#include <strings.h>
+
+#define SC2_MAX_CATALOG_MODELS       8192
+#define SC2_MAX_CATALOG_ACTORS       8192
+#define SC2_MAX_CATALOG_UNITS        8192
+#define SC2_MAX_CATALOG_LINKS        16384 // CUnit array elements; stock Core+Liberty+campaign stay well under this
+#define SC2_MAX_UNIT_LINK_ENTRIES    64 // array elements in one CUnit node; stock Liberty maximum is 24
+#define SC2_MAX_CATALOG_FOOTPRINTS   1024
+#define SC2_MAX_CATALOG_TERRAIN_TEX  512
+#define SC2_MAX_CATALOG_CLIFFS       256
+#define SC2_MAX_CATALOG_TILES        512 // entries; covers dependency and map-local CTile catalogs
+#define SC2_MAX_CATALOG_SOUNDS       8192 // entries; covers Core, Liberty and campaign CSound layers
+#define SC2_HARD_TILE_HEADER_SIZE    28 // bytes; HRDT v102 header through block count
+#define SC2_HARD_TILE_RECORD_SIZE    58 // bytes; center, normal, endpoints, width/depth and flags
+#define SC2_HARD_TILE_NAME_PREFIX    3 // bytes; separator uint16_t followed by a zero byte
+#define SC2_HARD_TILE_NAME_SUFFIX    4 // bytes; unknown uint32_t after the terminated CTile ID
+#define SC2_MAX_CATALOG_PARENT_DEPTH 8
+#define SC2_MAX_CATALOG_INCLUDE_DEPTH 8
+#define SC2_ARRAY_LEN(x)             ((uint32_t)(sizeof(x) / sizeof((x)[0])))
+#define SC2_XML_STRING_FIELD(name, field) { name, offsetof(sc2MapObject_t, field), SC2_XML_FIELD_STRING, sizeof(((sc2MapObject_t *)0)->field) }
+#define SC2_XML_FIELD(name, field, type)  { name, offsetof(sc2MapObject_t, field), type, 0 }
+#define SC2_STRUCT_XML_STRING_FIELD(struct_type, name, field) { name, offsetof(struct_type, field), SC2_XML_FIELD_STRING, sizeof(((struct_type *)0)->field) }
+#define SC2_STRUCT_XML_FIELD(struct_type, name, field, field_type) { name, offsetof(struct_type, field), field_type, 0 }
+#define SC2_TERRAIN_XML_STRING_FIELD(name, field) { name, offsetof(sc2MapTerrain_t, field), SC2_XML_FIELD_STRING, sizeof(((sc2MapTerrain_t *)0)->field) }
+#define SC2_TERRAIN_XML_FIELD(name, field, type)  { name, offsetof(sc2MapTerrain_t, field), type, 0 }
+#define SC2_LIGHTING_XML_FIELD(name, field, type) { name, offsetof(sc2MapLighting_t, field), type, 0 }
+#define SC2_DIRECTIONAL_LIGHT_XML_FIELD(name, field, type) { name, offsetof(sc2DirectionalLight_t, field), type, 0 }
+
+typedef struct {
+    handle_t archive;
+    handle_t archive_data;
+    char   base[MAX_PATHLEN];
+} sc2MapSource_t;
+
+typedef struct {
+    char id[64];
+    char parent[64];
+    char race[64];
+    char path[256], image[256];
+    int variants; /* -1 inherits; zero selects the unsuffixed model. */
+} sc2CatalogModel_t;
+
+typedef struct {
+    char id[64];
+    char model[64];
+    char footprint[64];
+    char parent[64], portrait[64], icon[256], wireframe[256];
+} sc2CatalogActor_t;
+
+typedef struct {
+    char id[64];
+    char actor[64];
+    char footprint[64];
+    char mover[64];
+    uint32_t flags;
+    char parent[64];
+    float properties[24]; uint32_t property_mask;
+    bool has_radius, has_height;
+    float radius, height;
+    uint32_t first_card, last_card;
+    char name[128];
+    float armor;
+    bool has_armor;
+    uint32_t first_link, last_link; /* 1-based into sc2Catalog_t.links, in load order; 0 = none */
+    uint64_t target_flags, target_mask;
+} sc2CatalogUnit_t;
+
+/* One AbilArray/WeaponArray/BehaviorArray element. index<0 appends to the inherited array. */
+typedef struct {
+    char link[SC2_LINK_LEN];
+    uint32_t next;
+    int8_t index;
+    uint8_t kind;
+    bool removed;
+} sc2CatalogLink_t;
+
+typedef struct {
+    char name[64];
+    char model[256];
+    char footprint[64];
+    char mover[64];
+    float radius;
+    float footprint_width;
+    float footprint_height;
+    float footprint_radius;
+    float move_height;
+    uint32_t unit_flags, variation;
+    float unit_properties[24];
+} sc2ResolvedObjectModel_t;
+
+typedef struct {
+    char id[64];
+    float width;
+    float height;
+    float radius;
+} sc2CatalogFootprint_t;
+
+typedef struct {
+    char id[64];
+    char diffuse[256];
+    char normal[256];
+} sc2CatalogTerrainTex_t;
+
+typedef struct {
+    char id[64];
+    char mesh[64];
+} sc2CatalogCliff_t;
+
+typedef struct {
+    char id[64];
+    char model[256];
+} sc2CatalogTile_t;
+
+typedef struct {
+    char id[96];
+    char parent[96];
+    char path[256];
+} sc2CatalogSound_t;
+
+typedef struct sc2_convtext {
+    struct sc2_convtext *next;
+    char id[64], text[256];
+} sc2Convtext_t;
+
+
+
+typedef struct sc2_conversation {
+    struct sc2_conversation *next;
+    sc2Convtext_t *text;
+    char id[128], name[256], image[256];
+} sc2Conversation_t;
+
+
+
+typedef struct { sc2CardButton_t button; uint32_t next; } sc2CatalogCard_t;
+typedef struct { char id[64], parent[64]; float amount; bool has_amount; } sc2CatalogDamage_t;
+
+typedef struct {
+    uint32_t cards_count, buttons_count, weapons_count, damage_count;
+    sc2CatalogCard_t cards[16384];
+    sc2ButtonFace_t buttons[2048];
+    sc2WeaponPresentation_t weapons[2048];
+    sc2CatalogDamage_t damage[4096];
+    sc2Conversation_t *conv;
+    uint32_t models_count;
+    uint32_t actors_count;
+    uint32_t units_count;
+    uint32_t footprints_count;
+    uint32_t terrain_tex_count;
+    uint32_t cliffs_count;
+    uint32_t tiles_count;
+    uint32_t sounds_count;
+    sc2CatalogModel_t models[SC2_MAX_CATALOG_MODELS];
+    sc2CatalogActor_t actors[SC2_MAX_CATALOG_ACTORS];
+    sc2CatalogUnit_t units[SC2_MAX_CATALOG_UNITS];
+    sc2CatalogFootprint_t footprints[SC2_MAX_CATALOG_FOOTPRINTS];
+    sc2CatalogTerrainTex_t terrain_tex[SC2_MAX_CATALOG_TERRAIN_TEX];
+    sc2CatalogCliff_t cliffs[SC2_MAX_CATALOG_CLIFFS];
+    sc2CatalogTile_t tiles[SC2_MAX_CATALOG_TILES];
+    sc2CatalogSound_t sounds[SC2_MAX_CATALOG_SOUNDS];
+    uint32_t links_count;
+    sc2CatalogLink_t links[SC2_MAX_CATALOG_LINKS];
+} sc2Catalog_t;
+
+#define SC2_XML_FIELD_DWORD      BZ_FIELD_U32
+#define SC2_XML_FIELD_FLOAT      BZ_FIELD_FLOAT
+#define SC2_XML_FIELD_STRING     BZ_FIELD_CHAR_ARRAY
+#define SC2_XML_FIELD_VEC3       BZ_FIELD_VEC3
+#define SC2_XML_FIELD_COLOR_ARGB BZ_FIELD_COLOR32_ARGB
+#define SC2_XML_FIELD_COLOR_RGBA BZ_FIELD_COLOR32_RGBA
+
+typedef struct {
+    cstring_t        name;
+    size_t        offset;
+    bzFieldType_t type;
+    uint32_t         size;
+} sc2XmlField_t;
+
+typedef struct {
+    cstring_t name;
+    uint32_t  flag;
+} sc2XmlFlag_t;
+
+typedef struct {
+    cstring_t               node_name;
+    sc2XmlField_t const *fields;
+    uint32_t                num_fields;
+} sc2XmlNodeFields_t;
+
+static sc2MapHost_t sc2_host;
+static sc2Map_t     sc2_map;
+/* Kept alive after map load (not freed) so galaxy scripts can resolve models
+ * for units created at runtime (UnitCreate/UnitCargoCreate) that are never
+ * placed as map objects and therefore never enter sc2_map.objects[]. */
+static sc2Catalog_t *sc2_persistent_catalog;
+
+static cstring_t const sc2_catalog_roots[] = {
+    "Mods/Core.SC2Mod/Base.SC2Data",
+    "Mods/Liberty.SC2Mod/Base.SC2Data",
+    "Mods/LibertyMulti.SC2Mod/Base.SC2Data",
+    "Campaigns/LibertyStory.SC2Campaign/Base.SC2Data",
+    "Campaigns/Liberty.SC2Campaign/Base.SC2Data",
+    NULL,
+};
+
+static cstring_t const sc2_catalog_known_files[] = {
+    "GameData\\ButtonData.xml",
+    "GameData\\WeaponData.xml",
+    "GameData\\EffectData.xml",
+    "GameData\\UnitData.xml",
+    "GameData\\ModelData.xml",
+    "GameData\\ActorData.xml",
+    "GameData\\FootprintData.xml",
+    "GameData\\TerrainTexData.xml",
+    "GameData\\CliffData.xml",
+    "GameData\\TileData.xml",
+    "GameData\\SoundData.xml",
+    "GameData\\ConversationStateData.xml",
+    NULL,
+};
+
+static sc2XmlField_t const sc2_conv_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2Conversation_t, "Id", id),
+    SC2_STRUCT_XML_STRING_FIELD(sc2Conversation_t, "Name", name),
+    SC2_STRUCT_XML_STRING_FIELD(sc2Conversation_t, "ImagePath", image),
+
+};
+
+static sc2XmlField_t const sc2_conv_text_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2Convtext_t, "Id", id),
+    SC2_STRUCT_XML_STRING_FIELD(sc2Convtext_t, "Text", text),
+};
+
+static bool sc2_mapinfo_fourcc(sc2MapInfo_t const *mapInfo);
+static bool sc2_parse_xml_field(void *base, sc2XmlField_t const *fields, uint32_t num_fields, cstring_t name, cstring_t value);
+static cstring_t sc2_object_type_name(sc2ObjectType_t type);
+
+static handle_t sc2_alloc(long size) {
+    return sc2_host.mem_alloc ? sc2_host.mem_alloc(size) : NULL;
+}
+
+static void sc2_free(handle_t mem) {
+    if (!mem) return;
+    if (sc2_host.mem_free) sc2_host.mem_free(mem);
+}
+
+static handle_t sc2_read_file(cstring_t filename, uint32_t *size) {
+    return sc2_host.read_file ? sc2_host.read_file(filename, size) : NULL;
+}
+
+static void sc2_free_file(handle_t file) {
+    if (!file) return;
+    if (sc2_host.free_file) sc2_host.free_file(file);
+}
+
+static bool sc2_file_exists(cstring_t path) {
+    uint32_t size = 0;
+    handle_t data;
+
+    if (!path || !*path) return false;
+    data = sc2_read_file(path, &size);
+    if (data) sc2_free_file(data);
+    return data && size > 0;
+}
+
+/* Conversation strings share the catalog lifetime, including replacement on the next map load. */
+static void sc2_free_catalog(sc2Catalog_t *catalog) {
+    while (catalog->conv) {
+        sc2Conversation_t *next = catalog->conv->next;
+        while (catalog->conv->text) {
+            sc2Convtext_t *text = catalog->conv->text;
+            catalog->conv->text = text->next; sc2_free(text);
+        }
+        sc2_free(catalog->conv); catalog->conv = next;
+    }
+    sc2_free(catalog);
+}
+
+static void sc2_map_clear(void) {
+    SAFE_DELETE(sc2_persistent_catalog, sc2_free_catalog);
+    SAFE_DELETE(sc2_map.t3Terrain.ramps, sc2_free);
+    ARRAY_COUNT(sc2_map.t3Terrain.ramps) = 0;
+    SAFE_DELETE(sc2_map.t3CellFlags, sc2_free);
+    SAFE_DELETE(sc2_map.t3SyncCliffLevel, sc2_free);
+    SAFE_DELETE(sc2_map.t3HeightMap, sc2_free);
+    SAFE_DELETE(sc2_map.t3SyncHeightMap, sc2_free);
+    SAFE_DELETE(sc2_map.t3TextureMasks, sc2_free);
+    SAFE_DELETE(sc2_map.hard_tiles, sc2_free);
+    memset(&sc2_map, 0, sizeof(sc2_map));
+}
+
+static sc2MapInfo_t *sc2_ensure_mapinfo(void) {
+    if (!sc2_map.MapInfo.fourcc)
+        sc2_map.MapInfo.fourcc = MAKEFOURCC('M','a','p','I');
+    return &sc2_map.MapInfo;
+}
+
+static uint32_t sc2_map_width(void) {
+    return sc2_map.MapInfo.width;
+}
+
+static uint32_t sc2_map_height(void) {
+    return sc2_map.MapInfo.height;
+}
+
+static bool sc2_source_open(sc2MapSource_t *source, cstring_t mapFilename) {
+    uint32_t size = 0;
+    memset(source, 0, sizeof(*source));
+    if (mapFilename && *mapFilename) {
+        source->archive_data = sc2_read_file(mapFilename, &size);
+        if (source->archive_data && size > 0 &&
+            SFileOpenArchiveFromMemory(source->archive_data, size, 0, &source->archive)) {
+            return true;
+        }
+        snprintf(source->base, sizeof(source->base), "%s", mapFilename);
+    }
+    return true;
+}
+
+static void sc2_source_close(sc2MapSource_t *source) {
+    if (source->archive) SFileCloseArchive(source->archive);
+    sc2_free_file(source->archive_data);
+    memset(source, 0, sizeof(*source));
+}
+
+static handle_t sc2_source_read(sc2MapSource_t *source, cstring_t filename, uint32_t *size) {
+    PATHSTR path;
+    handle_t file;
+    uint32_t file_size;
+    uint8_t *data;
+
+    if (size) *size = 0;
+    if (!source || !filename || !*filename) return NULL;
+
+    if (source->archive) {
+        if (!SFileOpenFileEx(source->archive, filename, SFILE_OPEN_FROM_MPQ, &file)) {
+            snprintf(path, sizeof(path), "%s", filename);
+            for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
+            if (!SFileOpenFileEx(source->archive, path, SFILE_OPEN_FROM_MPQ, &file))
+                return NULL;
+        }
+        file_size = SFileGetFileSize(file, NULL);
+        data = sc2_alloc(file_size + 1);
+        if (!SFileReadFile(file, data, file_size, NULL, NULL)) {
+            SFileCloseFile(file);
+            sc2_free(data);
+            return NULL;
+        }
+        SFileCloseFile(file);
+        data[file_size] = 0;
+        if (size) *size = file_size;
+        return data;
+    }
+
+    if (!source->base[0])
+        return sc2_read_file(filename, size);
+    /* base + separator + filename can exceed PATHSTR; use a wider stack buffer */
+    char wide_path[MAX_PATHLEN + MAX_PATHLEN];
+    snprintf(wide_path, sizeof(wide_path), "%s/%s", source->base, filename);
+    data = sc2_read_file(wide_path, size);
+    if (!data) {
+        snprintf(wide_path, sizeof(wide_path), "%s\\%s", source->base, filename);
+        data = sc2_read_file(wide_path, size);
+    }
+    return data;
+}
+
+static xmlDoc *sc2_read_xml(sc2MapSource_t *source, cstring_t filename) {
+    uint32_t size = 0;
+    uint8_t *data = sc2_source_read(source, filename, &size);
+    xmlDoc *doc = NULL;
+    if (data && size > 0) {
+        doc = xmlReadMemory((char const *)data, (int)size, filename, NULL,
+                            XML_PARSE_RECOVER | XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    }
+    sc2_free_file(data);
+    return doc;
+}
+
+static xmlDoc *sc2_read_global_xml(cstring_t filename) {
+    uint32_t size = 0;
+    uint8_t *data = sc2_read_file(filename, &size);
+    xmlDoc *doc = NULL;
+
+    if (!data && filename) {
+        PATHSTR path;
+        snprintf(path, sizeof(path), "%s", filename);
+        for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+        data = sc2_read_file(path, &size);
+    }
+    if (data && size > 0) {
+        doc = xmlReadMemory((char const *)data, (int)size, filename, NULL,
+                            XML_PARSE_RECOVER | XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    }
+    sc2_free_file(data);
+    return doc;
+}
+
+static uint8_t *sc2_read_disk_file(cstring_t filename, uint32_t *size) {
+    FILE *file;
+    long file_size;
+    uint8_t *data;
+
+    if (size) *size = 0;
+    if (!filename || !*filename)
+        return NULL;
+    file = fopen(filename, "rb");
+    if (!file)
+        return NULL;
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    data = sc2_alloc(file_size + 1);
+    if (!data) {
+        fclose(file);
+        return NULL;
+    }
+    if (file_size > 0 && fread(data, 1, file_size, file) != (size_t)file_size) {
+        fclose(file);
+        sc2_free(data);
+        return NULL;
+    }
+    fclose(file);
+    data[file_size] = 0;
+    if (size) *size = (uint32_t)file_size;
+    return data;
+}
+
+static xmlDoc *sc2_read_catalog_xml_from_archive(cstring_t archive_name, cstring_t filename) {
+    uint32_t archive_size = 0;
+    uint32_t file_size;
+    uint8_t *archive_data;
+    uint8_t *data;
+    handle_t archive;
+    handle_t file;
+    xmlDoc *doc = NULL;
+    PATHSTR path;
+
+    if (!archive_name || !*archive_name || !filename || !*filename)
+        return NULL;
+    archive_data = sc2_read_disk_file(archive_name, &archive_size);
+    if (!archive_data || archive_size == 0 ||
+        !SFileOpenArchiveFromMemory(archive_data, archive_size, 0, &archive)) {
+        sc2_free(archive_data);
+        return NULL;
+    }
+    if (!SFileOpenFileEx(archive, filename, SFILE_OPEN_FROM_MPQ, &file)) {
+        snprintf(path, sizeof(path), "%s", filename);
+        for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+        if (!SFileOpenFileEx(archive, path, SFILE_OPEN_FROM_MPQ, &file)) {
+            SFileCloseArchive(archive);
+            sc2_free(archive_data);
+            return NULL;
+        }
+    }
+    file_size = SFileGetFileSize(file, NULL);
+    data = sc2_alloc(file_size + 1);
+    if (data && SFileReadFile(file, data, file_size, NULL, NULL)) {
+        data[file_size] = 0;
+        doc = xmlReadMemory((char const *)data, (int)file_size, filename, NULL,
+                            XML_PARSE_RECOVER | XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
+    }
+    sc2_free(data);
+    SFileCloseFile(file);
+    SFileCloseArchive(archive);
+    sc2_free(archive_data);
+    return doc;
+}
+
+static xmlDoc *sc2_read_catalog_xml(cstring_t root, cstring_t filename) {
+    PATHSTR path;
+    PATHSTR archive_path;
+    xmlDoc *doc;
+    cstring_t data_dir;
+
+    if (!root || !*root) return sc2_read_global_xml(filename);
+    /* Catalog roots already include Base.SC2Data; repeating it hid the base light/model catalogs. */
+    snprintf(path, sizeof(path), "%s/%s", root, filename);
+    doc = sc2_read_global_xml(path);
+    if (doc)
+        return doc;
+    data_dir = sc2_host.cvar_string ? sc2_host.cvar_string("data", "") : "";
+    if (data_dir && *data_dir) {
+        snprintf(archive_path, sizeof(archive_path), "%s/%s", data_dir, root);
+        return sc2_read_catalog_xml_from_archive(archive_path, filename);
+    }
+    snprintf(archive_path, sizeof(archive_path), "%s", root);
+    return sc2_read_catalog_xml_from_archive(archive_path, filename);
+}
+
+static xmlDoc *sc2_read_map_catalog_xml(sc2MapSource_t *source, cstring_t filename) {
+    PATHSTR path;
+    xmlDoc *doc;
+
+    snprintf(path, sizeof(path), "Base.SC2Data/%s", filename);
+    for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+    doc = sc2_read_xml(source, path);
+    if (doc)
+        return doc;
+    snprintf(path, sizeof(path), "Base.SC2Data\\%s", filename);
+    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
+    return sc2_read_xml(source, path);
+}
+
+static bool sc2_catalog_include_path(cstring_t in, string_t out, uint32_t out_size) {
+    char path[MAX_PATHLEN];
+    uint32_t len;
+
+    if (!in || !*in || !out || !out_size)
+        return false;
+    if (strlen(in) >= sizeof(path) || strlen(in) >= out_size)
+        return false;
+    if (in[0] == '/' || in[0] == '\\' || strchr(in, ':'))
+        return false;
+    snprintf(path, sizeof(path), "%s", in);
+    for (char *p = path; *p; p++) if (*p == '\\') *p = '/';
+    len = (uint32_t)strlen(path);
+    if (!len)
+        return false;
+    for (uint32_t i = 0; i <= len; ) {
+        uint32_t start = i;
+
+        while (i < len && path[i] != '/') i++;
+        if (i == start || (i == start + 1 && path[start] == '.') ||
+            (i == start + 2 && path[start] == '.' && path[start + 1] == '.'))
+            return false;
+        i++;
+    }
+    snprintf(out, out_size, "%s", path);
+    for (char *p = out; *p; p++) if (*p == '/') *p = '\\';
+    return true;
+}
+
+static xmlDoc *sc2_read_layer_catalog_xml(sc2MapSource_t *source, cstring_t root_name, cstring_t filename) {
+    return source ? sc2_read_map_catalog_xml(source, filename) : sc2_read_catalog_xml(root_name, filename);
+}
+
+static bool sc2_xml_attr(xmlNode *node, cstring_t attr_name, string_t buffer, uint32_t size) {
+    if (!node || !attr_name || !buffer || !size) return false;
+    for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+        xmlChar *text;
+
+        if (!sc2_streqi((char const *)attr->name, attr_name))
+            continue;
+        text = xmlNodeListGetString(node->doc, attr->children, 1);
+        if (!text) return false;
+        snprintf(buffer, size, "%s", (char const *)text);
+        xmlFree(text);
+        return buffer[0] != '\0';
+    }
+    return false;
+}
+
+static cstring_t sc2_xml_content(xmlNode *node, char *buffer, uint32_t size) {
+    xmlChar *text;
+    if (!node || !buffer || size == 0) return NULL;
+    text = xmlNodeGetContent(node);
+    if (!text) return NULL;
+    snprintf(buffer, size, "%s", (char const *)text);
+    xmlFree(text);
+    return buffer;
+}
+
+static void sc2_add_terrain_texture(cstring_t path) {
+    sc2TerrainTexture_t *texture;
+    char buffer[256];
+    char *ext;
+
+    if (!path || !*path || sc2_map.t3Terrain.num_terrain_textures >= SC2_MAX_TERRAIN_TEXTURES)
+        return;
+    snprintf(buffer, sizeof(buffer), "%s", path);
+    for (char *p = buffer; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+    if (sc2_path_has_dir(buffer)) {
+        sc2_append_extension(buffer, sizeof(buffer), ".dds");
+    }
+    FOR_LOOP(i, sc2_map.t3Terrain.num_terrain_textures) {
+        if (!strcasecmp(sc2_map.t3Terrain.terrain_textures[i].diffuse, buffer)) {
+            return;
+        }
+    }
+
+    texture = &sc2_map.t3Terrain.terrain_textures[sc2_map.t3Terrain.num_terrain_textures++];
+    snprintf(texture->diffuse, sizeof(texture->diffuse), "%s", buffer);
+    snprintf(texture->normal, sizeof(texture->normal), "%s", buffer);
+    ext = sc2_path_has_dir(texture->normal) ? strrchr(texture->normal, '.') : NULL;
+    if (ext && sc2_has_extension_i(texture->normal, ".dds")) {
+        snprintf(ext, sizeof(texture->normal) - (uint32_t)(ext - texture->normal), "_normal.dds");
+    }
+}
+
+static void sc2_parse_terrain_value(cstring_t key, cstring_t value) {
+    if (!key || !value || !*value)
+        return;
+    if (sc2_contains_i(key, "normal")) {
+        uint32_t index = sc2_map.t3Terrain.num_terrain_textures ? sc2_map.t3Terrain.num_terrain_textures - 1 : 0;
+        if (index < SC2_MAX_TERRAIN_TEXTURES) {
+            snprintf(sc2_map.t3Terrain.terrain_textures[index].normal,
+                     sizeof(sc2_map.t3Terrain.terrain_textures[index].normal),
+                     "%s",
+                     value);
+        }
+    } else if (sc2_contains_i(key, "texture") ||
+               sc2_contains_i(key, "diffuse") ||
+               sc2_contains_i(key, "blend") ||
+               sc2_contains_i(key, "file") ||
+               strstr(value, ".dds") ||
+               strstr(value, ".DDS")) {
+        sc2_add_terrain_texture(value);
+    }
+}
+
+static bool sc2_parse_argb_color(cstring_t text, color32_t *color) {
+    uint32_t a, r, g, b;
+
+    if (!text || !color)
+        return false;
+    if (sscanf(text, "%u,%u,%u,%u", &a, &r, &g, &b) == 4) {
+        *color = (color32_t){ (uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)a };
+        return true;
+    }
+    if (sscanf(text, "%u,%u,%u", &r, &g, &b) == 3) {
+        *color = (color32_t){ (uint8_t)r, (uint8_t)g, (uint8_t)b, 255 };
+        return true;
+    }
+    return false;
+}
+
+static bool sc2_parse_rgba_color(cstring_t text, color32_t *color) {
+    uint32_t r, g, b, a;
+
+    if (!text || !color)
+        return false;
+    if (sscanf(text, "%u,%u,%u,%u", &r, &g, &b, &a) == 4) {
+        *color = (color32_t){ (uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)a };
+        return true;
+    }
+    if (sscanf(text, "%u,%u,%u", &r, &g, &b) == 3) {
+        *color = (color32_t){ (uint8_t)r, (uint8_t)g, (uint8_t)b, 255 };
+        return true;
+    }
+    return false;
+}
+
+static float sc2_abs_float(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+static bool sc2_parse_float_pair(cstring_t text, float *x, float *y) {
+    float a, b;
+
+    if (!text || !x || !y) return false;
+    if (sscanf(text, "%f,%f", &a, &b) != 2) return false;
+    *x = a;
+    *y = b;
+    return true;
+}
+
+static bool sc2_parse_footprint_area(cstring_t text, float *width, float *height) {
+    float x0, y0, x1, y1;
+
+    if (!text || !width || !height) return false;
+    if (sscanf(text, "%f,%f,%f,%f", &x0, &y0, &x1, &y1) != 4) return false;
+    *width = sc2_abs_float(x1 - x0);
+    *height = sc2_abs_float(y1 - y0);
+    return *width > 0.0f && *height > 0.0f;
+}
+
+static sc2XmlField_t const sc2_terrain_data_fields[] = {
+    SC2_TERRAIN_XML_FIELD("FogDensity", fog_density, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("FogFalloff", fog_falloff, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("FogStartHeight", fog_start_height, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("FogStartingHeight", fog_start_height, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("FogColor", fog_color, SC2_XML_FIELD_COLOR_ARGB),
+};
+
+static sc2XmlField_t const sc2_light_data_fields[] = {
+    SC2_LIGHTING_XML_FIELD("Colorize", colorize, SC2_XML_FIELD_DWORD),
+    SC2_LIGHTING_XML_FIELD("AmbientColor", ambient_color, SC2_XML_FIELD_VEC3),
+    SC2_LIGHTING_XML_FIELD("ColorizationBlend", colorization_blend, SC2_XML_FIELD_FLOAT),
+};
+
+static sc2XmlField_t const sc2_directional_light_fields[] = {
+    SC2_DIRECTIONAL_LIGHT_XML_FIELD("Color", color, SC2_XML_FIELD_VEC3),
+    SC2_DIRECTIONAL_LIGHT_XML_FIELD("ColorMultiplier", color_multiplier, SC2_XML_FIELD_FLOAT),
+    SC2_DIRECTIONAL_LIGHT_XML_FIELD("SpecColorMultiplier", spec_color_multiplier, SC2_XML_FIELD_FLOAT),
+    SC2_DIRECTIONAL_LIGHT_XML_FIELD("Direction", direction, SC2_XML_FIELD_VEC3),
+};
+
+static void sc2_parse_terrain_data_node(xmlNode *node, cstring_t terrain_id) {
+    char id[64];
+    char value[256];
+
+    if (!node || node->type != XML_ELEMENT_NODE)
+        return;
+    if (sc2_streqi((char const *)node->name, "CTerrain") && sc2_xml_attr(node, "id", id, sizeof(id)))
+        terrain_id = id;
+    if (terrain_id && sc2_streqi(terrain_id, sc2_map.t3Terrain.tile_set) &&
+        sc2_xml_attr(node, "value", value, sizeof(value)) &&
+        sc2_parse_xml_field(&sc2_map.t3Terrain,
+                            sc2_terrain_data_fields,
+                            SC2_ARRAY_LEN(sc2_terrain_data_fields),
+                            (char const *)node->name,
+                            value)) {
+        sc2_map.t3Terrain.fog_enabled = true;
+    }
+    for (xmlNode *child = node->children; child; child = child->next)
+        sc2_parse_terrain_data_node(child, terrain_id);
+}
+
+static struct {
+    cstring_t name;
+    int    index;
+} const sc2_light_indices[] = {
+    { "Key",  SC2_LIGHT_KEY },
+    { "Fill", SC2_LIGHT_FILL },
+    { "Back", SC2_LIGHT_BACK },
+};
+
+static int sc2_light_index(cstring_t index) {
+    FOR_LOOP(i, SC2_ARRAY_LEN(sc2_light_indices))
+        if (sc2_streqi(index, sc2_light_indices[i].name)) return sc2_light_indices[i].index;
+    return -1;
+}
+
+static void sc2_init_directional_light(sc2DirectionalLight_t *light) {
+    if (!light || light->enabled)
+        return;
+    light->enabled = true;
+    light->color = (vec3_t){ 1.0f, 1.0f, 1.0f };
+    light->color_multiplier = 1.0f;
+    light->spec_color_multiplier = 1.0f;
+    light->direction = (vec3_t){ 0.0f, 0.0f, -1.0f };
+}
+
+static void sc2_parse_light_data_value(xmlNode *node, int light_index, cstring_t name, cstring_t value) {
+    sc2DirectionalLight_t *light;
+
+    if (!node || !name || !value || !*value)
+        return;
+    if (light_index >= 0 && light_index < SC2_MAX_DIRECTIONAL_LIGHTS) {
+        light = &sc2_map.lighting.directional[light_index];
+        sc2_init_directional_light(light);
+        sc2_parse_xml_field(light,
+                            sc2_directional_light_fields,
+                            SC2_ARRAY_LEN(sc2_directional_light_fields),
+                            name,
+                            value);
+        return;
+    }
+    sc2_parse_xml_field(&sc2_map.lighting,
+                        sc2_light_data_fields,
+                        SC2_ARRAY_LEN(sc2_light_data_fields),
+                        name,
+                        value);
+}
+
+static void sc2_parse_light_data_node(xmlNode *node, cstring_t light_id, int light_index) {
+    char id[64];
+    char value[256];
+    cstring_t field;
+
+    if (!node || node->type != XML_ELEMENT_NODE)
+        return;
+    if (sc2_streqi((char const *)node->name, "CLight")) {
+        if (!sc2_xml_attr(node, "id", id, sizeof(id)) || !sc2_streqi(id, sc2_map.t3Terrain.tile_set))
+            return;
+        snprintf(sc2_map.lighting.id, sizeof(sc2_map.lighting.id), "%s", id);
+        sc2_map.lighting.enabled = true;
+        light_id = sc2_map.lighting.id;
+        light_index = -1;
+    }
+    if (light_id && sc2_streqi(light_id, sc2_map.t3Terrain.tile_set)) {
+        if (sc2_streqi((char const *)node->name, "DirectionalLight") &&
+            sc2_xml_attr(node, "index", id, sizeof(id))) {
+            light_index = sc2_light_index(id);
+        }
+        for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+            xmlChar *text = xmlNodeListGetString(node->doc, attr->children, 1);
+            if (text) {
+                sc2_parse_light_data_value(node, light_index, (char const *)attr->name, (char const *)text);
+                xmlFree(text);
+            }
+        }
+        field = (char const *)node->name;
+        if (sc2_streqi(field, "Param") && sc2_xml_attr(node, "index", id, sizeof(id))) field = id;
+        if (sc2_xml_attr(node, "value", value, sizeof(value)))
+            sc2_parse_light_data_value(node, light_index, field, value);
+    }
+    for (xmlNode *child = node->children; child; child = child->next)
+        sc2_parse_light_data_node(child, light_id, light_index);
+}
+
+static void sc2_parse_cliff_set_node(xmlNode *node) {
+    char value[64];
+    uint32_t index;
+
+    if (!node || !sc2_streqi((char const *)node->name, "cliffSet"))
+        return;
+    if (!sc2_xml_attr(node, "i", value, sizeof(value)))
+        return;
+    index = (uint32_t)strtoul(value, NULL, 10);
+    if (index >= SC2_MAX_CLIFF_SETS)
+        return;
+    if (!sc2_xml_attr(node, "name", sc2_map.t3Terrain.cliff_sets[index].name, sizeof(sc2_map.t3Terrain.cliff_sets[index].name)))
+        return;
+    sc2_map.t3Terrain.num_cliff_sets = MAX(sc2_map.t3Terrain.num_cliff_sets, index + 1);
+}
+
+static void sc2_parse_cliff_cell_node(xmlNode *node) {
+    sc2CliffCell_t *cell;
+    char value[64];
+
+    if (!node || !sc2_streqi((char const *)node->name, "cc") || sc2_map.t3Terrain.num_cliff_cells >= SC2_MAX_CLIFF_CELLS)
+        return;
+    cell = &sc2_map.t3Terrain.cliff_cells[sc2_map.t3Terrain.num_cliff_cells];
+    memset(cell, 0, sizeof(*cell));
+    if (!sc2_xml_attr(node, "i", value, sizeof(value)))
+        return;
+    cell->index = (uint32_t)strtoul(value, NULL, 10);
+    if (sc2_xml_attr(node, "f", value, sizeof(value))) cell->flags = (uint32_t)strtoul(value, NULL, 10);
+    if (sc2_xml_attr(node, "cid", value, sizeof(value))) cell->cliff_set = (uint32_t)strtoul(value, NULL, 10);
+    if (sc2_xml_attr(node, "cvar", value, sizeof(value))) cell->variant = (uint32_t)strtoul(value, NULL, 10);
+    sc2_map.t3Terrain.num_cliff_cells++;
+}
+
+static void sc2_map_try_size_field(cstring_t key, cstring_t value) {
+    sc2MapInfo_t *mapInfo = sc2_ensure_mapinfo();
+    vec3_t v;
+    if (!mapInfo || !key || !value || !*value) return;
+    if ((sc2_contains_i(key, "width") || sc2_streqi(key, "x")) && atoi(value) > 0)
+        mapInfo->width = (uint32_t)atoi(value);
+    else if ((sc2_contains_i(key, "height") || sc2_streqi(key, "y")) && atoi(value) > 0)
+        mapInfo->height = (uint32_t)atoi(value);
+    else if ((sc2_contains_i(key, "size") || sc2_contains_i(key, "bounds")) && sc2_parse_vec3(value, &v)) {
+        if (v.x > 0) mapInfo->width = (uint32_t)v.x;
+        if (v.y > 0) mapInfo->height = (uint32_t)v.y;
+    } else if ((sc2_contains_i(key, "name") || sc2_contains_i(key, "title")) && !sc2_map.map_name[0]) {
+        snprintf(sc2_map.map_name, sizeof(sc2_map.map_name), "%s", value);
+    }
+}
+
+static void sc2_parse_mapinfo_node(xmlNode *node) {
+    char value[256];
+    if (!node || node->type != XML_ELEMENT_NODE) return;
+    for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+        xmlChar *text = xmlNodeListGetString(node->doc, attr->children, 1);
+        if (text) {
+            cstring_t key = sc2_streqi((char const *)attr->name, "value") ?
+                         (char const *)node->name : (char const *)attr->name;
+            sc2_map_try_size_field(key, (char const *)text);
+            xmlFree(text);
+        }
+    }
+    if (sc2_xml_content(node, value, sizeof(value)) && sc2_has_nonspace(value))
+        sc2_map_try_size_field((char const *)node->name, value);
+    for (xmlNode *child = node->children; child; child = child->next)
+        sc2_parse_mapinfo_node(child);
+}
+
+static bool sc2_parse_mapinfo_binary(sc2MapSource_t *source) {
+    uint32_t size = 0;
+    uint8_t *data = sc2_source_read(source, "MapInfo", &size);
+    uint32_t header_size = (uint32_t)(sizeof(sc2_map.MapInfo) - sizeof(sc2_map.MapInfo.data));
+
+    if (!data || size < header_size) {
+        sc2_free_file(data);
+        return false;
+    }
+    memset(&sc2_map.MapInfo, 0, sizeof(sc2_map.MapInfo));
+    memcpy(&sc2_map.MapInfo, data, MIN(size, (uint32_t)sizeof(sc2_map.MapInfo)));
+    sc2_free_file(data);
+    if (!sc2_mapinfo_fourcc(&sc2_map.MapInfo)) {
+        memset(&sc2_map.MapInfo, 0, sizeof(sc2_map.MapInfo));
+        return false;
+    }
+    if (!sc2_map.map_name[0] && sc2_map.MapInfo.data[0])
+        snprintf(sc2_map.map_name, sizeof(sc2_map.map_name), "%.*s",
+                 (int)(sizeof(sc2_map.map_name) - 1), (char const *)sc2_map.MapInfo.data);
+    return true;
+}
+
+static void sc2_parse_mapinfo(sc2MapSource_t *source) {
+    xmlDoc *doc;
+
+    if (sc2_parse_mapinfo_binary(source))
+        return;
+    doc = sc2_read_xml(source, "MapInfo");
+    if (!doc) doc = sc2_read_xml(source, "MapInfo.xml");
+    if (!doc) return;
+    sc2_ensure_mapinfo();
+    sc2_parse_mapinfo_node(xmlDocGetRootElement(doc));
+    xmlFreeDoc(doc);
+}
+
+static sc2XmlField_t const sc2_terrain_height_map_fields[] = {
+    SC2_TERRAIN_XML_STRING_FIELD("tileSet", tile_set),
+};
+
+static sc2XmlField_t const sc2_terrain_vert_data_fields[] = {
+    SC2_TERRAIN_XML_FIELD("quantizeBias", height_quantize_bias, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("quantizeScale", height_quantize_scale, SC2_XML_FIELD_FLOAT),
+    SC2_TERRAIN_XML_FIELD("standardHeight", standard_height, SC2_XML_FIELD_FLOAT),
+};
+
+static sc2XmlNodeFields_t const sc2_terrain_node_fields[] = {
+    { "heightMap", sc2_terrain_height_map_fields, SC2_ARRAY_LEN(sc2_terrain_height_map_fields) },
+    { "vertData",  sc2_terrain_vert_data_fields,  SC2_ARRAY_LEN(sc2_terrain_vert_data_fields) },
+};
+
+static void sc2_parse_terrain_field(xmlNode *node, cstring_t name, cstring_t value) {
+    FOR_LOOP(i, SC2_ARRAY_LEN(sc2_terrain_node_fields)) {
+        sc2XmlNodeFields_t const *mapping = &sc2_terrain_node_fields[i];
+        if (sc2_streqi((char const *)node->name, mapping->node_name)) {
+            sc2_parse_xml_field(&sc2_map.t3Terrain, mapping->fields, mapping->num_fields, name, value);
+            return;
+        }
+    }
+}
+
+/* Scalar attributes use the XML schema; the nested oriented-box grammar is one explicit production. */
+static sc2XmlField_t const sc2_ramp_fields[] = {
+    { "dir", offsetof(sc2Ramp_t, dir), BZ_FIELD_U32 },
+    { "hi", offsetof(sc2Ramp_t, hi), BZ_FIELD_U32 },
+    { "lo", offsetof(sc2Ramp_t, lo), BZ_FIELD_U32 },
+    { "cid", offsetof(sc2Ramp_t, cid), BZ_FIELD_U32 },
+    { "leftLoVar", offsetof(sc2Ramp_t, variant[0]), BZ_FIELD_U32 },
+    { "leftHiVar", offsetof(sc2Ramp_t, variant[1]), BZ_FIELD_U32 },
+    { "rightLoVar", offsetof(sc2Ramp_t, variant[2]), BZ_FIELD_U32 },
+    { "rightHiVar", offsetof(sc2Ramp_t, variant[3]), BZ_FIELD_U32 },
+};
+static struct { cstring_t name; size_t offset; } const sc2_ramp_boxes[] = {
+    { "leftLo", offsetof(sc2Ramp_t, edge[0]) },
+    { "leftHi", offsetof(sc2Ramp_t, edge[1]) },
+    { "rightLo", offsetof(sc2Ramp_t, edge[2]) },
+    { "rightHi", offsetof(sc2Ramp_t, edge[3]) },
+    { "base", offsetof(sc2Ramp_t, base) },
+    { "mid", offsetof(sc2Ramp_t, mid) },
+};
+
+static void sc2_parse_ramp_list(xmlNode *node) {
+    if (!sc2_streqi((cstring_t)node->name, "rampList")) return;
+    uint32_t count = 0;
+    for (xmlNode *child = node->children; child; child = child->next)
+        if (sc2_streqi((cstring_t)child->name, "ramp")) count++;
+    SAFE_DELETE(sc2_map.t3Terrain.ramps, sc2_free);
+    sc2_map.t3Terrain.ramps = count ? sc2_alloc(count * sizeof(sc2Ramp_t)) : NULL;
+    ARRAY_COUNT(sc2_map.t3Terrain.ramps) = 0;
+    for (xmlNode *child = node->children; child; child = child->next) {
+        if (!sc2_streqi((cstring_t)child->name, "ramp")) continue;
+        sc2Ramp_t *ramp = &sc2_map.t3Terrain.ramps[ARRAY_COUNT(sc2_map.t3Terrain.ramps)++];
+        memset(ramp, 0, sizeof(*ramp));
+        for (xmlAttr *attr = child->properties; attr; attr = attr->next) {
+            xmlChar *value = xmlNodeListGetString(child->doc, attr->children, 1);
+            if (!value) continue;
+            sc2_parse_xml_field(ramp, sc2_ramp_fields, SC2_ARRAY_LEN(sc2_ramp_fields), (cstring_t)attr->name, (cstring_t)value);
+            FOR_LOOP(i, SC2_ARRAY_LEN(sc2_ramp_boxes)) {
+                if (!sc2_streqi((cstring_t)attr->name, sc2_ramp_boxes[i].name)) continue;
+                sc2RampBox_t *box = (sc2RampBox_t *)((char *)ramp + sc2_ramp_boxes[i].offset);
+                if (sscanf((cstring_t)value, "u(%f, %f) r(%f, %f) c=(%f, %f) w=%f h=%f", &box->up.x, &box->up.y, &box->right.x, &box->right.y, &box->center.x, &box->center.y, &box->width, &box->height) != 8)
+                    fprintf(stderr, "SC2 ramp: invalid %s box '%s'\n", sc2_ramp_boxes[i].name, value);
+            }
+            xmlFree(value);
+        }
+    }
+}
+
+static void sc2_parse_terrain_node(xmlNode *node) {
+    char value[256];
+
+    if (!node || node->type != XML_ELEMENT_NODE)
+        return;
+    sc2_parse_ramp_list(node);
+    sc2_parse_cliff_set_node(node);
+    sc2_parse_cliff_cell_node(node);
+    for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+        xmlChar *text = xmlNodeListGetString(node->doc, attr->children, 1);
+        if (text) {
+            cstring_t key = (sc2_contains_i((char const *)node->name, "texture") &&
+                          sc2_streqi((char const *)attr->name, "name")) ?
+                         (char const *)node->name : (char const *)attr->name;
+            sc2_parse_terrain_field(node, (char const *)attr->name, (char const *)text);
+            sc2_parse_terrain_value(key, (char const *)text);
+            xmlFree(text);
+        }
+    }
+    if (sc2_xml_content(node, value, sizeof(value)) && sc2_has_nonspace(value)) {
+        sc2_parse_terrain_value((char const *)node->name, value);
+    }
+    for (xmlNode *child = node->children; child; child = child->next) {
+        sc2_parse_terrain_node(child);
+    }
+}
+
+static void sc2_parse_terrain(sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_xml(source, "t3Terrain.xml");
+    if (!doc) doc = sc2_read_xml(source, "t3Terrain");
+    if (!doc) return;
+    sc2_parse_terrain_node(xmlDocGetRootElement(doc));
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_terrain_data(sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_xml(source, "Base.SC2Data/GameData/TerrainData.xml");
+    if (!doc) doc = sc2_read_xml(source, "Base.SC2Data\\GameData\\TerrainData.xml");
+    if (!doc) return;
+    sc2_parse_terrain_data_node(xmlDocGetRootElement(doc), NULL);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_terrain_data_catalog_file(cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\TerrainData.xml");
+    if (!doc) return;
+    sc2_parse_terrain_data_node(xmlDocGetRootElement(doc), NULL);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_terrain_data_catalogs(void) {
+    for (uint32_t i = 0; sc2_catalog_roots[i]; i++)
+        sc2_parse_terrain_data_catalog_file(sc2_catalog_roots[i]);
+    sc2_parse_terrain_data_catalog_file("");
+}
+
+static void sc2_parse_light_data(sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_xml(source, "Base.SC2Data/GameData/LightData.xml");
+    if (!doc) doc = sc2_read_xml(source, "Base.SC2Data\\GameData\\LightData.xml");
+    if (!doc) return;
+    sc2_parse_light_data_node(xmlDocGetRootElement(doc), NULL, -1);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_light_data_catalog_file(cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\LightData.xml");
+    if (!doc) return;
+    sc2_parse_light_data_node(xmlDocGetRootElement(doc), NULL, -1);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_light_data_catalogs(void) {
+    for (uint32_t i = 0; sc2_catalog_roots[i]; i++)
+        sc2_parse_light_data_catalog_file(sc2_catalog_roots[i]);
+    sc2_parse_light_data_catalog_file("");
+}
+
+static void sc2_set_object_model(sc2MapObject_t *object) {
+    if (!object->model[0] && object->name[0] && object->type == SC2_OBJECT_UNIT)
+        snprintf(object->model, sizeof(object->model), "Assets\\Units\\Terran\\%s\\%s.m3", object->name, object->name);
+}
+
+static sc2XmlField_t const sc2_object_fields[] = {
+    SC2_XML_FIELD("Id", id, SC2_XML_FIELD_DWORD),
+    SC2_XML_STRING_FIELD("Name", name),
+    SC2_XML_STRING_FIELD("Model", model),
+    SC2_XML_STRING_FIELD("File", model),
+    SC2_XML_FIELD("Position", position, SC2_XML_FIELD_VEC3),
+    SC2_XML_FIELD("x", position.x, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("y", position.y, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("z", position.z, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Rotation", angle, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Angle", angle, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Yaw", angle, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Scale", scale, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Variation", variation, SC2_XML_FIELD_DWORD),
+    SC2_XML_FIELD("Player", player, SC2_XML_FIELD_DWORD),
+    SC2_XML_FIELD("Owner", player, SC2_XML_FIELD_DWORD),
+    SC2_XML_FIELD("Section", section, SC2_XML_FIELD_DWORD),
+    SC2_XML_FIELD("Resources", resources, SC2_XML_FIELD_DWORD),
+    SC2_XML_FIELD("TintColor", tint_color, SC2_XML_FIELD_COLOR_RGBA),
+    SC2_XML_FIELD("Color", color, SC2_XML_FIELD_COLOR_RGBA),
+};
+
+static sc2XmlField_t const sc2_unit_fields[] = {
+    SC2_XML_STRING_FIELD("UnitType", name),
+};
+
+static sc2XmlField_t const sc2_doodad_fields[] = {
+    SC2_XML_STRING_FIELD("Type", name),
+};
+
+static sc2XmlField_t const sc2_point_fields[] = {
+    SC2_XML_STRING_FIELD("Type", type_name),
+    SC2_XML_STRING_FIELD("AnimProps", anim_props),
+    SC2_XML_STRING_FIELD("Sound", sound),
+    SC2_XML_STRING_FIELD("AttachID", attach_id),
+    SC2_XML_FIELD("ObjectID", object_id, SC2_XML_FIELD_DWORD),
+    SC2_XML_STRING_FIELD("ObjectType", object_type),
+    SC2_XML_FIELD("PathingSoftRadius", pathing_soft_radius, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("PathingHardRadius", pathing_hard_radius, SC2_XML_FIELD_FLOAT),
+};
+
+static sc2XmlField_t const sc2_camera_fields[] = {
+    SC2_XML_FIELD("CameraTarget", camera.target, SC2_XML_FIELD_VEC3),
+    SC2_XML_FIELD("Target", camera.target, SC2_XML_FIELD_VEC3),
+};
+
+static sc2XmlField_t const sc2_camera_value_fields[] = {
+    SC2_XML_FIELD("Distance", camera.distance, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Pitch", camera.pitch, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("Yaw", camera.yaw, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("FieldOfView", camera.fov, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("NearClip", camera.znear, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("FarClip", camera.zfar, SC2_XML_FIELD_FLOAT),
+    SC2_XML_FIELD("HeightOffset", camera.height_offset, SC2_XML_FIELD_FLOAT),
+};
+
+static sc2XmlFlag_t const sc2_object_flags[] = {
+    { "HeightAbsolute", SC2_OBJECT_HEIGHT_ABSOLUTE },
+    { "HeightOffset",   SC2_OBJECT_HEIGHT_OFFSET },
+    { "ForcePlacement", SC2_OBJECT_FORCE_PLACEMENT },
+};
+
+static bool sc2_parse_xml_field(void *base, sc2XmlField_t const *fields, uint32_t num_fields, cstring_t name, cstring_t value) {
+    if (!base || !fields || !name || !value || !*value)
+        return false;
+    FOR_LOOP(i, num_fields) {
+        sc2XmlField_t const *field = &fields[i];
+        char *out = (char *)base + field->offset;
+        if (!sc2_streqi(name, field->name))
+            continue;
+        switch (field->type) {
+            case SC2_XML_FIELD_DWORD:
+                *(uint32_t *)out = (uint32_t)strtoul(value, NULL, 10);
+                return true;
+            case SC2_XML_FIELD_FLOAT:
+                *(float *)out = strtof(value, NULL);
+                return true;
+            case SC2_XML_FIELD_STRING:
+                snprintf(out, field->size, "%s", value);
+                return true;
+            case SC2_XML_FIELD_VEC3:
+                return sc2_parse_vec3(value, (vec3_t *)out);
+            case SC2_XML_FIELD_COLOR_ARGB:
+                return sc2_parse_argb_color(value, (color32_t *)out);
+            case SC2_XML_FIELD_COLOR_RGBA:
+                return sc2_parse_rgba_color(value, (color32_t *)out);
+            default: return false; /* BZ_FIELD_BOOL / BZ_FIELD_CSTR / BZ_FIELD_FOURCC not used in SC2 XML */
+        }
+    }
+    return false;
+}
+
+/* Catalog scalar children share one DDX-style decoder; nested productions stay with their owning grammar. */
+static bool sc2_parse_xml_child_field(void *base, sc2XmlField_t const *fields, uint32_t num_fields,
+                                      xmlNode *node, cstring_t attr_name) {
+    char value[256];
+
+    if (!node || node->type != XML_ELEMENT_NODE || !sc2_xml_attr(node, attr_name, value, sizeof(value))) return false;
+    return sc2_parse_xml_field(base, fields, num_fields, (cstring_t)node->name, value);
+}
+
+static void sc2_parse_object_field(sc2MapObject_t *object, sc2XmlField_t const *fields, uint32_t num_fields, cstring_t key, cstring_t value, bool *has_position) {
+    if (sc2_parse_xml_field(object, fields, num_fields, key, value) &&
+        (sc2_streqi(key, "Position") || sc2_streqi(key, "CameraTarget") ||
+         sc2_streqi(key, "x") || sc2_streqi(key, "y")) &&
+        has_position)
+        *has_position = true;
+}
+
+static void sc2_parse_object_fields(sc2MapObject_t *object, sc2ObjectType_t type, cstring_t key, cstring_t value, bool *has_position) {
+    sc2_parse_object_field(object, sc2_object_fields, SC2_ARRAY_LEN(sc2_object_fields), key, value, has_position);
+    switch (type) {
+        case SC2_OBJECT_UNIT:
+            sc2_parse_object_field(object, sc2_unit_fields, SC2_ARRAY_LEN(sc2_unit_fields), key, value, has_position);
+            break;
+        case SC2_OBJECT_DOODAD:
+            sc2_parse_object_field(object, sc2_doodad_fields, SC2_ARRAY_LEN(sc2_doodad_fields), key, value, has_position);
+            break;
+        case SC2_OBJECT_POINT:
+            sc2_parse_object_field(object, sc2_point_fields, SC2_ARRAY_LEN(sc2_point_fields), key, value, has_position);
+            break;
+        case SC2_OBJECT_CAMERA:
+            sc2_parse_object_field(object, sc2_camera_fields, SC2_ARRAY_LEN(sc2_camera_fields), key, value, has_position);
+            break;
+    }
+}
+
+static struct {
+    cstring_t          name;
+    sc2ObjectType_t type;
+    bool            contains;
+} const sc2_object_types[] = {
+    { "ObjectUnit",   SC2_OBJECT_UNIT,   true }, { "Unit",   SC2_OBJECT_UNIT,   false },
+    { "ObjectDoodad", SC2_OBJECT_DOODAD, true }, { "Doodad", SC2_OBJECT_DOODAD, false },
+    { "ObjectPoint",  SC2_OBJECT_POINT,  true }, { "Point",  SC2_OBJECT_POINT,  false },
+    { "ObjectCamera", SC2_OBJECT_CAMERA, true }, { "Camera", SC2_OBJECT_CAMERA, false },
+};
+
+static bool sc2_object_type(xmlNode *node, sc2ObjectType_t *type) {
+    cstring_t name = (char const *)node->name;
+
+    FOR_LOOP(i, SC2_ARRAY_LEN(sc2_object_types)) {
+        if ((sc2_object_types[i].contains && sc2_contains_i(name, sc2_object_types[i].name)) ||
+            (!sc2_object_types[i].contains && sc2_streqi(name, sc2_object_types[i].name))) {
+            *type = sc2_object_types[i].type;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sc2_object_flag(sc2MapObject_t *object, xmlNode *node) {
+    char index[64];
+    char value[64];
+
+    if (!object || !sc2_contains_i((char const *)node->name, "Flag"))
+        return;
+    if (!sc2_xml_attr(node, "Index", index, sizeof(index)) ||
+        !sc2_xml_attr(node, "Value", value, sizeof(value)) ||
+        !atoi(value))
+        return;
+    FOR_LOOP(i, SC2_ARRAY_LEN(sc2_object_flags)) {
+        if (sc2_streqi(index, sc2_object_flags[i].name)) {
+            object->flags |= sc2_object_flags[i].flag;
+            return;
+        }
+    }
+}
+
+static void sc2_parse_object_node(xmlNode *node) {
+    sc2MapObject_t object;
+    bool has_position = false;
+    sc2ObjectType_t type;
+    char value[256];
+
+    if (!node || node->type != XML_ELEMENT_NODE) return;
+    if (!sc2_object_type(node, &type)) {
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_object_node(child);
+        return;
+    }
+    memset(&object, 0, sizeof(object));
+    object.scale = 1.0f;
+    object.type = type;
+
+    for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+        xmlChar *text = xmlNodeListGetString(node->doc, attr->children, 1);
+        if (text) {
+            sc2_parse_object_fields(&object, type, (char const *)attr->name, (char const *)text, &has_position);
+            xmlFree(text);
+        }
+    }
+    for (xmlNode *child = node->children; child; child = child->next) {
+        char index[64];
+        if (child->type != XML_ELEMENT_NODE)
+            continue;
+        sc2_object_flag(&object, child);
+        if (type == SC2_OBJECT_CAMERA &&
+            sc2_contains_i((char const *)child->name, "CameraValue") &&
+            sc2_xml_attr(child, "Index", index, sizeof(index)) &&
+            sc2_xml_attr(child, "Value", value, sizeof(value))) {
+            sc2_parse_object_field(&object,
+                                   sc2_camera_value_fields,
+                                   SC2_ARRAY_LEN(sc2_camera_value_fields),
+                                   index,
+                                   value,
+                                   NULL);
+            continue;
+        }
+        if (sc2_xml_content(child, value, sizeof(value))) {
+            sc2_parse_object_fields(&object, type, (char const *)child->name, value, &has_position);
+        }
+    }
+
+    if (has_position && (object.name[0] || object.model[0])) {
+        if (sc2_map.num_objects < SC2_MAX_MAP_OBJECTS) {
+            sc2_set_object_model(&object);
+            sc2_map.objects[sc2_map.num_objects++] = object;
+        }
+    }
+}
+
+static void sc2_parse_objects(sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_xml(source, "Objects");
+    if (!doc) doc = sc2_read_xml(source, "Objects.xml");
+    if (!doc) return;
+    sc2_parse_object_node(xmlDocGetRootElement(doc));
+    xmlFreeDoc(doc);
+}
+
+/* Catalog layers override only supplied fields; absent values retain their dependency's definition. */
+static void sc2_catalog_add_model(sc2Catalog_t *catalog, sc2CatalogModel_t const *src) {
+    sc2CatalogModel_t *model = NULL;
+    FOR_LOOP(i, catalog->models_count)
+        if (!strcasecmp(catalog->models[i].id, src->id)) { model = &catalog->models[i]; break; }
+    if (!model) {
+        if (catalog->models_count >= SC2_MAX_CATALOG_MODELS) {
+            fprintf(stderr, "SC2 catalog: model capacity exhausted at %s\n", src->id); return;
+        }
+        model = &catalog->models[catalog->models_count++]; model->variants = -1;
+        snprintf(model->id, sizeof(model->id), "%s", src->id);
+    }
+    if (*src->parent) snprintf(model->parent, sizeof(model->parent), "%s", src->parent);
+    if (*src->race) snprintf(model->race, sizeof(model->race), "%s", src->race);
+    if (*src->path) snprintf(model->path, sizeof(model->path), "%s", src->path);
+    if (*src->image) snprintf(model->image,sizeof(model->image),"%s",src->image);
+    if (src->variants >= 0) model->variants = src->variants;
+    sc2_normalize_slashes(model->path);
+}
+
+static void sc2_catalog_add_sound(sc2Catalog_t *catalog, sc2CatalogSound_t const *src) {
+    sc2CatalogSound_t *sound = NULL;
+    FOR_LOOP(i, catalog->sounds_count)
+        if (!strcasecmp(catalog->sounds[i].id, src->id)) { sound = &catalog->sounds[i]; break; }
+    if (!sound) {
+        if (catalog->sounds_count >= SC2_MAX_CATALOG_SOUNDS) {
+            fprintf(stderr, "SC2 catalog: sound capacity exhausted at %s\n", src->id); return;
+        }
+        sound = &catalog->sounds[catalog->sounds_count++];
+        snprintf(sound->id, sizeof(sound->id), "%s", src->id);
+    }
+    if (*src->parent) snprintf(sound->parent, sizeof(sound->parent), "%s", src->parent);
+    if (*src->path) snprintf(sound->path, sizeof(sound->path), "%s", src->path);
+    sc2_normalize_slashes(sound->path);
+}
+
+static void sc2_catalog_add_actor(sc2Catalog_t *catalog, cstring_t id, cstring_t model_id, cstring_t footprint) {
+    sc2CatalogActor_t *actor;
+
+    if (!catalog || !id || !*id || ((!model_id || !*model_id) && (!footprint || !*footprint))) return;
+    FOR_LOOP(i, catalog->actors_count) {
+        if (!strcasecmp(catalog->actors[i].id, id)) {
+            if (model_id && *model_id)
+                snprintf(catalog->actors[i].model, sizeof(catalog->actors[i].model), "%s", model_id);
+            if (footprint && *footprint)
+                snprintf(catalog->actors[i].footprint, sizeof(catalog->actors[i].footprint), "%s", footprint);
+            return;
+        }
+    }
+    if (catalog->actors_count >= SC2_MAX_CATALOG_ACTORS) return;
+    actor = &catalog->actors[catalog->actors_count++];
+    snprintf(actor->id, sizeof(actor->id), "%s", id);
+    snprintf(actor->model, sizeof(actor->model), "%s", model_id ? model_id : "");
+    snprintf(actor->footprint, sizeof(actor->footprint), "%s", footprint ? footprint : "");
+}
+
+static sc2XmlFlag_t const sc2_unit_flags[] = {
+    { "Movable",   SC2_UNIT_FLAG_MOVABLE },
+    { "Worker",    SC2_UNIT_FLAG_WORKER },
+    { "Resource",  SC2_UNIT_FLAG_RESOURCE },
+    { "Structure", SC2_UNIT_FLAG_STRUCTURE },
+};
+
+static uint32_t sc2_unit_flag(cstring_t name) {
+    if (!name || !*name) return 0;
+    FOR_LOOP(i, SC2_ARRAY_LEN(sc2_unit_flags))
+        if (sc2_streqi(name, sc2_unit_flags[i].name)) return sc2_unit_flags[i].flag;
+    return 0;
+}
+
+static sc2CatalogUnit_t *sc2_catalog_add_unit(sc2Catalog_t *catalog,
+                                 cstring_t id,
+                                 cstring_t actor_id,
+                                 cstring_t footprint,
+                                 cstring_t mover,
+                                 uint32_t flags,
+                                 float radius,
+                                 bool has_radius,
+                                 float height,
+                                 bool has_height, sc2CatalogUnit_t const *src) {
+    sc2CatalogUnit_t *unit;
+
+    if (!catalog || !id || !*id)
+        return NULL;
+    FOR_LOOP(i, catalog->units_count) {
+        if (!strcasecmp(catalog->units[i].id, id)) {
+            if (actor_id && *actor_id)
+                snprintf(catalog->units[i].actor, sizeof(catalog->units[i].actor), "%s", actor_id);
+            if (footprint && *footprint)
+                snprintf(catalog->units[i].footprint, sizeof(catalog->units[i].footprint), "%s", footprint);
+            if (mover && *mover)
+                snprintf(catalog->units[i].mover, sizeof(catalog->units[i].mover), "%s", mover);
+            if (*src->name) snprintf(catalog->units[i].name,sizeof(catalog->units[i].name),"%s",src->name);
+            if (src->has_armor) { catalog->units[i].armor=src->armor; catalog->units[i].has_armor=true; }
+            if (*src->parent) snprintf(catalog->units[i].parent,sizeof(catalog->units[i].parent),"%s",src->parent);
+            for (int p=0;p<24;p++) if (src->property_mask & (1u<<p)) catalog->units[i].properties[p]=src->properties[p];
+            catalog->units[i].property_mask |= src->property_mask;
+            catalog->units[i].target_flags=(catalog->units[i].target_flags & ~src->target_mask) | src->target_flags;
+            catalog->units[i].target_mask |= src->target_mask;
+            catalog->units[i].flags |= flags;
+            if (has_radius) {
+                catalog->units[i].has_radius = true;
+                catalog->units[i].radius = radius;
+            }
+            if (has_height) {
+                catalog->units[i].has_height = true;
+                catalog->units[i].height = height;
+            }
+            return &catalog->units[i];
+        }
+    }
+    if (catalog->units_count >= SC2_MAX_CATALOG_UNITS) { fprintf(stderr,"SC2 CUnit catalog full: dropped '%s'\n",id); return NULL; }
+    unit = &catalog->units[catalog->units_count++];
+    *unit = *src;
+    snprintf(unit->id, sizeof(unit->id), "%s", id);
+    snprintf(unit->actor, sizeof(unit->actor), "%s", actor_id ? actor_id : "");
+    snprintf(unit->footprint, sizeof(unit->footprint), "%s", footprint ? footprint : "");
+    snprintf(unit->mover, sizeof(unit->mover), "%s", mover ? mover : "");
+    unit->flags = flags;
+    unit->has_radius = has_radius;
+    unit->radius = has_radius ? radius : 0.0f;
+    unit->has_height = has_height;
+    unit->height = has_height ? height : 0.0f;
+    unit->first_card = unit->last_card = 0;
+    unit->first_link = unit->last_link = 0;
+    return unit;
+}
+
+/* Later layers append after earlier ones, so resolution replays every definition in load order. */
+static void sc2_catalog_add_links(sc2Catalog_t *catalog, sc2CatalogUnit_t *unit, sc2CatalogLink_t const *links, uint32_t count) {
+    if (!unit) return;
+    FOR_LOOP(i, count) {
+        if (catalog->links_count + 1 >= SC2_MAX_CATALOG_LINKS) {
+            fprintf(stderr, "SC2 CUnit array catalog full: dropped '%s' entries of '%s'\n", links[i].link, unit->id);
+            return;
+        }
+        uint32_t n = ++catalog->links_count;
+        catalog->links[n] = links[i]; catalog->links[n].next = 0;
+        if (unit->last_link) catalog->links[unit->last_link].next = n; else unit->first_link = n;
+        unit->last_link = n;
+    }
+}
+
+static int sc2_unit_link_kind(cstring_t name) {
+    if (sc2_streqi(name, "AbilArray")) return SC2_LINK_ABIL;
+    if (sc2_streqi(name, "WeaponArray")) return SC2_LINK_WEAPON;
+    if (sc2_streqi(name, "BehaviorArray")) return SC2_LINK_BEHAVIOR;
+    return -1;
+}
+
+static void sc2_catalog_add_terrain_tex(sc2Catalog_t *catalog, cstring_t id, cstring_t diffuse, cstring_t normal) {
+    sc2CatalogTerrainTex_t *tex;
+
+    if (!catalog || !id || !*id || !diffuse || !*diffuse) return;
+    FOR_LOOP(i, catalog->terrain_tex_count) {
+        if (!strcasecmp(catalog->terrain_tex[i].id, id)) {
+            snprintf(catalog->terrain_tex[i].diffuse, sizeof(catalog->terrain_tex[i].diffuse), "%s", diffuse);
+            snprintf(catalog->terrain_tex[i].normal, sizeof(catalog->terrain_tex[i].normal), "%s", normal ? normal : "");
+            sc2_normalize_slashes(catalog->terrain_tex[i].diffuse);
+            sc2_normalize_slashes(catalog->terrain_tex[i].normal);
+            return;
+        }
+    }
+    if (catalog->terrain_tex_count >= SC2_MAX_CATALOG_TERRAIN_TEX) return;
+    tex = &catalog->terrain_tex[catalog->terrain_tex_count++];
+    snprintf(tex->id, sizeof(tex->id), "%s", id);
+    snprintf(tex->diffuse, sizeof(tex->diffuse), "%s", diffuse);
+    snprintf(tex->normal, sizeof(tex->normal), "%s", normal ? normal : "");
+    sc2_normalize_slashes(tex->diffuse);
+    sc2_normalize_slashes(tex->normal);
+}
+
+static void sc2_catalog_add_cliff(sc2Catalog_t *catalog, cstring_t id, cstring_t mesh) {
+    sc2CatalogCliff_t *cliff;
+
+    if (!catalog || !id || !*id || !mesh || !*mesh) return;
+    FOR_LOOP(i, catalog->cliffs_count) {
+        if (!strcasecmp(catalog->cliffs[i].id, id)) {
+            snprintf(catalog->cliffs[i].mesh, sizeof(catalog->cliffs[i].mesh), "%s", mesh);
+            return;
+        }
+    }
+    if (catalog->cliffs_count >= SC2_MAX_CATALOG_CLIFFS) return;
+    cliff = &catalog->cliffs[catalog->cliffs_count++];
+    snprintf(cliff->id, sizeof(cliff->id), "%s", id);
+    snprintf(cliff->mesh, sizeof(cliff->mesh), "%s", mesh);
+}
+
+static void sc2_catalog_add_tile(sc2Catalog_t *catalog, cstring_t id, cstring_t model) {
+    sc2CatalogTile_t *tile;
+
+    if (!catalog || !id || !*id || !model || !*model) return;
+    FOR_LOOP(i, catalog->tiles_count) {
+        if (strcasecmp(catalog->tiles[i].id, id)) continue;
+        snprintf(catalog->tiles[i].model, sizeof(catalog->tiles[i].model), "%s", model);
+        sc2_normalize_slashes(catalog->tiles[i].model);
+        return;
+    }
+    if (catalog->tiles_count >= SC2_MAX_CATALOG_TILES) return;
+    tile = &catalog->tiles[catalog->tiles_count++];
+    snprintf(tile->id, sizeof(tile->id), "%s", id);
+    snprintf(tile->model, sizeof(tile->model), "%s", model);
+    sc2_normalize_slashes(tile->model);
+}
+
+static void sc2_catalog_add_footprint(sc2Catalog_t *catalog,
+                                      cstring_t id,
+                                      float width,
+                                      float height,
+                                      float radius) {
+    sc2CatalogFootprint_t *footprint;
+
+    if (!catalog || !id || !*id || (width <= 0.0f && height <= 0.0f && radius <= 0.0f))
+        return;
+    if (radius <= 0.0f)
+        radius = MAX(width, height) * 0.5f;
+    if (width <= 0.0f)
+        width = radius * 2.0f;
+    if (height <= 0.0f)
+        height = radius * 2.0f;
+    FOR_LOOP(i, catalog->footprints_count) {
+        if (!strcasecmp(catalog->footprints[i].id, id)) {
+            catalog->footprints[i].width = width;
+            catalog->footprints[i].height = height;
+            catalog->footprints[i].radius = radius;
+            return;
+        }
+    }
+    if (catalog->footprints_count >= SC2_MAX_CATALOG_FOOTPRINTS) return;
+    footprint = &catalog->footprints[catalog->footprints_count++];
+    snprintf(footprint->id, sizeof(footprint->id), "%s", id);
+    footprint->width = width;
+    footprint->height = height;
+    footprint->radius = radius;
+}
+
+static sc2CatalogModel_t const *sc2_catalog_model(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->models_count) {
+        if (!strcasecmp(catalog->models[i].id, id)) return &catalog->models[i];
+    }
+    return NULL;
+}
+
+static sc2CatalogSound_t const *sc2_catalog_sound(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->sounds_count)
+        if (!strcasecmp(catalog->sounds[i].id, id)) return &catalog->sounds[i];
+    return NULL;
+}
+
+static bool sc2_append_text(string_t out, uint32_t out_size, uint32_t *pos, cstring_t text) {
+    uint32_t len;
+
+    if (!out || !out_size || !pos || !text) return false;
+    len = (uint32_t)strlen(text);
+    if (*pos + len >= out_size) return false;
+    memcpy(out + *pos, text, len);
+    *pos += len;
+    out[*pos] = '\0';
+    return true;
+}
+
+static bool sc2_catalog_expand_model_path(cstring_t path, cstring_t id, cstring_t race, string_t out, uint32_t out_size) {
+    uint32_t pos = 0;
+
+    if (!path || !*path || !id || !*id || !out || !out_size) return false;
+    out[0] = '\0';
+    for (cstring_t p = path; *p; ) {
+        if (!strncmp(p, "##id##", 6)) {
+            if (!sc2_append_text(out, out_size, &pos, id)) return false;
+            p += 6;
+        } else if (!strncmp(p, "##Race##", 8)) {
+            if (!race || !*race || !sc2_append_text(out, out_size, &pos, race)) return false;
+            p += 8;
+        } else if (!strncmp(p, "##", 2)) {
+            return false;
+        } else {
+            if (pos + 1 >= out_size) return false;
+            out[pos++] = *p++;
+            out[pos] = '\0';
+        }
+    }
+    sc2_normalize_slashes(out);
+    return out[0] != '\0';
+}
+
+static bool sc2_catalog_resolve_model_path_r(sc2Catalog_t const *catalog,
+                                             sc2CatalogModel_t const *model,
+                                             cstring_t id,
+                                             cstring_t race,
+                                             string_t out,
+                                             uint32_t out_size,
+                                             uint32_t depth) {
+    if (!catalog || !model || !out || !out_size || depth > SC2_MAX_CATALOG_PARENT_DEPTH) return false;
+    if (model->path[0]) {
+        return sc2_catalog_expand_model_path(model->path,
+                                             id && *id ? id : model->id,
+                                             race && *race ? race : model->race,
+                                             out,
+                                             out_size);
+    }
+    if (model->parent[0]) {
+        return sc2_catalog_resolve_model_path_r(catalog,
+                                                sc2_catalog_model(catalog, model->parent),
+                                                id && *id ? id : model->id,
+                                                race && *race ? race : model->race,
+                                                out,
+                                                out_size,
+                                                depth + 1);
+    }
+    return false;
+}
+
+/* VariationCount selects numbered assets; the map's Variation is part of the model lookup key. */
+static bool sc2_catalog_model_path(sc2Catalog_t const *catalog, cstring_t id, sc2MapObject_t *object) {
+    sc2CatalogModel_t const *model = sc2_catalog_model(catalog, id), *cur = model;
+    char path[sizeof(object->model)];
+    if (!sc2_catalog_resolve_model_path_r(catalog, model, id, model ? model->race : NULL, path, sizeof(path), 0))
+        return false;
+    FOR_LOOP(depth, SC2_MAX_CATALOG_PARENT_DEPTH) {
+        if (!cur || cur->variants >= 0) break;
+        cur = sc2_catalog_model(catalog, cur->parent);
+    }
+    if (cur && cur->variants > 0) {
+        char *ext = strrchr(path, '.');
+        char suffix[16];
+        if (!ext) { fprintf(stderr, "SC2 catalog: model stem has no extension: %s\n", path); return false; }
+        if (object->variation >= (uint32_t)cur->variants)
+            fprintf(stderr, "SC2 catalog: variation %u exceeds count %d for %s; preserving requested asset\n", object->variation, cur->variants, id);
+        /* The original path is a catalog stem, not an existing unsuffixed M3. */
+        *ext = 0;
+        snprintf(suffix, sizeof(suffix), "_%02u.m3", object->variation);
+        strlcpy(object->model, path, sizeof(object->model));
+        strlcat(object->model, suffix, sizeof(object->model));
+    } else snprintf(object->model, sizeof(object->model), "%s", path);
+    return true;
+}
+
+static cstring_t sc2_catalog_cliff_mesh(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->cliffs_count) {
+        if (!strcasecmp(catalog->cliffs[i].id, id)) return catalog->cliffs[i].mesh;
+    }
+    return NULL;
+}
+
+static bool sc2_cliff_mesh_exists(cstring_t mesh) {
+    char path[256];
+
+    if (!mesh || !*mesh) return false;
+    snprintf(path, sizeof(path), "Assets\\Cliffs\\%s\\%s_ABBB_00.m3", mesh, mesh);
+    return sc2_file_exists(path);
+}
+
+static cstring_t sc2_cliff_mesh_fallback(cstring_t name) {
+    uint32_t len;
+
+    if (!name || !*name) return NULL;
+    if (sc2_cliff_mesh_exists(name)) return name;
+    len = (uint32_t)strlen(name);
+    if (len >= 6 && !strcasecmp(name + len - 6, "Cliff0") && sc2_cliff_mesh_exists("CliffNatural0"))
+        return "CliffNatural0";
+    if (len >= 6 && !strcasecmp(name + len - 6, "Cliff1") && sc2_cliff_mesh_exists("CliffMade0"))
+        return "CliffMade0";
+    return NULL;
+}
+
+static sc2CatalogActor_t const *sc2_catalog_actor(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->actors_count) {
+        if (!strcasecmp(catalog->actors[i].id, id)) return &catalog->actors[i];
+    }
+    return NULL;
+}
+
+static cstring_t sc2_catalog_actor_model(sc2Catalog_t const *catalog, cstring_t id) {
+    sc2CatalogActor_t const *actor = sc2_catalog_actor(catalog, id);
+    return actor && actor->model[0] ? actor->model : NULL;
+}
+
+static cstring_t sc2_catalog_actor_footprint(sc2Catalog_t const *catalog, cstring_t id) {
+    sc2CatalogActor_t const *actor = sc2_catalog_actor(catalog, id);
+    return actor && actor->footprint[0] ? actor->footprint : NULL;
+}
+
+static sc2CatalogUnit_t const *sc2_catalog_unit(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->units_count) {
+        if (!strcasecmp(catalog->units[i].id, id)) return &catalog->units[i];
+    }
+    return NULL;
+}
+
+static sc2CatalogFootprint_t const *sc2_catalog_footprint(sc2Catalog_t const *catalog, cstring_t id) {
+    if (!catalog || !id || !*id) return NULL;
+    FOR_LOOP(i, catalog->footprints_count) {
+        if (!strcasecmp(catalog->footprints[i].id, id)) return &catalog->footprints[i];
+    }
+    return NULL;
+}
+
+static cstring_t sc2_catalog_terrain_diffuse(sc2Catalog_t const *catalog, cstring_t id, cstring_t *normal) {
+    char key[64];
+
+    if (normal) *normal = NULL;
+    if (!catalog || !id || !*id) return NULL;
+    snprintf(key, sizeof(key), "%s", id);
+    if (sc2_has_extension_i(key, ".dds")) {
+        char *ext = strrchr(key, '.');
+        if (ext) *ext = '\0';
+    }
+    FOR_LOOP(i, catalog->terrain_tex_count) {
+        if (!strcasecmp(catalog->terrain_tex[i].id, key)) {
+            if (normal) *normal = catalog->terrain_tex[i].normal;
+            return catalog->terrain_tex[i].diffuse;
+        }
+    }
+    return NULL;
+}
+
+static bool sc2_terrain_texture_path_from_tileset(cstring_t id,
+                                                  string_t diffuse,
+                                                  uint32_t diffuse_size,
+                                                  string_t normal,
+                                                  uint32_t normal_size) {
+    char suffix[128];
+    char path[256];
+    uint32_t tile_len;
+
+    if (!id || !*id || !sc2_map.t3Terrain.tile_set[0] || !diffuse || !normal)
+        return false;
+    tile_len = (uint32_t)strlen(sc2_map.t3Terrain.tile_set);
+    if (strncasecmp(id, sc2_map.t3Terrain.tile_set, tile_len) || !id[tile_len])
+        return false;
+    sc2_camel_to_underscore(id + tile_len, suffix, sizeof(suffix));
+    snprintf(path, sizeof(path), "Assets\\Textures\\%s_%s.dds", sc2_map.t3Terrain.tile_set, suffix);
+    if (!sc2_file_exists(path))
+        return false;
+    snprintf(diffuse, diffuse_size, "%s", path);
+    snprintf(path, sizeof(path), "Assets\\Textures\\%s_%sNormal.dds", sc2_map.t3Terrain.tile_set, suffix);
+    snprintf(normal, normal_size, "%s", sc2_file_exists(path) ? path : diffuse);
+    return true;
+}
+
+static sc2XmlField_t const sc2_catalog_model_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogModel_t, "Model", path),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogModel_t, "Image", image),
+    SC2_STRUCT_XML_FIELD(sc2CatalogModel_t, "VariationCount", variants, SC2_XML_FIELD_DWORD),
+};
+
+static sc2XmlField_t const sc2_catalog_sound_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogSound_t, "AssetArray", path),
+};
+
+static sc2XmlField_t const sc2_catalog_actor_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogActor_t, "PortraitModel", portrait),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogActor_t, "UnitIcon", icon),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogActor_t, "Model", model),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogActor_t, "Footprint", footprint),
+};
+
+static sc2XmlField_t const sc2_catalog_unit_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogUnit_t, "Name", name),
+    SC2_STRUCT_XML_FIELD(sc2CatalogUnit_t, "LifeArmor", armor, SC2_XML_FIELD_FLOAT),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogUnit_t, "Actor", actor),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogUnit_t, "Footprint", footprint),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogUnit_t, "Mover", mover),
+    SC2_STRUCT_XML_FIELD(sc2CatalogUnit_t, "Radius", radius, SC2_XML_FIELD_FLOAT),
+    SC2_STRUCT_XML_FIELD(sc2CatalogUnit_t, "Height", height, SC2_XML_FIELD_FLOAT),
+};
+
+static sc2XmlField_t const sc2_catalog_terrain_tex_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogTerrainTex_t, "Texture", diffuse),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogTerrainTex_t, "Normalmap", normal),
+};
+
+static sc2XmlField_t const sc2_catalog_cliff_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogCliff_t, "CliffMesh", mesh),
+};
+
+static sc2XmlField_t const sc2_catalog_tile_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CatalogTile_t, "Material", model),
+};
+
+static void sc2_parse_model_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        sc2CatalogModel_t model = { .variants = -1 };
+        if (node->type != XML_ELEMENT_NODE || !sc2_contains_i((char const *)node->name, "CModel")) continue;
+        if (!sc2_xml_attr(node, "id", model.id, sizeof(model.id))) continue;
+        sc2_xml_attr(node, "parent", model.parent, sizeof(model.parent));
+        sc2_xml_attr(node, "Race", model.race, sizeof(model.race));
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_xml_child_field(&model, sc2_catalog_model_fields, SC2_ARRAY_LEN(sc2_catalog_model_fields), child, "value");
+        sc2_catalog_add_model(catalog, &model);
+    }
+}
+
+static void sc2_parse_sound_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        sc2CatalogSound_t sound = {0};
+        if (node->type != XML_ELEMENT_NODE || !sc2_streqi((char const *)node->name, "CSound")) continue;
+        if (!sc2_xml_attr(node, "id", sound.id, sizeof(sound.id))) continue;
+        sc2_xml_attr(node, "parent", sound.parent, sizeof(sound.parent));
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_xml_child_field(&sound, sc2_catalog_sound_fields, SC2_ARRAY_LEN(sc2_catalog_sound_fields), child, "File");
+        sc2_catalog_add_sound(catalog, &sound);
+    }
+}
+
+static void sc2_parse_model_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\ModelData.xml");
+
+    sc2_parse_model_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_model_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\ModelData.xml");
+
+    sc2_parse_model_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_actor_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        char unit_name[64] = "";
+        sc2CatalogActor_t actor = {0};
+        bool actor_node;
+
+        if (node->type != XML_ELEMENT_NODE) continue;
+        actor_node = sc2_contains_i((char const *)node->name, "CActorUnit") ||
+                     sc2_contains_i((char const *)node->name, "CActorDoodad");
+        if (!actor_node || !sc2_xml_attr(node, "id", id, sizeof(id))) continue;
+        sc2_xml_attr(node, "unitName", unit_name, sizeof(unit_name));
+        sc2_xml_attr(node, "parent", actor.parent, sizeof(actor.parent));
+        for (xmlNode *child=node->children;child;child=child->next) {
+            sc2_parse_xml_child_field(&actor,sc2_catalog_actor_fields,SC2_ARRAY_LEN(sc2_catalog_actor_fields),child,"value");
+            if (sc2_streqi((cstring_t)child->name,"Wireframe"))
+                for (xmlNode *image=child->children;image;image=image->next)
+                    if (sc2_streqi((cstring_t)image->name,"Image")) sc2_xml_attr(image,"value",actor.wireframe,sizeof(actor.wireframe));
+        }
+        if (!actor.model[0]) snprintf(actor.model, sizeof(actor.model), "%s", id);
+        sc2_catalog_add_actor(catalog, id, actor.model, actor.footprint);
+        if (unit_name[0]) sc2_catalog_add_actor(catalog,unit_name,actor.model,actor.footprint);
+        for (uint32_t i=0;i<catalog->actors_count;i++) {
+            sc2CatalogActor_t *dst=&catalog->actors[i];
+            if (strcmp(dst->id,id) && (!unit_name[0] || strcmp(dst->id,unit_name))) continue;
+            #define SC2_ACTOR_COPY(field) if (*actor.field) snprintf(dst->field,sizeof(dst->field),"%s",actor.field)
+            SC2_ACTOR_COPY(parent); SC2_ACTOR_COPY(portrait); SC2_ACTOR_COPY(icon); SC2_ACTOR_COPY(wireframe);
+            #undef SC2_ACTOR_COPY
+        }
+    }
+}
+
+static void sc2_parse_actor_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\ActorData.xml");
+
+    sc2_parse_actor_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_actor_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\ActorData.xml");
+
+    sc2_parse_actor_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+/* Property slots are the native c_unitProp indices; omitted scalar fields inherit. */
+static cstring_t const sc2_unit_property_fields[24] = {
+    "LifeStart", NULL, "LifeMax", "LifeRegenRate", "EnergyStart", NULL, "EnergyMax", "EnergyRegenRate",
+    "ShieldStart", NULL, "ShieldMax", "ShieldRegenRate", NULL, NULL, NULL, NULL, NULL, NULL,
+    "Acceleration", "Height", "Speed", "TurningRate", NULL, "Radius"
+};
+
+static sc2XmlField_t const sc2_button_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2ButtonFace_t, "Icon", icon),
+    SC2_STRUCT_XML_STRING_FIELD(sc2ButtonFace_t, "Name", name),
+    SC2_STRUCT_XML_STRING_FIELD(sc2ButtonFace_t, "Tooltip", tooltip),
+    SC2_STRUCT_XML_STRING_FIELD(sc2ButtonFace_t, "Hotkey", hotkey),
+};
+static sc2XmlField_t const sc2_weapon_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2WeaponPresentation_t, "Effect", effect),
+    SC2_STRUCT_XML_STRING_FIELD(sc2WeaponPresentation_t, "Icon", icon),
+    SC2_STRUCT_XML_FIELD(sc2WeaponPresentation_t, "Range", range, SC2_XML_FIELD_FLOAT),
+    SC2_STRUCT_XML_FIELD(sc2WeaponPresentation_t, "Period", period, SC2_XML_FIELD_FLOAT),
+};
+static sc2XmlField_t const sc2_card_fields[] = {
+    SC2_STRUCT_XML_STRING_FIELD(sc2CardButton_t, "Face", face),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CardButton_t, "Type", type),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CardButton_t, "AbilCmd", abilcmd),
+    SC2_STRUCT_XML_STRING_FIELD(sc2CardButton_t, "Submenu", submenu),
+    SC2_STRUCT_XML_FIELD(sc2CardButton_t, "Row", row, SC2_XML_FIELD_DWORD),
+    SC2_STRUCT_XML_FIELD(sc2CardButton_t, "Column", column, SC2_XML_FIELD_DWORD),
+    SC2_STRUCT_XML_FIELD(sc2CardButton_t, "index", index, SC2_XML_FIELD_DWORD),
+};
+
+static void sc2_parse_presentation_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root=xmlDocGetRootElement(doc);
+    for (xmlNode *node=root ? root->children : NULL; node; node=node->next) {
+        char id[64], parent[64];
+        cstring_t tag=(cstring_t)node->name;
+        bool button=sc2_streqi(tag,"CButton"), weapon=sc2_contains_i(tag,"CWeapon"), damage=sc2_streqi(tag,"CEffectDamage");
+        if (!button && !weapon && !damage) continue;
+        if (!sc2_xml_attr(node,"id",id,sizeof(id))) {
+            char def[8];
+            if (!sc2_xml_attr(node,"default",def,sizeof(def)) || !atoi(def)) continue;
+            snprintf(id,sizeof(id),"$%s",tag);
+        }
+        void *row=NULL;
+        uint32_t *count=button ? &catalog->buttons_count : weapon ? &catalog->weapons_count : &catalog->damage_count;
+        size_t stride=button ? sizeof(catalog->buttons[0]) : weapon ? sizeof(catalog->weapons[0]) : sizeof(catalog->damage[0]);
+        void *rows=button ? (void *)catalog->buttons : weapon ? (void *)catalog->weapons : (void *)catalog->damage;
+        uint32_t capacity=button ? SC2_ARRAY_LEN(catalog->buttons) : weapon ? SC2_ARRAY_LEN(catalog->weapons) : SC2_ARRAY_LEN(catalog->damage);
+        for (uint32_t i=0;i<*count;i++) if (!strcmp((char *)rows+i*stride,id)) { row=(char *)rows+i*stride; break; }
+        if (!row) {
+            if (*count==capacity) { fprintf(stderr,"SC2 %s catalog full: '%s'\n",tag,id); continue; }
+            row=(char *)rows+(*count)++*stride;
+            snprintf(row,64,"%s",id);
+        }
+        if (sc2_xml_attr(node,"parent",parent,sizeof(parent))) snprintf((char *)row+64,64,"%s",parent);
+        for (xmlNode *child=node->children;child;child=child->next) {
+            if (button) sc2_parse_xml_child_field(row,sc2_button_fields,SC2_ARRAY_LEN(sc2_button_fields),child,"value");
+            else if (weapon) sc2_parse_xml_child_field(row,sc2_weapon_fields,SC2_ARRAY_LEN(sc2_weapon_fields),child,"value");
+            else {
+                static sc2XmlField_t const fields[]={ SC2_STRUCT_XML_FIELD(sc2CatalogDamage_t,"Amount",amount,SC2_XML_FIELD_FLOAT) };
+                if (sc2_parse_xml_child_field(row,fields,SC2_ARRAY_LEN(fields),child,"value")) ((sc2CatalogDamage_t *)row)->has_amount=true;
+            }
+        }
+    }
+}
+
+static void sc2_parse_unit_cards(sc2Catalog_t *catalog, sc2CatalogUnit_t *unit, xmlNode *node) {
+    for (xmlNode *layout=node->children;layout;layout=layout->next) {
+        char index[64];
+        if (!sc2_streqi((cstring_t)layout->name,"CardLayouts")) continue;
+        /* Named submenus are separate cards; the selected-unit HUD starts at card zero. */
+        if (sc2_xml_attr(layout,"index",index,sizeof(index)) && strcmp(index,"0")) continue;
+        uint32_t slot=0;
+        for (xmlNode *child=layout->children;child;child=child->next) {
+            if (!sc2_streqi((cstring_t)child->name,"LayoutButtons")) continue;
+            if (catalog->cards_count+1==SC2_ARRAY_LEN(catalog->cards)) { fprintf(stderr,"SC2 command cards full: '%s'\n",unit->id); return; }
+            sc2CatalogCard_t *card=&catalog->cards[++catalog->cards_count];
+            card->button.index=slot++;
+            for (uint32_t i=0;i<SC2_ARRAY_LEN(sc2_card_fields);i++) {
+                char value[256];
+                if (sc2_xml_attr(child,sc2_card_fields[i].name,value,sizeof(value)))
+                    sc2_parse_xml_field(&card->button,sc2_card_fields,SC2_ARRAY_LEN(sc2_card_fields),sc2_card_fields[i].name,value);
+            }
+            card->button.removed=sc2_xml_attr(child,"removed",index,sizeof(index)) && atoi(index);
+            if (unit->last_card) catalog->cards[unit->last_card].next=catalog->cards_count;
+            else unit->first_card=catalog->cards_count;
+            unit->last_card=catalog->cards_count;
+        }
+    }
+}
+
+/* ETargetFilter bit numbers from retail TriggerLibs/GameData/Game.galaxy. */
+static int sc2_catalog_target_bit(cstring_t name) {
+    static struct { cstring_t name; int bit; } const fields[]={
+        {"Air",5},{"Ground",6},{"Light",7},{"Armored",8},{"Biological",9},{"Robotic",10},
+        {"Mechanical",11},{"Psionic",12},{"Massive",13},{"Structure",14},{"Hover",15},
+        {"Heroic",16},{"Worker",17},{"Resource",18},{"HarvestableResource",19},{"Missile",20},
+        {"Destructible",21},{"Item",22},{"Uncommandable",23},{"PreventDefeat",26},{"PreventReveal",27}
+    };
+    FOR_LOOP(i,SC2_ARRAY_LEN(fields)) if (!strcmp(name,fields[i].name)) return fields[i].bit;
+    return -1;
+}
+static void sc2_parse_unit_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        sc2CatalogUnit_t unit = {0};
+        bool has_radius = false, has_height = false;
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_contains_i((char const *)node->name, "CUnit"))
+            continue;
+        if (!sc2_xml_attr(node,"id",id,sizeof(id))) {
+            char def[16]; if (!sc2_xml_attr(node,"default",def,sizeof(def)) || !atoi(def)) continue;
+            snprintf(id,sizeof(id),"$CUnit");
+        }
+        sc2_xml_attr(node,"parent",unit.parent,sizeof(unit.parent));
+        sc2CatalogLink_t links[SC2_MAX_UNIT_LINK_ENTRIES];
+        uint32_t link_n = 0;
+        for (xmlNode *child = node->children; child; child = child->next) {
+            char value[64];
+            if (sc2_streqi((cstring_t)child->name,"Attributes") || sc2_streqi((cstring_t)child->name,"FlagArray") || sc2_streqi((cstring_t)child->name,"PlaneArray")) {
+                char index[64];
+                if (sc2_xml_attr(child,"index",index,sizeof(index)) && sc2_xml_attr(child,"value",value,sizeof(value))) {
+                    int bit=sc2_catalog_target_bit(index);
+                    if (bit>=0) { unit.target_mask|=1ull<<bit; if (atoi(value)) unit.target_flags|=1ull<<bit; }
+                }
+            }
+            int kind = child->type == XML_ELEMENT_NODE ? sc2_unit_link_kind((char const *)child->name) : -1;
+            if (kind >= 0) {
+                sc2CatalogLink_t *e = &links[link_n];
+                char index[16];
+                if (link_n == SC2_MAX_UNIT_LINK_ENTRIES) { fprintf(stderr,"SC2 CUnit '%s': array entries dropped\n",id); continue; }
+                *e = (sc2CatalogLink_t){ .kind = (uint8_t)kind, .index = -1 };
+                if (sc2_xml_attr(child, "index", index, sizeof(index))) e->index = (int8_t)MIN(127, MAX(0, atoi(index)));
+                e->removed = sc2_xml_attr(child, "removed", value, sizeof(value)) && atoi(value);
+                sc2_xml_attr(child, "Link", e->link, sizeof(e->link));
+                /* A Turret-only WeaponArray element changes presentation, not membership. */
+                if (e->removed || e->link[0]) link_n++;
+                continue;
+            }
+            for (int p=0;p<24;p++) if (sc2_unit_property_fields[p] && sc2_streqi((char const *)child->name,sc2_unit_property_fields[p]) && sc2_xml_attr(child,"value",value,sizeof(value))) {
+                unit.properties[p]=strtof(value,NULL); unit.property_mask |= 1u<<p;
+            }
+            if (sc2_streqi((char const *)child->name,"Food") && sc2_xml_attr(child,"value",value,sizeof(value))) {
+                float food=strtof(value,NULL); unit.properties[12]=MAX(0,-food); unit.properties[13]=MAX(0,food);
+                unit.property_mask |= (1u<<12)|(1u<<13);
+            }
+
+            if (sc2_parse_xml_child_field(&unit, sc2_catalog_unit_fields, SC2_ARRAY_LEN(sc2_catalog_unit_fields), child, "value")) {
+                if (sc2_streqi((char const *)child->name, "LifeArmor")) unit.has_armor=true;
+                if (sc2_streqi((char const *)child->name, "Radius")) has_radius = unit.radius > 0.0f;
+                if (sc2_streqi((char const *)child->name, "Height")) has_height = true;
+            } else if (child->type == XML_ELEMENT_NODE && sc2_contains_i((char const *)child->name, "Flag")) {
+                char index[64];
+                if ((sc2_xml_attr(child, "index", index, sizeof(index)) ||
+                     sc2_xml_attr(child, "Index", index, sizeof(index))) &&
+                    (sc2_xml_attr(child, "value", value, sizeof(value)) ||
+                     sc2_xml_attr(child, "Value", value, sizeof(value))) &&
+                    atoi(value)) {
+                    unit.flags |= sc2_unit_flag(index);
+                }
+            }
+        }
+
+        sc2CatalogUnit_t *stored=sc2_catalog_add_unit(catalog,id,unit.actor,unit.footprint,unit.mover,unit.flags,
+            unit.radius,has_radius,unit.height,has_height,&unit);
+        sc2_catalog_add_links(catalog,stored,links,link_n);
+        if (stored) sc2_parse_unit_cards(catalog,stored,node);
+    }
+}
+
+static void sc2_parse_unit_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\UnitData.xml");
+
+    sc2_parse_unit_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_unit_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\UnitData.xml");
+
+    sc2_parse_unit_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_footprint_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        float width = 0.0f;
+        float height = 0.0f;
+        float radius = 0.0f;
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_contains_i((char const *)node->name, "CFootprint"))
+            continue;
+        if (!sc2_xml_attr(node, "id", id, sizeof(id))) continue;
+        for (xmlNode *child = node->children; child; child = child->next) {
+            char value[64];
+            float child_width;
+            float child_height;
+
+            if (child->type != XML_ELEMENT_NODE) continue;
+            if (sc2_streqi((char const *)child->name, "Layers") &&
+                sc2_xml_attr(child, "Area", value, sizeof(value)) &&
+                sc2_parse_footprint_area(value, &child_width, &child_height) &&
+                child_width * child_height >= width * height) {
+                width = child_width;
+                height = child_height;
+            } else if (sc2_streqi((char const *)child->name, "Size") &&
+                       sc2_xml_attr(child, "value", value, sizeof(value)) &&
+                       sc2_parse_float_pair(value, &child_width, &child_height) &&
+                       child_width > 0.0f && child_height > 0.0f) {
+                width = child_width;
+                height = child_height;
+            } else if (sc2_streqi((char const *)child->name, "Shape")) {
+                if (sc2_xml_attr(child, "Radius", value, sizeof(value)) ||
+                    sc2_xml_attr(child, "radius", value, sizeof(value))) {
+                    sscanf(value, "%f", &radius);
+                }
+                for (xmlNode *shape = child->children; shape; shape = shape->next) {
+                    if (shape->type == XML_ELEMENT_NODE &&
+                        sc2_streqi((char const *)shape->name, "Radius") &&
+                        sc2_xml_attr(shape, "value", value, sizeof(value))) {
+                        sscanf(value, "%f", &radius);
+                    }
+                }
+            }
+        }
+        sc2_catalog_add_footprint(catalog, id, width, height, radius);
+    }
+}
+
+static void sc2_parse_footprint_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\FootprintData.xml");
+
+    sc2_parse_footprint_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_footprint_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\FootprintData.xml");
+
+    sc2_parse_footprint_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_terrain_tex_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        sc2CatalogTerrainTex_t tex = {0};
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_contains_i((char const *)node->name, "CTerrainTex"))
+            continue;
+        if (!sc2_xml_attr(node, "id", id, sizeof(id))) continue;
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_xml_child_field(&tex, sc2_catalog_terrain_tex_fields, SC2_ARRAY_LEN(sc2_catalog_terrain_tex_fields), child, "value");
+        sc2_catalog_add_terrain_tex(catalog, id, tex.diffuse, tex.normal);
+    }
+}
+
+static void sc2_parse_terrain_tex_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\TerrainTexData.xml");
+
+    sc2_parse_terrain_tex_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_terrain_tex_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\TerrainTexData.xml");
+
+    sc2_parse_terrain_tex_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_cliff_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        sc2CatalogCliff_t cliff = {0};
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_contains_i((char const *)node->name, "CCliff"))
+            continue;
+        if (!sc2_xml_attr(node, "id", id, sizeof(id))) continue;
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_xml_child_field(&cliff, sc2_catalog_cliff_fields, SC2_ARRAY_LEN(sc2_catalog_cliff_fields), child, "value");
+        sc2_catalog_add_cliff(catalog, id, cliff.mesh);
+    }
+}
+
+static void sc2_parse_cliff_catalog_file(sc2Catalog_t *catalog, cstring_t root_name) {
+    xmlDoc *doc = sc2_read_catalog_xml(root_name, "GameData\\CliffData.xml");
+
+    sc2_parse_cliff_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_cliff_catalog_source(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    xmlDoc *doc = sc2_read_map_catalog_xml(source, "GameData\\CliffData.xml");
+
+    sc2_parse_cliff_catalog_doc(catalog, doc);
+    xmlFreeDoc(doc);
+}
+
+static void sc2_parse_tile_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root;
+
+    if (!doc) return;
+    root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char id[64];
+        sc2CatalogTile_t tile = {0};
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_streqi((char const *)node->name, "CTile")) continue;
+        if (!sc2_xml_attr(node, "id", id, sizeof(id))) continue;
+        for (xmlNode *child = node->children; child; child = child->next)
+            sc2_parse_xml_child_field(&tile, sc2_catalog_tile_fields, SC2_ARRAY_LEN(sc2_catalog_tile_fields), child, "value");
+        sc2_catalog_add_tile(catalog, id, tile.model);
+    }
+}
+
+/* Indices use both compact attributes and child value tags; dependency layers merge by group|index. */
+static void sc2_parse_conversation_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    xmlNode *root = xmlDocGetRootElement(doc);
+    for (xmlNode *node = root ? root->children : NULL; node; node = node->next) {
+        char group[64];
+        if (node->type != XML_ELEMENT_NODE || strcmp((cstring_t)node->name, "CConversationState")) continue;
+        if (!sc2_xml_attr(node, "id", group, sizeof(group))) continue;
+        for (xmlNode *idx = node->children; idx; idx = idx->next) {
+            sc2Conversation_t row = {0};
+            char key[256], val[256];
+            if (idx->type != XML_ELEMENT_NODE || strcmp((cstring_t)idx->name, "Indices")) continue;
+            FOR_LOOP(i, SC2_ARRAY_LEN(sc2_conv_fields)) {
+                cstring_t field = sc2_conv_fields[i].name;
+                if (sc2_xml_attr(idx, field, val, sizeof(val)))
+                    sc2_parse_xml_field(&row, sc2_conv_fields, SC2_ARRAY_LEN(sc2_conv_fields), field, val);
+            }
+            for (xmlNode *child = idx->children; child; child = child->next) {
+                if (child->type != XML_ELEMENT_NODE) continue;
+                sc2_parse_xml_child_field(&row, sc2_conv_fields, SC2_ARRAY_LEN(sc2_conv_fields), child, "value");
+            }
+            if (!row.id[0]) { fprintf(stderr, "SC2 conversation: missing index ID in %s\n", group); continue; }
+            snprintf(key, sizeof(key), "%s|%s", group, row.id);
+            sc2Conversation_t *out = catalog->conv;
+            while (out && strcmp(out->id, key)) out = out->next;
+            if (!out) {
+                out = sc2_alloc(sizeof(*out));
+                memset(out, 0, sizeof(*out)); out->next = catalog->conv; catalog->conv = out;
+                strlcpy(out->id, key, sizeof(out->id));
+            }
+            for (uint32_t i = 1; i < SC2_ARRAY_LEN(sc2_conv_fields); i++) {
+                cstring_t text = (cstring_t)&row + sc2_conv_fields[i].offset;
+                if (*text) strlcpy((string_t)out + sc2_conv_fields[i].offset, text, sc2_conv_fields[i].size);
+            }
+            /* InfoText is a repeated keyed production; preserve every authored text ID, including empty values. */
+            for (xmlNode *child = idx->children; child; child = child->next) {
+                sc2Convtext_t info = {0};
+                if (child->type != XML_ELEMENT_NODE || strcmp((cstring_t)child->name, "InfoText")) continue;
+                FOR_LOOP(i, SC2_ARRAY_LEN(sc2_conv_text_fields)) {
+                    cstring_t field = sc2_conv_text_fields[i].name;
+                    if (sc2_xml_attr(child, field, val, sizeof(val)))
+                        sc2_parse_xml_field(&info, sc2_conv_text_fields, SC2_ARRAY_LEN(sc2_conv_text_fields), field, val);
+                }
+                for (xmlNode *sub = child->children; sub; sub = sub->next)
+                    sc2_parse_xml_child_field(&info, sc2_conv_text_fields, SC2_ARRAY_LEN(sc2_conv_text_fields), sub, "value");
+                if (!info.id[0]) { fprintf(stderr, "SC2 conversation: missing InfoText ID in %s\n", key); continue; }
+                sc2Convtext_t *text = out->text;
+                while (text && strcmp(text->id, info.id)) text = text->next;
+                if (!text) { text = sc2_alloc(sizeof(*text)); info.next = out->text; out->text = text; }
+                else info.next = text->next;
+                *text = info;
+            }
+        }
+    }
+}
+
+static void sc2_parse_catalog_doc(sc2Catalog_t *catalog, xmlDoc *doc) {
+    sc2_parse_presentation_catalog_doc(catalog, doc);
+    sc2_parse_unit_catalog_doc(catalog, doc);
+    sc2_parse_model_catalog_doc(catalog, doc);
+    sc2_parse_actor_catalog_doc(catalog, doc);
+    sc2_parse_footprint_catalog_doc(catalog, doc);
+    sc2_parse_terrain_tex_catalog_doc(catalog, doc);
+    sc2_parse_cliff_catalog_doc(catalog, doc);
+    sc2_parse_tile_catalog_doc(catalog, doc);
+    sc2_parse_sound_catalog_doc(catalog, doc);
+    sc2_parse_conversation_doc(catalog, doc);
+}
+
+static void sc2_parse_catalog_layer_doc(sc2Catalog_t *catalog,
+                                        sc2MapSource_t *source,
+                                        cstring_t root_name,
+                                        xmlDoc *doc,
+                                        uint32_t depth) {
+    xmlNode *root;
+
+    if (!catalog || !doc)
+        return;
+    root = xmlDocGetRootElement(doc);
+    if (!root || root->type != XML_ELEMENT_NODE)
+        return;
+    if (sc2_streqi((char const *)root->name, "Catalog")) {
+        sc2_parse_catalog_doc(catalog, doc);
+        return;
+    }
+    if (!sc2_streqi((char const *)root->name, "Includes") ||
+        depth >= SC2_MAX_CATALOG_INCLUDE_DEPTH)
+        return;
+    for (xmlNode *node = root->children; node; node = node->next) {
+        char include_path[MAX_PATHLEN];
+        char path[MAX_PATHLEN];
+        xmlDoc *include_doc;
+
+        if (node->type != XML_ELEMENT_NODE || !sc2_streqi((char const *)node->name, "Catalog"))
+            continue;
+        if (!sc2_xml_attr(node, "path", include_path, sizeof(include_path)) &&
+            !sc2_xml_attr(node, "Path", include_path, sizeof(include_path)))
+            continue;
+        if (!sc2_catalog_include_path(include_path, path, sizeof(path)))
+            continue;
+        include_doc = sc2_read_layer_catalog_xml(source, root_name, path);
+        if (!include_doc)
+            continue;
+        sc2_parse_catalog_layer_doc(catalog, source, root_name, include_doc, depth + 1);
+        xmlFreeDoc(include_doc);
+    }
+}
+
+static void sc2_parse_catalog_layer_fallback(sc2Catalog_t *catalog,
+                                             sc2MapSource_t *source,
+                                             cstring_t root_name) {
+    for (uint32_t i = 0; sc2_catalog_known_files[i]; i++) {
+        xmlDoc *doc = sc2_read_layer_catalog_xml(source, root_name, sc2_catalog_known_files[i]);
+
+        sc2_parse_catalog_doc(catalog, doc);
+        xmlFreeDoc(doc);
+    }
+}
+
+static void sc2_parse_catalog_layer(sc2Catalog_t *catalog,
+                                    sc2MapSource_t *source,
+                                    cstring_t root_name) {
+    xmlDoc *manifest = sc2_read_layer_catalog_xml(source, root_name, "GameData.xml");
+
+    if (manifest) {
+        sc2_parse_catalog_layer_doc(catalog, source, root_name, manifest, 0);
+        xmlFreeDoc(manifest);
+        return;
+    }
+    sc2_parse_catalog_layer_fallback(catalog, source, root_name);
+}
+
+static void sc2_parse_catalogs(sc2Catalog_t *catalog, sc2MapSource_t *source) {
+    for (uint32_t i = 0; sc2_catalog_roots[i]; i++)
+        sc2_parse_catalog_layer(catalog, NULL, sc2_catalog_roots[i]);
+    sc2_parse_catalog_layer(catalog, NULL, "");
+    sc2_parse_catalog_layer(catalog, source, NULL);
+}
+
+static void sc2_resolve_terrain_textures(sc2Catalog_t const *catalog) {
+    FOR_LOOP(i, sc2_map.t3Terrain.num_terrain_textures) {
+        char stem[128];
+        char diffuse_path[256];
+        char normal_path[256];
+        cstring_t normal;
+        cstring_t diffuse = sc2_catalog_terrain_diffuse(catalog, sc2_map.t3Terrain.terrain_textures[i].diffuse, &normal);
+
+        if (diffuse) {
+            snprintf(sc2_map.t3Terrain.terrain_textures[i].diffuse, sizeof(sc2_map.t3Terrain.terrain_textures[i].diffuse), "%s", diffuse);
+            snprintf(sc2_map.t3Terrain.terrain_textures[i].normal, sizeof(sc2_map.t3Terrain.terrain_textures[i].normal), "%s",
+                     normal && *normal ? normal : diffuse);
+            continue;
+        }
+        if (sc2_path_has_dir(sc2_map.t3Terrain.terrain_textures[i].diffuse))
+            continue;
+        if (sc2_terrain_texture_path_from_tileset(sc2_map.t3Terrain.terrain_textures[i].diffuse,
+                                                  sc2_map.t3Terrain.terrain_textures[i].diffuse,
+                                                  sizeof(sc2_map.t3Terrain.terrain_textures[i].diffuse),
+                                                  sc2_map.t3Terrain.terrain_textures[i].normal,
+                                                  sizeof(sc2_map.t3Terrain.terrain_textures[i].normal))) {
+            continue;
+        }
+        sc2_camel_to_underscore(sc2_map.t3Terrain.terrain_textures[i].diffuse, stem, sizeof(stem));
+        snprintf(diffuse_path, sizeof(diffuse_path), "Assets\\Textures\\%s.dds", stem);
+        snprintf(normal_path, sizeof(normal_path), "Assets\\Textures\\%sNormal.dds", stem);
+        if (sc2_file_exists(diffuse_path)) {
+            snprintf(sc2_map.t3Terrain.terrain_textures[i].diffuse, sizeof(sc2_map.t3Terrain.terrain_textures[i].diffuse), "%s", diffuse_path);
+            snprintf(sc2_map.t3Terrain.terrain_textures[i].normal, sizeof(sc2_map.t3Terrain.terrain_textures[i].normal), "%s",
+                     sc2_file_exists(normal_path) ? normal_path : diffuse_path);
+        }
+    }
+}
+
+static void sc2_resolve_cliff_sets(sc2Catalog_t const *catalog) {
+    FOR_LOOP(i, sc2_map.t3Terrain.num_cliff_sets) {
+        cstring_t mesh = sc2_catalog_cliff_mesh(catalog, sc2_map.t3Terrain.cliff_sets[i].name);
+        if (!mesh || !*mesh)
+            mesh = sc2_cliff_mesh_fallback(sc2_map.t3Terrain.cliff_sets[i].name);
+        if (mesh && *mesh) {
+            snprintf(sc2_map.t3Terrain.cliff_sets[i].mesh, sizeof(sc2_map.t3Terrain.cliff_sets[i].mesh), "%s", mesh);
+        } else if (sc2_map.t3Terrain.cliff_sets[i].name[0]) {
+            strncpy(sc2_map.t3Terrain.cliff_sets[i].mesh,
+                    sc2_map.t3Terrain.cliff_sets[i].name,
+                    sizeof(sc2_map.t3Terrain.cliff_sets[i].mesh) - 1);
+            sc2_map.t3Terrain.cliff_sets[i].mesh[sizeof(sc2_map.t3Terrain.cliff_sets[i].mesh) - 1] = '\0';
+        }
+    }
+}
+
+static void sc2_resolve_hard_tiles(sc2Catalog_t const *catalog) {
+#ifdef SC2_DEBUG_CUTSCENE
+    uint32_t resolved = 0, unresolved = 0;
+    fprintf(stderr, "SC2 road resolve: placements=%u CTile catalog entries=%u\n",
+            (unsigned)ARRAY_COUNT(sc2_map.hard_tiles), (unsigned)catalog->tiles_count);
+#endif
+    FOR_EACH_ARRAY(sc2MapHardTile_t, tile, sc2_map.hard_tiles) {
+        FOR_LOOP(i, catalog->tiles_count) {
+            if (strcasecmp(tile->tile, catalog->tiles[i].id)) continue;
+            snprintf(tile->model, sizeof(tile->model), "%s", catalog->tiles[i].model);
+            break;
+        }
+        if (!tile->model[0]) {
+            char path[256];
+            snprintf(path, sizeof(path), "Assets\\HardTiles\\%s\\%s.m3", tile->tile, tile->tile);
+            if (sc2_file_exists(path))
+                snprintf(tile->model, sizeof(tile->model), "%s", path);
+            else
+                fprintf(stderr, "SC2 hard tile: unresolved CTile %s\n", tile->tile);
+        }
+#ifdef SC2_DEBUG_CUTSCENE
+        if (tile->model[0]) resolved++; else unresolved++;
+        fprintf(stderr, "SC2 road resolve[%u]: CTile='%s' model='%s' center_z=%.3f terrain_z=%.3f delta=%.3f\n",
+            (unsigned)(tile - sc2_map.hard_tiles), tile->tile, tile->model[0] ? tile->model : "(unresolved)",
+            tile->position.z, SC2_MapHeightAtPoint(tile->position.x, tile->position.y),
+            tile->position.z - SC2_MapHeightAtPoint(tile->position.x, tile->position.y));
+#endif
+    }
+#ifdef SC2_DEBUG_CUTSCENE
+    fprintf(stderr, "SC2 road resolve: resolved=%u unresolved=%u\n", (unsigned)resolved, (unsigned)unresolved);
+#endif
+}
+
+static bool sc2_try_object_model_path(sc2MapObject_t *object, cstring_t prefix) {
+    char path[256];
+
+    if (!object || !prefix || !*prefix || !object->name[0]) return false;
+    snprintf(path, sizeof(path), "%s\\%s\\%s.m3", prefix, object->name, object->name);
+    if (sc2_file_exists(path)) {
+        snprintf(object->model, sizeof(object->model), "%s", path);
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s\\%s\\%s_%02u.m3", prefix, object->name, object->name, object->variation);
+    if (sc2_file_exists(path)) {
+        snprintf(object->model, sizeof(object->model), "%s", path);
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s\\%s\\%s_00.m3", prefix, object->name, object->name);
+    if (sc2_file_exists(path)) {
+        snprintf(object->model, sizeof(object->model), "%s", path);
+        return true;
+    }
+    return false;
+}
+
+static void sc2_resolve_object_model_candidates(sc2MapObject_t *object) {
+    static struct {
+        cstring_t name;
+        cstring_t model;
+    } const aliases[] = {
+        { "Civilian", "Assets\\Units\\Terran\\ColonistMale\\ColonistMale.m3" },
+        { "CivilianFemale", "Assets\\Units\\Terran\\ColonistFemale\\ColonistFemale_00.m3" },
+        { "LogisticsHeadquarters", "Assets\\Doodads\\TRaynor01RadioTower\\TRaynor01RadioTower.m3" },
+        { NULL, NULL },
+    };
+    static cstring_t const prefixes[] = {
+        "Assets\\Units\\Critters",
+        "Assets\\Buildings\\Terran",
+        "Assets\\Buildings\\Resources",
+        "Assets\\Units\\Terran",
+        "Assets\\Doodads",
+        "Assets\\Effects\\Terran",
+        NULL,
+    };
+
+    if (!object || !object->name[0]) return;
+    for (uint32_t i = 0; aliases[i].name; i++) {
+        if (!strcasecmp(object->name, aliases[i].name) && sc2_file_exists(aliases[i].model)) {
+            snprintf(object->model, sizeof(object->model), "%s", aliases[i].model);
+            return;
+        }
+    }
+    for (uint32_t i = 0; prefixes[i]; i++) {
+        if (sc2_try_object_model_path(object, prefixes[i])) return;
+    }
+}
+
+static void sc2_resolve_object_footprint(sc2Catalog_t const *catalog, sc2MapObject_t *object) {
+    sc2CatalogFootprint_t const *footprint;
+
+    if (!catalog || !object || !object->footprint[0]) return;
+    footprint = sc2_catalog_footprint(catalog, object->footprint);
+    if (!footprint) return;
+    object->footprint_width = footprint->width;
+    object->footprint_height = footprint->height;
+    object->footprint_radius = footprint->radius;
+}
+
+static void sc2_resolve_unit_properties(sc2Catalog_t const *catalog, sc2CatalogUnit_t const *unit, float *values, int depth) {
+    if (!unit) return;
+    if (depth >= SC2_MAX_CATALOG_PARENT_DEPTH) { fprintf(stderr,"SC2 CUnit parent cycle/depth at '%s'\n",unit->id); return; }
+    if (*unit->parent) {
+        sc2CatalogUnit_t const *parent=sc2_catalog_unit(catalog,unit->parent);
+        if (!parent) fprintf(stderr,"SC2 CUnit '%s': unresolved parent '%s'\n",unit->id,unit->parent);
+        else sc2_resolve_unit_properties(catalog,parent,values,depth+1);
+    }
+    for (int p=0;p<24;p++) if (unit->property_mask & (1u<<p)) values[p]=unit->properties[p];
+}
+
+/* Parents first, then this unit's elements in load order: indexed elements replace or remove a slot,
+ * unindexed ones append unless the link is already present (a later layer repeating its base). */
+#define SC2_MAX_LINK_SLOTS 128 // slots; index attribute is clamped to 127
+typedef struct { char link[SC2_MAX_LINK_SLOTS][SC2_LINK_LEN]; bool present[SC2_MAX_LINK_SLOTS]; uint32_t count; } sc2LinkSlots_t;
+static void sc2_resolve_unit_links(sc2Catalog_t const *catalog, sc2CatalogUnit_t const *unit, int kind, sc2LinkSlots_t *slots, int depth) {
+    if (!unit || depth >= SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    if (*unit->parent) sc2_resolve_unit_links(catalog, sc2_catalog_unit(catalog, unit->parent), kind, slots, depth + 1);
+    for (uint32_t n = unit->first_link; n; n = catalog->links[n].next) {
+        sc2CatalogLink_t const *e = &catalog->links[n];
+        uint32_t at = e->index < 0 ? slots->count : (uint32_t)e->index;
+        bool dup = false;
+        if (e->kind != kind) continue;
+        if (e->index < 0) FOR_LOOP(i, slots->count) dup |= slots->present[i] && !strcasecmp(slots->link[i], e->link);
+        if (dup || at >= SC2_MAX_LINK_SLOTS) continue;
+        slots->present[at] = !e->removed;
+        if (!e->removed) snprintf(slots->link[at], SC2_LINK_LEN, "%s", e->link);
+        slots->count = MAX(slots->count, at + 1);
+    }
+}
+
+uint32_t SC2_MapUnitLinks(cstring_t unit_type, int kind, char (*out)[SC2_LINK_LEN], uint32_t max) {
+    static sc2LinkSlots_t slots;
+    uint32_t n = 0;
+    if (!sc2_persistent_catalog || !unit_type || !*unit_type || kind < 0 || kind >= SC2_LINK_KINDS) return 0;
+    memset(&slots, 0, sizeof(slots));
+    sc2_resolve_unit_links(sc2_persistent_catalog, sc2_catalog_unit(sc2_persistent_catalog, "$CUnit"), kind, &slots, 0);
+    sc2_resolve_unit_links(sc2_persistent_catalog, sc2_catalog_unit(sc2_persistent_catalog, unit_type), kind, &slots, 0);
+    FOR_LOOP(i, slots.count) if (slots.present[i]) {
+        if (n == max) { fprintf(stderr, "SC2 CUnit '%s': %u array links exceed unit capacity %u\n", unit_type, slots.count, max); break; }
+        snprintf(out[n++], SC2_LINK_LEN, "%s", slots.link[i]);
+    }
+    return n;
+}
+
+/* Resolves object->model/footprint/mover from its name via the unit->actor->model
+ * catalog chain. Shared by pre-placed map objects and dynamically spawned units
+ * (galaxy UnitCreate has no map object, so it builds a throwaway object here). */
+static void sc2_resolve_object_model(sc2Catalog_t const *catalog, sc2MapObject_t *object) {
+    cstring_t model_id = NULL;
+    if (!object->name[0]) return;
+    if (object->type == SC2_OBJECT_UNIT) {
+        sc2CatalogUnit_t const *unit = sc2_catalog_unit(catalog, object->name);
+        sc2_resolve_unit_properties(catalog,sc2_catalog_unit(catalog,"$CUnit"),object->unit_properties,0);
+        sc2_resolve_unit_properties(catalog,unit,object->unit_properties,0);
+        if (unit) {
+            if (unit->has_radius) object->radius = unit->radius;
+            if (unit->has_height) object->move_height = unit->height;
+            if (unit->footprint[0]) snprintf(object->footprint, sizeof(object->footprint), "%s", unit->footprint);
+            if (unit->mover[0]) snprintf(object->mover, sizeof(object->mover), "%s", unit->mover);
+            object->unit_flags |= unit->flags;
+            if (unit->actor[0]) {
+                cstring_t actor_footprint = sc2_catalog_actor_footprint(catalog, unit->actor);
+                if (!object->footprint[0] && actor_footprint)
+                    snprintf(object->footprint, sizeof(object->footprint), "%s", actor_footprint);
+                model_id = sc2_catalog_actor_model(catalog, unit->actor);
+            }
+        }
+    }
+    if (!object->footprint[0]) {
+        cstring_t actor_footprint = sc2_catalog_actor_footprint(catalog, object->name);
+        if (actor_footprint)
+            snprintf(object->footprint, sizeof(object->footprint), "%s", actor_footprint);
+    }
+    sc2_resolve_object_footprint(catalog, object);
+    if (!model_id) model_id = sc2_catalog_actor_model(catalog, object->name);
+    if (!model_id) model_id = object->name;
+    if (!sc2_catalog_model_path(catalog, model_id, object))
+        sc2_resolve_object_model_candidates(object);
+}
+
+static void sc2_resolve_object_models(sc2Catalog_t const *catalog) {
+    sc2ResolvedObjectModel_t resolved[SC2_MAX_MAP_OBJECTS];
+    uint32_t resolved_count = 0;
+
+    memset(resolved, 0, sizeof(resolved));
+    FOR_LOOP(i, sc2_map.num_objects) {
+        sc2MapObject_t *object = &sc2_map.objects[i];
+        if (!object->name[0]) continue;
+        FOR_LOOP(j, resolved_count) {
+            if (!strcasecmp(resolved[j].name, object->name) && resolved[j].variation == object->variation) {
+                snprintf(object->model, sizeof(object->model), "%s", resolved[j].model);
+                snprintf(object->footprint, sizeof(object->footprint), "%s", resolved[j].footprint);
+                snprintf(object->mover, sizeof(object->mover), "%s", resolved[j].mover);
+                object->radius = resolved[j].radius;
+                object->footprint_width = resolved[j].footprint_width;
+                object->footprint_height = resolved[j].footprint_height;
+                object->footprint_radius = resolved[j].footprint_radius;
+                object->move_height = resolved[j].move_height;
+                object->unit_flags = resolved[j].unit_flags;
+                memcpy(object->unit_properties,resolved[j].unit_properties,sizeof(object->unit_properties));
+                goto next_object;
+            }
+        }
+        sc2_resolve_object_model(catalog, object);
+        if (!object->model[0] && (object->type == SC2_OBJECT_UNIT || object->type == SC2_OBJECT_DOODAD))
+            fprintf(stderr, "SC2 %s: unresolved model '%s'\n", sc2_object_type_name(object->type), object->name);
+        if (resolved_count < SC2_MAX_MAP_OBJECTS) {
+            snprintf(resolved[resolved_count].name, sizeof(resolved[resolved_count].name), "%s", object->name);
+            snprintf(resolved[resolved_count].model, sizeof(resolved[resolved_count].model), "%s", object->model);
+            snprintf(resolved[resolved_count].footprint, sizeof(resolved[resolved_count].footprint), "%s", object->footprint);
+            snprintf(resolved[resolved_count].mover, sizeof(resolved[resolved_count].mover), "%s", object->mover);
+            resolved[resolved_count].radius = object->radius;
+            resolved[resolved_count].footprint_width = object->footprint_width;
+            resolved[resolved_count].footprint_height = object->footprint_height;
+            resolved[resolved_count].footprint_radius = object->footprint_radius;
+            resolved[resolved_count].move_height = object->move_height;
+            resolved[resolved_count].unit_flags = object->unit_flags;
+            resolved[resolved_count].variation = object->variation;
+            memcpy(resolved[resolved_count].unit_properties,object->unit_properties,sizeof(object->unit_properties));
+            resolved_count++;
+        }
+next_object:
+        ;
+    }
+}
+
+static uint32_t sc2_count_unresolved_models(void) {
+    uint32_t count = 0;
+
+    FOR_LOOP(i, sc2_map.num_objects) {
+        sc2MapObject_t const *object = &sc2_map.objects[i];
+
+        if ((object->type == SC2_OBJECT_UNIT ||
+             object->type == SC2_OBJECT_DOODAD ||
+             object->type == SC2_OBJECT_POINT) &&
+            object->name[0] && !object->model[0]) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void sc2_resolve_catalogs(sc2MapSource_t *source) {
+    sc2Catalog_t *catalog = sc2_alloc(sizeof(*catalog));
+
+    if (!catalog) return;
+    memset(catalog, 0, sizeof(*catalog));
+    sc2_parse_catalogs(catalog, source);
+    sc2_resolve_terrain_textures(catalog);
+    sc2_resolve_cliff_sets(catalog);
+    sc2_resolve_hard_tiles(catalog);
+    sc2_resolve_object_models(catalog);
+    sc2_map.catalog.units = catalog->units_count;
+    sc2_map.catalog.actors = catalog->actors_count;
+    sc2_map.catalog.models = catalog->models_count;
+    sc2_map.catalog.footprints = catalog->footprints_count;
+    sc2_map.catalog.unresolved_models = sc2_count_unresolved_models();
+    SAFE_DELETE(sc2_persistent_catalog, sc2_free_catalog);
+    sc2_persistent_catalog = catalog;
+}
+
+static uint64_t sc2_resolve_target_flags(sc2CatalogUnit_t const *unit, int depth) {
+    if (!unit || depth>SC2_MAX_CATALOG_PARENT_DEPTH) return 0;
+    uint64_t flags=*unit->parent ? sc2_resolve_target_flags(sc2_catalog_unit(sc2_persistent_catalog,unit->parent),depth+1) : 0;
+    return (flags & ~unit->target_mask) | unit->target_flags;
+}
+uint64_t SC2_MapUnitTargetFlags(cstring_t type) {
+    if (!sc2_persistent_catalog) return 0;
+    return sc2_resolve_target_flags(sc2_catalog_unit(sc2_persistent_catalog,type),0);
+}
+
+/* Dynamic units must inherit the same catalog model and movement metadata as map objects. */
+bool SC2_MapResolveUnit(cstring_t unit_type, sc2MapObject_t *object) {
+    if (!sc2_persistent_catalog || !unit_type || !*unit_type || !object) return false;
+    memset(object, 0, sizeof(*object));
+    object->type = SC2_OBJECT_UNIT;
+    snprintf(object->name, sizeof(object->name), "%s", unit_type);
+    sc2_resolve_object_model(sc2_persistent_catalog, object);
+    return object->model[0] != '\0';
+}
+
+cstring_t SC2_MapResolveUnitModel(cstring_t unit_type) {
+    static sc2MapObject_t object;
+    return SC2_MapResolveUnit(unit_type, &object) ? object.model : "";
+}
+
+/* Replay dependency layers and unit parents before applying array-index overrides. */
+static void sc2_resolve_cards(sc2CatalogUnit_t const *unit, sc2CardButton_t *slots, uint32_t depth) {
+    if (!unit || depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    if (*unit->parent) sc2_resolve_cards(sc2_catalog_unit(sc2_persistent_catalog,unit->parent),slots,depth+1);
+    for (uint32_t i=unit->first_card;i;i=sc2_persistent_catalog->cards[i].next) {
+        sc2CardButton_t const *button=&sc2_persistent_catalog->cards[i].button;
+        if (button->index>=SC2_COMMAND_SLOTS) { fprintf(stderr,"SC2 CUnit '%s': card index %u exceeds HUD capacity\n",unit->id,button->index); continue; }
+        slots[button->index]=button->removed ? (sc2CardButton_t){0} : *button;
+    }
+}
+static void sc2_resolve_unit_ui(sc2CatalogUnit_t const *unit, sc2UnitPresentation_t *out, uint32_t depth) {
+    if (!unit || depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    if (*unit->parent) sc2_resolve_unit_ui(sc2_catalog_unit(sc2_persistent_catalog,unit->parent),out,depth+1);
+    if (*unit->name) snprintf(out->name,sizeof(out->name),"%s",unit->name);
+    if (unit->has_armor) out->armor=unit->armor;
+}
+static void sc2_resolve_actor_ui(cstring_t id, sc2UnitPresentation_t *out, char *portrait, uint32_t depth) {
+    if (!id || !*id || depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    for (uint32_t i=0;i<sc2_persistent_catalog->actors_count;i++) {
+        sc2CatalogActor_t const *actor=&sc2_persistent_catalog->actors[i];
+        if (strcmp(actor->id,id)) continue;
+        sc2_resolve_actor_ui(actor->parent,out,portrait,depth+1);
+        if (*actor->icon) snprintf(out->icon,sizeof(out->icon),"%s",actor->icon);
+        if (*actor->wireframe) snprintf(out->wireframe,sizeof(out->wireframe),"%s",actor->wireframe);
+        if (*actor->portrait) snprintf(portrait,64,"%s",actor->portrait);
+        return;
+    }
+}
+bool SC2_MapUnitPresentation(cstring_t type, sc2UnitPresentation_t *out) {
+    if (!sc2_persistent_catalog || !type || !out) return false;
+    sc2CatalogUnit_t const *unit=sc2_catalog_unit(sc2_persistent_catalog,type);
+    if (!unit) return false;
+    *out=(sc2UnitPresentation_t){0};
+    sc2_resolve_unit_ui(sc2_catalog_unit(sc2_persistent_catalog,"$CUnit"),out,0);
+    sc2_resolve_unit_ui(unit,out,0);
+    sc2_resolve_cards(unit,out->cards,0);
+    char portrait[64]="";
+    sc2_resolve_actor_ui(*unit->actor ? unit->actor : type,out,portrait,0);
+    if (*portrait) {
+        sc2CatalogModel_t const *model=sc2_catalog_model(sc2_persistent_catalog,portrait),*source=model;
+        for (int depth=0;source && depth<SC2_MAX_CATALOG_PARENT_DEPTH;depth++) {
+            if (*source->image) { sc2_catalog_expand_model_path(source->image,portrait,model->race,out->portrait_image,sizeof(out->portrait_image)); break; }
+            source=sc2_catalog_model(sc2_persistent_catalog,source->parent);
+        }
+        sc2MapObject_t object={0};
+        if (sc2_catalog_model_path(sc2_persistent_catalog,portrait,&object)) snprintf(out->portrait,sizeof(out->portrait),"%s",object.model);
+        else fprintf(stderr,"SC2 CUnit '%s': unresolved portrait '%s'\n",type,portrait);
+    }
+    /* Core CUnit's ##id## default keys expand using the concrete unit id. */
+    char *token=strstr(out->name,"##id##");
+    if (token) {
+        char value[128]; snprintf(value,sizeof(value),"%.*s%s%s",(int)(token-out->name),out->name,type,token+6);
+        snprintf(out->name,sizeof(out->name),"%s",value);
+    }
+    return true;
+}
+static void sc2_resolve_face(cstring_t id, sc2ButtonFace_t *out, uint32_t depth) {
+    if (depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    for (uint32_t i=0;i<sc2_persistent_catalog->buttons_count;i++) {
+        sc2ButtonFace_t const *face=&sc2_persistent_catalog->buttons[i];
+        if (strcmp(face->id,id)) continue;
+        if (*face->parent) sc2_resolve_face(face->parent,out,depth+1);
+        #define SC2_FACE_COPY(field) if (*face->field) snprintf(out->field,sizeof(out->field),"%s",face->field)
+        SC2_FACE_COPY(icon); SC2_FACE_COPY(name); SC2_FACE_COPY(tooltip); SC2_FACE_COPY(hotkey);
+        #undef SC2_FACE_COPY
+        return;
+    }
+}
+bool SC2_MapButtonFace(cstring_t id, sc2ButtonFace_t *out) {
+    if (!sc2_persistent_catalog || !id || !out) return false;
+    *out=(sc2ButtonFace_t){0};
+    sc2_resolve_face("$CButton",out,0); sc2_resolve_face(id,out,0);
+    for (uint32_t i=0;i<SC2_ARRAY_LEN(sc2_button_fields);i++) {
+        char *field=(char *)out+sc2_button_fields[i].offset, *token=strstr(field,"##id##");
+        if (!token) continue;
+        char value[256]; snprintf(value,sizeof(value),"%.*s%s%s",(int)(token-field),field,id,token+6);
+        snprintf(field,sc2_button_fields[i].size,"%s",value);
+    }
+    return *out->icon!=0;
+}
+static void sc2_resolve_weapon(cstring_t id, sc2WeaponPresentation_t *out, uint32_t depth) {
+    if (depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return;
+    for (uint32_t i=0;i<sc2_persistent_catalog->weapons_count;i++) {
+        sc2WeaponPresentation_t const *weapon=&sc2_persistent_catalog->weapons[i];
+        if (strcmp(weapon->id,id)) continue;
+        if (*weapon->parent) sc2_resolve_weapon(weapon->parent,out,depth+1);
+        if (*weapon->effect) snprintf(out->effect,sizeof(out->effect),"%s",weapon->effect);
+        if (*weapon->icon) snprintf(out->icon,sizeof(out->icon),"%s",weapon->icon);
+        if (weapon->range>0) out->range=weapon->range;
+        if (weapon->period>0) out->period=weapon->period;
+        return;
+    }
+}
+static bool sc2_resolve_damage(cstring_t id, float *amount, uint32_t depth) {
+    if (depth>=SC2_MAX_CATALOG_PARENT_DEPTH) return false;
+    for (uint32_t i=0;i<sc2_persistent_catalog->damage_count;i++) {
+        sc2CatalogDamage_t const *damage=&sc2_persistent_catalog->damage[i];
+        if (strcmp(damage->id,id)) continue;
+        if (damage->has_amount) { *amount=damage->amount; return true; }
+        return *damage->parent && sc2_resolve_damage(damage->parent,amount,depth+1);
+    }
+    return false;
+}
+bool SC2_MapWeaponPresentation(cstring_t id, sc2WeaponPresentation_t *out) {
+    if (!sc2_persistent_catalog || !id || !out) return false;
+    *out=(sc2WeaponPresentation_t){0};
+    snprintf(out->id,sizeof(out->id),"%s",id);
+    sc2_resolve_weapon("$CWeaponLegacy",out,0); sc2_resolve_weapon(id,out,0);
+    return *out->effect && sc2_resolve_damage(out->effect,&out->damage,0) && out->range>0 && out->period>0;
+}
+
+static bool sc2_catalog_sound_path_r(sc2Catalog_t const *catalog, sc2CatalogSound_t const *sound,
+                                     cstring_t id, string_t path, uint32_t path_size, uint32_t depth) {
+    static cstring_t const races[] = { "Terran", "Protoss", "Zerg" };
+    if (!sound || depth > SC2_MAX_CATALOG_PARENT_DEPTH) return false;
+    if (sound->path[0]) {
+        if (!strstr(sound->path, "##Race##"))
+            return sc2_catalog_expand_model_path(sound->path, id, NULL, path, path_size);
+        FOR_LOOP(i, SC2_ARRAY_LEN(races))
+            if (sc2_catalog_expand_model_path(sound->path, id, races[i], path, path_size) && sc2_file_exists(path)) return true;
+        return false;
+    }
+    return sc2_catalog_sound_path_r(catalog, sc2_catalog_sound(catalog, sound->parent), id, path, path_size, depth + 1);
+}
+
+cstring_t SC2_MapResolveSound(cstring_t sound_id, int asset) {
+    static char path[MAX_PATHLEN];
+    sc2CatalogSound_t const *sound;
+    (void)asset;
+    if (!sc2_persistent_catalog || !sound_id || !*sound_id) return "";
+    sound = sc2_catalog_sound(sc2_persistent_catalog, sound_id);
+    if (sc2_catalog_sound_path_r(sc2_persistent_catalog, sound, sound_id, path, sizeof(path), 0)) return path;
+    fprintf(stderr, "SC2 sound: unresolved CSound '%s'\n", sound_id);
+    return "";
+}
+
+/* Sound duration is the Vorbis final PCM granule divided by the identification-header sample rate. */
+float SC2_MapSoundLength(cstring_t sound_id, int asset) {
+    cstring_t path = SC2_MapResolveSound(sound_id, asset);
+    uint8_t *data;
+    uint32_t size = 0, rate = 0;
+    uint64_t granule = 0;
+    if (!path || !*path) return 0.0f;
+    data = sc2_read_file(path, &size);
+    if (!data) { fprintf(stderr, "SC2 sound: missing asset '%s' for '%s'\n", path, sound_id); return 0.0f; }
+    FOR_LOOP(i, size > 16 ? size - 16 : 0)
+        if (data[i] == 1 && !memcmp(data + i + 1, "vorbis", 6)) { memcpy(&rate, data + i + 12, sizeof(rate)); break; }
+    for (uint32_t i = size > 14 ? size - 14 : 0; i > 0; i--)
+        if (!memcmp(data + i, "OggS", 4)) { memcpy(&granule, data + i + 6, sizeof(granule)); break; }
+    sc2_free_file(data);
+    if (!rate || !granule) { fprintf(stderr, "SC2 sound: invalid OGG timing '%s'\n", path); return 0.0f; }
+    return (float)((double)granule / (double)rate);
+}
+
+static bool sc2_mapinfo_fourcc(sc2MapInfo_t const *mapInfo) {
+    return mapInfo &&
+        (mapInfo->fourcc == MAKEFOURCC('I','p','a','M') ||
+         mapInfo->fourcc == MAKEFOURCC('M','a','p','I'));
+}
+
+static cstring_t sc2_object_type_name(sc2ObjectType_t type) {
+    switch (type) {
+        case SC2_OBJECT_UNIT: return "unit";
+        case SC2_OBJECT_DOODAD: return "doodad";
+        case SC2_OBJECT_POINT: return "point";
+        case SC2_OBJECT_CAMERA: return "camera";
+    }
+    return "unknown";
+}
+
+static void sc2_dump_cell_flags(FILE *out, sc2MapCellFlags_t const *layer) {
+    uint32_t counts[4] = { 0 };
+
+    if (!out || !layer) return;
+    FOR_LOOP(i, layer->width * layer->height) {
+        if (layer->data[i] < SC2_ARRAY_LEN(counts))
+            counts[layer->data[i]]++;
+    }
+    fprintf(out,
+            "t3CellFlags: version=%u size=%ux%u counts[00]=%u counts[01]=%u counts[02]=%u counts[03]=%u\n",
+            (unsigned)layer->version,
+            (unsigned)layer->width,
+            (unsigned)layer->height,
+            (unsigned)counts[0],
+            (unsigned)counts[1],
+            (unsigned)counts[2],
+            (unsigned)counts[3]);
+}
+
+static void sc2_dump_height_map(FILE *out, sc2MapHeightMap_t const *layer) {
+    float min_height = 0.0f;
+    float max_height = 0.0f;
+    bool have_height = false;
+
+    if (!out || !layer) return;
+    FOR_LOOP(y, layer->height) {
+        FOR_LOOP(x, layer->width) {
+            float height = sc2_map_height_at_grid(&sc2_map, x, y);
+
+            if (!have_height || height < min_height) min_height = height;
+            if (!have_height || height > max_height) max_height = height;
+            have_height = true;
+        }
+    }
+    fprintf(out,
+            "t3HeightMap: version=%u size=%ux%u min=%.3f max=%.3f\n",
+            (unsigned)layer->version,
+            (unsigned)layer->width,
+            (unsigned)layer->height,
+            min_height,
+            max_height);
+}
+
+void SC2_MapDump(FILE *out, cstring_t filename) {
+    uint32_t object_counts[4] = { 0 };
+
+    if (!out) out = stdout;
+    FOR_LOOP(i, sc2_map.num_objects) {
+        if ((uint32_t)sc2_map.objects[i].type < SC2_ARRAY_LEN(object_counts))
+            object_counts[sc2_map.objects[i].type]++;
+    }
+    fprintf(out, "sc2map: file=%s\n", filename && *filename ? filename : "(current)");
+    fprintf(out,
+            "MapInfo: version=%u size=%ux%u name=\"%s\"\n",
+            (unsigned)sc2_map.MapInfo.version,
+            (unsigned)sc2_map.MapInfo.width,
+            (unsigned)sc2_map.MapInfo.height,
+            sc2_map.map_name);
+    if (sc2_map.t3CellFlags)
+        sc2_dump_cell_flags(out, sc2_map.t3CellFlags);
+    if (sc2_map.t3HeightMap)
+        sc2_dump_height_map(out, sc2_map.t3HeightMap);
+    if (sc2_map.t3SyncHeightMap) {
+        fprintf(out,
+                "t3SyncHeightMap: version=%u size=%ux%u\n",
+                (unsigned)sc2_map.t3SyncHeightMap->version,
+                (unsigned)sc2_map.t3SyncHeightMap->width,
+                (unsigned)sc2_map.t3SyncHeightMap->height);
+    }
+    if (sc2_map.t3SyncCliffLevel) {
+        fprintf(out,
+                "t3SyncCliffLevel: version=%u size=%ux%u\n",
+                (unsigned)sc2_map.t3SyncCliffLevel->version,
+                (unsigned)sc2_map.t3SyncCliffLevel->width,
+                (unsigned)sc2_map.t3SyncCliffLevel->height);
+    }
+    if (sc2_map.t3TextureMasks) {
+        fprintf(out,
+                "t3TextureMasks: version=%u size=%ux%u bytes=%u\n",
+                (unsigned)sc2_map.t3TextureMasks->version,
+                (unsigned)sc2_map.t3TextureMasks->width,
+                (unsigned)sc2_map.t3TextureMasks->height,
+                (unsigned)sc2_map.t3TextureMasksSize);
+    }
+    fprintf(out,
+            "Objects: units=%u doodads=%u points=%u cameras=%u total=%u\n",
+            (unsigned)object_counts[SC2_OBJECT_UNIT],
+            (unsigned)object_counts[SC2_OBJECT_DOODAD],
+            (unsigned)object_counts[SC2_OBJECT_POINT],
+            (unsigned)object_counts[SC2_OBJECT_CAMERA],
+            (unsigned)sc2_map.num_objects);
+    fprintf(out,
+            "Catalog: units=%u actors=%u models=%u footprints=%u unresolvedModels=%u\n",
+            (unsigned)sc2_map.catalog.units,
+            (unsigned)sc2_map.catalog.actors,
+            (unsigned)sc2_map.catalog.models,
+            (unsigned)sc2_map.catalog.footprints,
+            (unsigned)sc2_map.catalog.unresolved_models);
+    FOR_LOOP(i, sc2_map.num_objects) {
+        sc2MapObject_t const *object = &sc2_map.objects[i];
+
+        fprintf(out,
+                "Object[%u]: type=%s id=%u name=%s model=%s footprint=%s size=%.3fx%.3f fpRadius=%.3f mover=%s unitFlags=0x%08x pos=%.3f,%.3f,%.3f radius=%.3f\n",
+                (unsigned)i,
+                sc2_object_type_name(object->type),
+                (unsigned)object->id,
+                object->name,
+                object->model,
+                object->footprint,
+                object->footprint_width,
+                object->footprint_height,
+                object->footprint_radius,
+                object->mover,
+                (unsigned)object->unit_flags,
+                object->position.x,
+                object->position.y,
+                object->position.z,
+                object->radius);
+    }
+}
+
+static uint8_t *sc2_read_binary_layer(sc2MapSource_t *source,
+                                    cstring_t filename,
+                                    uint32_t min_size,
+                                    uint32_t expected_fourcc,
+                                    uint32_t *out_size) {
+    uint32_t size = 0;
+    uint32_t fourcc = 0;
+    uint8_t *data = sc2_source_read(source, filename, &size);
+    uint8_t *copy;
+
+    if (out_size) *out_size = 0;
+    if (!data || size < min_size || size < sizeof(fourcc)) {
+        sc2_free_file(data);
+        return NULL;
+    }
+    memcpy(&fourcc, data, sizeof(fourcc));
+    if (fourcc != expected_fourcc) {
+        sc2_free_file(data);
+        return NULL;
+    }
+    copy = sc2_alloc(size);
+    if (!copy) {
+        sc2_free_file(data);
+        return NULL;
+    }
+    memcpy(copy, data, size);
+    sc2_free_file(data);
+    if (out_size) *out_size = size;
+    return copy;
+}
+
+static bool sc2_binary_layer_payload_valid(uint32_t size,
+                                           uint32_t header_size,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t sample_size) {
+    size_t count;
+    size_t payload_size;
+    size_t total_size;
+
+    if (!width || !height || !sample_size)
+        return false;
+    if ((size_t)width > (size_t)-1 / (size_t)height)
+        return false;
+    count = (size_t)width * (size_t)height;
+    if (count > ((size_t)-1 - (size_t)header_size) / (size_t)sample_size)
+        return false;
+    payload_size = count * (size_t)sample_size;
+    total_size = (size_t)header_size + payload_size;
+    return (size_t)size >= total_size;
+}
+
+static void sc2_parse_height_map(sc2MapSource_t *source) {
+    uint32_t size = 0;
+
+    sc2_map.t3HeightMap = (sc2MapHeightMap_t *)sc2_read_binary_layer(source,
+                                                                     "t3HeightMap",
+                                                                     sizeof(sc2MapHeightMap_t),
+                                                                     MAKEFOURCC('H','M','A','P'),
+                                                                     &size);
+    if (sc2_map.t3HeightMap &&
+        !sc2_binary_layer_payload_valid(size,
+                                        sizeof(sc2MapHeightMap_t),
+                                        sc2_map.t3HeightMap->width,
+                                        sc2_map.t3HeightMap->height,
+                                        sizeof(sc2MapHeightSample_t))) {
+        SAFE_DELETE(sc2_map.t3HeightMap, sc2_free);
+    }
+}
+
+static void sc2_parse_sync_height_map(sc2MapSource_t *source) {
+    uint32_t size = 0;
+
+    sc2_map.t3SyncHeightMap = (sc2MapSyncHeightMap_t *)sc2_read_binary_layer(source,
+                                                                             "t3SyncHeightMap",
+                                                                             sizeof(sc2MapSyncHeightMap_t),
+                                                                             MAKEFOURCC('S','M','A','P'),
+                                                                             &size);
+    if (sc2_map.t3SyncHeightMap &&
+        !sc2_binary_layer_payload_valid(size,
+                                        sizeof(sc2MapSyncHeightMap_t),
+                                        sc2_map.t3SyncHeightMap->width,
+                                        sc2_map.t3SyncHeightMap->height,
+                                        sizeof(sc2MapSyncHeightSample_t))) {
+        SAFE_DELETE(sc2_map.t3SyncHeightMap, sc2_free);
+    }
+}
+
+static void sc2_parse_cell_flags(sc2MapSource_t *source) {
+    uint32_t size = 0;
+
+    sc2_map.t3CellFlags = (sc2MapCellFlags_t *)sc2_read_binary_layer(source,
+                                                                     "t3CellFlags",
+                                                                     sizeof(sc2MapCellFlags_t),
+                                                                     MAKEFOURCC('L','F','C','T'),
+                                                                     &size);
+    if (sc2_map.t3CellFlags &&
+        !sc2_binary_layer_payload_valid(size,
+                                        sizeof(sc2MapCellFlags_t),
+                                        sc2_map.t3CellFlags->width,
+                                        sc2_map.t3CellFlags->height,
+                                        sizeof(uint8_t))) {
+        SAFE_DELETE(sc2_map.t3CellFlags, sc2_free);
+    }
+}
+
+static void sc2_parse_sync_cliff_level(sc2MapSource_t *source) {
+    uint32_t size = 0;
+
+    sc2_map.t3SyncCliffLevel = (sc2MapSyncCliffLevel_t *)sc2_read_binary_layer(source,
+                                                                               "t3SyncCliffLevel",
+                                                                               sizeof(sc2MapSyncCliffLevel_t),
+                                                                               MAKEFOURCC('C','L','I','F'),
+                                                                               &size);
+    if (sc2_map.t3SyncCliffLevel &&
+        !sc2_binary_layer_payload_valid(size,
+                                        sizeof(sc2MapSyncCliffLevel_t),
+                                        sc2_map.t3SyncCliffLevel->width,
+                                        sc2_map.t3SyncCliffLevel->height,
+                                        sizeof(uint16_t))) {
+        SAFE_DELETE(sc2_map.t3SyncCliffLevel, sc2_free);
+    }
+}
+
+static void sc2_parse_texture_masks(sc2MapSource_t *source) {
+    sc2_map.t3TextureMasks = (sc2MapTextureMasks_t *)sc2_read_binary_layer(source,
+                                                                           "t3TextureMasks",
+                                                                           sizeof(sc2MapTextureMasks_t),
+                                                                           MAKEFOURCC('M','A','S','K'),
+                                                                           &sc2_map.t3TextureMasksSize);
+    if (sc2_map.t3TextureMasks &&
+        !sc2_binary_layer_payload_valid(sc2_map.t3TextureMasksSize,
+                                        sizeof(sc2MapTextureMasks_t),
+                                        sc2_map.t3TextureMasks->width,
+                                        sc2_map.t3TextureMasks->height,
+                                        sizeof(uint8_t))) {
+        SAFE_DELETE(sc2_map.t3TextureMasks, sc2_free);
+        sc2_map.t3TextureMasksSize = 0;
+    }
+}
+
+static bool sc2_hard_tile_layout(uint8_t const *data, uint32_t size, uint32_t *count) {
+    size_t offset = SC2_HARD_TILE_HEADER_SIZE;
+    uint32_t blocks, total = 0;
+
+    if (!data || size < SC2_HARD_TILE_HEADER_SIZE) return false;
+    memcpy(&blocks, data + 24, sizeof(blocks));
+    FOR_LOOP(i, blocks) {
+        uint32_t num;
+        size_t bytes;
+
+        if (offset + sizeof(num) > size) return false;
+        memcpy(&num, data + offset, sizeof(num)); offset += sizeof(num);
+        if (num > SC2_MAX_HARD_TILES - total) return false;
+        bytes = (size_t)num * SC2_HARD_TILE_RECORD_SIZE;
+        if (bytes > size - offset || SC2_HARD_TILE_NAME_PREFIX + SC2_HARD_TILE_NAME_SUFFIX > size - offset - bytes) return false;
+        offset += bytes + SC2_HARD_TILE_NAME_PREFIX;
+        while (offset < size && data[offset]) offset++;
+        if (offset >= size || SC2_HARD_TILE_NAME_SUFFIX >= size - offset) return false;
+        total += num; offset += 1 + SC2_HARD_TILE_NAME_SUFFIX;
+    }
+    if (offset != size) return false;
+    *count = total;
+    return true;
+}
+
+/* HRDT stores each block's tile ID after its placement records, requiring a validated two-pass decode. */
+static void sc2_parse_hard_tiles(sc2MapSource_t *source) {
+    uint32_t size = 0, count = 0, blocks;
+    uint8_t *data = sc2_read_binary_layer(source, "t3HardTile", SC2_HARD_TILE_HEADER_SIZE,
+                                        MAKEFOURCC('H','R','D','T'), &size);
+    size_t offset = SC2_HARD_TILE_HEADER_SIZE;
+
+    if (!data) { fprintf(stderr, "SC2 road parse: t3HardTile absent\n"); return; }
+    fprintf(stderr, "SC2 road parse: HRDT bytes=%u\n", (unsigned)size);
+    if (!sc2_hard_tile_layout(data, size, &count)) {
+        fprintf(stderr, "SC2 hard tile: invalid HRDT layout (%u bytes)\n", (unsigned)size);
+        sc2_free(data); return;
+    }
+    memcpy(&blocks, data + 24, sizeof(blocks));
+    fprintf(stderr, "SC2 road parse: layout valid blocks=%u placements=%u\n", (unsigned)blocks, (unsigned)count);
+    if (!count) { sc2_free(data); return; }
+    sc2_map.hard_tiles = sc2_alloc((long)(count * sizeof(*sc2_map.hard_tiles)));
+    if (!sc2_map.hard_tiles) {
+        fprintf(stderr, "SC2 road parse: allocation failed for %u placements\n", (unsigned)count);
+        sc2_free(data); return;
+    }
+    memset(sc2_map.hard_tiles, 0, count * sizeof(*sc2_map.hard_tiles));
+    FOR_LOOP(block, blocks) {
+        uint32_t num, first = ARRAY_COUNT(sc2_map.hard_tiles);
+        uint8_t const *records, *name, *name_end;
+
+        memcpy(&num, data + offset, sizeof(num)); offset += sizeof(num); records = data + offset;
+        name = records + (size_t)num * SC2_HARD_TILE_RECORD_SIZE + SC2_HARD_TILE_NAME_PREFIX;
+        for (name_end = name; *name_end; name_end++);
+        fprintf(stderr, "SC2 road parse block[%u]: CTile='%.*s' placements=%u first=%u record_offset=%u\n",
+            (unsigned)block, (int)(name_end - name), (char const *)name, (unsigned)num,
+            (unsigned)first, (unsigned)(records - data));
+        FOR_LOOP(i, num) {
+            sc2MapHardTile_t *tile = &sc2_map.hard_tiles[first + i];
+            uint8_t const *record = records + (size_t)i * SC2_HARD_TILE_RECORD_SIZE;
+            uint32_t len = (uint32_t)(name_end - name);
+
+            memcpy(tile->tile, name, MIN(len, sizeof(tile->tile) - 1));
+            memcpy(&tile->position, record, sizeof(tile->position));
+            memcpy(&tile->normal, record + 12, sizeof(tile->normal));
+            memcpy(&tile->start, record + 24, sizeof(tile->start));
+            memcpy(&tile->end, record + 36, sizeof(tile->end));
+            memcpy(&tile->scale, record + 48, sizeof(tile->scale));
+            memcpy(&tile->flags, record + 56, sizeof(tile->flags));
+        }
+        ARRAY_COUNT(sc2_map.hard_tiles) += num;
+        offset = (size_t)(name_end - data) + 1 + SC2_HARD_TILE_NAME_SUFFIX;
+    }
+    fprintf(stderr, "SC2 road parse: decoded=%u final_offset=%u/%u\n",
+            (unsigned)ARRAY_COUNT(sc2_map.hard_tiles), (unsigned)offset, (unsigned)size);
+    sc2_free(data);
+}
+
+void SC2_MapSetHost(sc2MapHost_t const *host) {
+    memset(&sc2_host, 0, sizeof(sc2_host));
+    if (host) sc2_host = *host;
+}
+
+bool SC2_MapLoad(cstring_t mapFilename) {
+    sc2MapSource_t source;
+    sc2_map_clear();
+    sc2_map.cell_size = SC2_CELL_SIZE;
+    if (!sc2_source_open(&source, mapFilename)) {
+        return false;
+    }
+    sc2_parse_mapinfo(&source);
+    sc2_parse_terrain(&source);
+    sc2_parse_terrain_data_catalogs();
+    sc2_parse_terrain_data(&source);
+    sc2_parse_light_data_catalogs();
+    sc2_parse_light_data(&source);
+    sc2_parse_height_map(&source);
+    /* t3SyncHeightMap is not visible terrain height; merging it creates cliff spikes. */
+    sc2_parse_sync_height_map(&source);
+    sc2_parse_cell_flags(&source);
+    sc2_parse_sync_cliff_level(&source);
+    sc2_parse_texture_masks(&source);
+    sc2_parse_hard_tiles(&source);
+    sc2_parse_objects(&source);
+    sc2_resolve_catalogs(&source);
+    sc2_source_close(&source);
+    sc2_map.origin.x = 0.0f;
+    sc2_map.origin.y = 0.0f;
+    fprintf(stderr, "SC2_MapLoad: %s %ux%u objects=%u hardTiles=%u\n",
+            sc2_map.map_name, (unsigned)sc2_map_width(), (unsigned)sc2_map_height(),
+            (unsigned)sc2_map.num_objects, (unsigned)ARRAY_COUNT(sc2_map.hard_tiles));
+    return true;
+}
+
+void SC2_MapShutdown(void) {
+    sc2_map_clear();
+}
+
+sc2Map_t *SC2_MapCurrent(void) {
+    return &sc2_map;
+}
+
+float SC2_MapHeightAtPoint(float x, float y) {
+    return sc2_map_height_at_point(&sc2_map, x, y);
+}
+
+float SC2_MapAirHeightAtPoint(float x, float y) {
+    return sc2_map_broad_height_at_point(&sc2_map, x, y);
+}
+
+box2_t SC2_MapBounds(void) {
+    return (box2_t){
+        .min = sc2_map.origin,
+        .max = {
+            sc2_map.origin.x + sc2_map_width() * sc2_map.cell_size,
+            sc2_map.origin.y + sc2_map_height() * sc2_map.cell_size,
+        },
+    };
+}
+
+vec2_t SC2_MapNormalizedPosition(float x, float y) {
+    box2_t bounds = SC2_MapBounds();
+    return (vec2_t){
+        (x - bounds.min.x) / MAX(1.0f, bounds.max.x - bounds.min.x),
+        (y - bounds.min.y) / MAX(1.0f, bounds.max.y - bounds.min.y),
+    };
+}
+
+vec2_t SC2_MapDenormalizedPosition(float x, float y) {
+    box2_t bounds = SC2_MapBounds();
+    return (vec2_t){
+        bounds.min.x + x * (bounds.max.x - bounds.min.x),
+        bounds.min.y + y * (bounds.max.y - bounds.min.y),
+    };
+}
+
+uint32_t SC2_MapObjectClassId(sc2MapObject_t const *object) {
+    return object && object->name[0] ? sc2_hash32(object->name) : 0;
+}
+
+bool SC2_MapDefaultCamera(sc2MapCamera_t *camera) {
+    sc2MapCamera_t value = { 0 };
+
+    if (!camera) {
+        return false;
+    }
+    if (sc2_map.MapInfo.width && sc2_map.MapInfo.height) {
+        value.target = (vec3_t){
+            sc2_map.origin.x + (float)sc2_map.MapInfo.width * sc2_map.cell_size * 0.5f,
+            sc2_map.origin.y + (float)sc2_map.MapInfo.height * sc2_map.cell_size * 0.5f,
+            0.0f,
+        };
+    }
+    value.distance = 34.07f;
+    value.pitch = 56.0f;
+    value.yaw = 179.9584f;
+    value.fov = 27.7998f;
+    value.znear = 0.0998f;
+    value.zfar = 400.0f;
+
+    {
+        sc2MapObject_t const *chosen = NULL;
+        FOR_LOOP(i, sc2_map.num_objects) {
+            sc2MapObject_t const *object = &sc2_map.objects[i];
+            if (object->type != SC2_OBJECT_CAMERA) continue;
+            /* TRaynor01's first camera is a close cinematic (pitch 8.6, dist 4.95). Use StartGame*. */
+            if (strncasecmp(object->name, "StartGame", 9)) continue;
+            chosen = object;
+            break;
+        }
+        if (chosen) {
+            if (chosen->camera.target.x != 0.0f || chosen->camera.target.y != 0.0f || chosen->camera.target.z != 0.0f)
+                value.target = chosen->camera.target;
+            if (chosen->camera.distance > 0.0f) value.distance = chosen->camera.distance;
+            if (chosen->camera.pitch != 0.0f) value.pitch = chosen->camera.pitch;
+            if (chosen->camera.yaw != 0.0f) value.yaw = chosen->camera.yaw;
+            if (chosen->camera.fov > 0.0f) value.fov = chosen->camera.fov;
+            if (chosen->camera.znear > 0.0f) value.znear = chosen->camera.znear;
+            if (chosen->camera.zfar > 0.0f) value.zfar = chosen->camera.zfar;
+            if (chosen->camera.height_offset != 0.0f) value.height_offset = chosen->camera.height_offset;
+        }
+    }
+
+    *camera = value;
+    return true;
+}
+
+/* Galaxy state IDs are catalog group and index joined by '|', not guessed localization paths. */
+cstring_t SC2_MapConversationField(cstring_t key, cstring_t field) {
+    sc2Conversation_t *row = sc2_persistent_catalog ? sc2_persistent_catalog->conv : NULL;
+    while (row && strcmp(row->id, key)) row = row->next;
+    if (row && !strncmp(field, "Text:", 5)) {
+        for (sc2Convtext_t *text = row->text; text; text = text->next)
+            if (!strcmp(text->id, field + 5)) return text->text;
+    }
+    if (row) for (uint32_t i = 1; i < SC2_ARRAY_LEN(sc2_conv_fields); i++)
+        if (!strcmp(field, sc2_conv_fields[i].name)) return (cstring_t)row + sc2_conv_fields[i].offset;
+    fprintf(stderr, "SC2 conversation: unresolved %s field %s\n", key, field);
+    return NULL;
+}

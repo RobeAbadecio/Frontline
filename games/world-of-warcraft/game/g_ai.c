@@ -1,0 +1,471 @@
+#include "g_wow_local.h"
+#include <math.h>
+
+static wowMove_t wow_move_stand = { "Stand", NULL, NULL };
+static wowMove_t wow_move_ready = { "Ready", NULL, NULL };
+static wowMove_t wow_move_walk = { "Walk", NULL, NULL };
+static wowMove_t wow_move_run = { "Run", NULL, NULL };
+static wowMove_t wow_move_back = { "WalkBackwards", NULL, NULL };
+static wowMove_t wow_move_attack = { "Attack", NULL, NULL };
+static wowMove_t wow_move_pain = { "Pain", NULL, NULL };
+static wowMove_t wow_move_death = { "Death", NULL, NULL };
+
+#define WOW_DEFAULT_ATTACK_DAMAGE_POINT 250
+#define WOW_DEFAULT_ATTACK_BACKSWING 450
+#define WOW_DEFAULT_PAIN_TIME 450
+#define WOW_DEFAULT_DEATH_TIME 1200
+#define BZ_WOW_CORPSE_TIME 300000
+
+void Wow_FaceTarget(edict_t *ent, edict_t *target) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    vec2_t delta;
+
+    if (!ent || !target || !local) {
+        return;
+    }
+
+    delta = Vector2_sub(&target->s.origin2, &ent->s.origin2);
+    if (Vector2_len(&delta) <= 0.001f) {
+        return;
+    }
+    local->yaw = (float)RAD2DEG(atan2f(delta.y, delta.x));
+    ent->s.angle = (float)DEG2RAD(local->yaw);
+}
+
+static void Wow_AttackTimingFromAnimation(wowEntityLocal_t const *local,
+                                          uint32_t *damage_point,
+                                          uint32_t *backswing) {
+    uint32_t dp = WOW_DEFAULT_ATTACK_DAMAGE_POINT;
+    uint32_t bs = WOW_DEFAULT_ATTACK_BACKSWING;
+
+    if (local) {
+        if (local->attack_damage_point > 0) {
+            dp = local->attack_damage_point;
+        }
+        if (local->attack_backswing > 0) {
+            bs = local->attack_backswing;
+        }
+        if (local->animation && local->attack_damage_point == 0 && local->attack_backswing == 0) {
+            uint32_t duration = local->animation->interval[1] > local->animation->interval[0]
+                ? local->animation->interval[1] - local->animation->interval[0]
+                : 0;
+            if (duration > 0) {
+                /* Prefer M2 event-derived damage_point over the 35% fallback */
+                if (local->animation->damage_point > 0) {
+                    dp = MIN(local->animation->damage_point, duration);
+                } else {
+                    dp = MAX(1, duration * 35 / 100);
+                }
+                bs = MAX(1, duration - dp);
+            }
+        }
+    }
+
+    if (damage_point) {
+        *damage_point = dp;
+    }
+    if (backswing) {
+        *backswing = bs;
+    }
+}
+
+static void Wow_AdvanceDeathFrame(edict_t *ent, wowEntityLocal_t *local) {
+    uint32_t end_frame;
+
+    if (!ent || !local || !local->animation) {
+        return;
+    }
+
+    end_frame = local->animation->interval[1] > local->animation->interval[0]
+        ? local->animation->interval[1] - 1
+        : local->animation->interval[0];
+
+    if (ent->s.frame < end_frame) {
+        uint32_t next_frame = ent->s.frame + FRAMETIME;
+        ent->s.frame = MIN(next_frame, end_frame);
+    } else {
+        ent->s.frame = end_frame;
+    }
+}
+
+void Wow_ApplyDamage(edict_t *target, edict_t *attacker, uint32_t damage) {
+    wowEntityLocal_t *target_local;
+    uint32_t actual;
+
+    if (!target || damage == 0) return;
+    target_local = Wow_EntityLocal(target);
+    if (!target_local || target_local->dead || target_local->health == 0 || target_local->godmode) return;
+
+    actual = MIN(damage, target_local->health);
+    /* Push damage flash events to player client (entity 0). */
+    if (Wow_EntityIndex(target) < MAX_CLIENTS) {
+        wow_clients[0].incoming_damage = actual;
+        wow_clients[0].incoming_dmg_timer = 1500;
+    }
+    if (attacker && Wow_EntityIndex(attacker) < MAX_CLIENTS) {
+        wow_clients[0].outgoing_damage = actual;
+        wow_clients[0].outgoing_dmg_timer = 1500;
+    }
+
+    if (target_local->health <= damage) {
+        Wow_AIDie(target, attacker);
+        return;
+    }
+
+    target_local->health -= damage;
+
+    /* Quake2-style reaction: retaliate when not already locked, else play pain. */
+    if (attacker && attacker != target && target_local->attack &&
+        target_local->attack_damage_time == 0 &&
+        target_local->attack_backswing_time == 0 &&
+        target_local->pain_time == 0 &&
+        target_local->death_time == 0) {
+        target_local->enemy = attacker;
+        target_local->attack(target);
+        return;
+    }
+
+    if (target_local->pain) {
+        target_local->pain(target);
+    }
+}
+
+bool Wow_EntityAffectingCombat(edict_t *ent) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    wowEntityLocal_t *target_local;
+    edict_t *target;
+
+    if (!ent || !local) {
+        return false;
+    }
+    target = local->enemy;
+    if (!target || !target->inuse || target == ent) {
+        local->enemy = NULL;
+        return false;
+    }
+    target_local = Wow_EntityLocal(target);
+    if (local->dead || (local->health == 0) ||
+        (target_local && (target_local->dead || target_local->health == 0))) {
+        local->enemy = NULL;
+        return false;
+    }
+    return true;
+}
+
+bool Wow_SetStandMove(edict_t *ent) {
+    return Wow_SetEntityMove(ent, &wow_move_stand);
+}
+
+bool Wow_SetRunMove(edict_t *ent) {
+    return Wow_SetEntityMove(ent, &wow_move_run);
+}
+
+bool Wow_SetWalkMove(edict_t *ent) {
+    return Wow_SetEntityMove(ent, &wow_move_walk);
+}
+
+/* Preserve facing while selecting the M2 locomotion sequence that matches the input direction. */
+bool Wow_SetDirectionalMove(edict_t *ent, uint32_t flags) {
+    if ((flags & WOW_MOVE_BACK) && !(flags & WOW_MOVE_FORWARD))
+        return Wow_SetEntityMove(ent, &wow_move_back) || Wow_SetRunMove(ent);
+    /* A/D are lateral movement; ShuffleLeft/Right are turn animations, not strafe animations. */
+    return Wow_SetRunMove(ent);
+}
+
+bool Wow_SetCombatReadyAnimation(edict_t *ent) {
+    static cstring_t const weapon_ready_animations[] = {
+        "Ready1H",
+        "ReadyUnarmed",
+        "Ready2H",
+        "Ready2HL",
+        NULL,
+    };
+    static cstring_t const unarmed_ready_animations[] = {
+        "ReadyUnarmed",
+        "Ready1H",
+        "Ready2H",
+        "Ready2HL",
+        NULL,
+    };
+
+    if (Wow_SetEntityMoveFirstAnimation(ent, &wow_move_ready, ent && ent->s.model2 ? weapon_ready_animations : unarmed_ready_animations)) {
+        return true;
+    }
+    return Wow_SetStandMove(ent);
+}
+
+void Wow_AIIdle(edict_t *ent) {
+    if (Wow_EntityAffectingCombat(ent)) {
+        Wow_SetCombatReadyAnimation(ent);
+    } else {
+        Wow_SetStandMove(ent);
+    }
+}
+
+void Wow_AIMove(edict_t *ent) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    vec2_t target;
+    vec2_t delta;
+    float len;
+    float step;
+
+    if (!ent || !local) {
+        return;
+    }
+
+    target = (vec2_t){
+        local->home.x + cosf(local->patrol_phase) * local->patrol_radius,
+        local->home.y + sinf(local->patrol_phase) * local->patrol_radius,
+    };
+    delta = Vector2_sub(&target, &ent->s.origin2);
+    len = Vector2_len(&delta);
+    if (len <= 0.001f) {
+        return;
+    }
+
+    /* Frostbolt slow: halve movement speed while the debuff is active. */
+    float effective_speed = local->slow_timer > 0 ? local->walk_speed * 0.5f : local->walk_speed;
+    step = MIN(effective_speed * ((float)FRAMETIME / 1000.0f), len);
+    ent->s.origin.x += delta.x * step / len;
+    ent->s.origin.y += delta.y * step / len;
+    /* Quake2 M_CheckGround: re-anchor Z to the nearest authored terrain or WMO floor. */
+    ent->s.origin.z = Wow_FloorHeight(ent->s.origin.x, ent->s.origin.y, ent->s.origin.z);
+    ent->s.origin2 = (vec2_t){ ent->s.origin.x, ent->s.origin.y };
+    local->yaw = (float)RAD2DEG(atan2f(delta.y, delta.x));
+    ent->s.angle = (float)DEG2RAD(local->yaw);
+    Wow_SetWalkMove(ent);
+}
+
+void Wow_AIAttack(edict_t *ent) {
+    static cstring_t const attack_animations[] = {
+        "Attack1H",
+        "AttackUnarmed",
+        "Attack2H",
+        "Attack",
+        NULL,
+    };
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    edict_t *target;
+
+    uint32_t damage_point;
+    uint32_t backswing;
+
+    if (!ent || !local || local->dead) {
+        return;
+    }
+
+    if (local->attack_damage_time > 0 || local->attack_backswing_time > 0 ||
+        local->pain_time > 0 || local->death_time > 0) {
+        return;
+    }
+
+    target = Wow_EntityAffectingCombat(ent) ? local->enemy : NULL;
+    if (!target) {
+        return;
+    }
+
+    Wow_FaceTarget(ent, target);
+
+    /* Don't start the swing animation if out of melee range — the per-frame
+     * chase logic in Wow_RunFrame will close the gap automatically. */
+    {
+        vec2_t delta = Vector2_sub(&target->s.origin2, &ent->s.origin2);
+        if (Vector2_len(&delta) > WOW_MELEE_RANGE) {
+            return;
+        }
+    }
+
+    if (!Wow_SetEntityMoveFirstAnimation(ent, &wow_move_attack, attack_animations)) {
+        return;
+    }
+
+    Wow_AttackTimingFromAnimation(local, &damage_point, &backswing);
+    local->attack_damage_time = damage_point;
+    local->attack_backswing_time = backswing;
+    local->attack_time = damage_point + backswing;
+    local->attack_damage_done = false;
+}
+
+void Wow_AIPain(edict_t *ent) {
+    static cstring_t const pain_animations[] = {
+        "CombatWound",
+        "StandWound",
+        "Stun",
+        NULL,
+    };
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+
+    if (!ent || !local || local->dead || local->health == 0) {
+        return;
+    }
+
+    local->pain_time = WOW_DEFAULT_PAIN_TIME;
+    Wow_SetEntityMoveFirstAnimation(ent, &wow_move_pain, pain_animations);
+}
+
+void Wow_AIDie(edict_t *ent, edict_t *attacker) {
+    static cstring_t const death_animations[] = {
+        "Death",
+        "Dead",
+        NULL,
+    };
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    (void)attacker;
+
+    if (!ent || !local || local->dead) {
+        return;
+    }
+
+    local->dead = true;
+    local->health = 0;
+    local->enemy = NULL;
+    local->attack_time = 0;
+    local->attack_damage_time = 0;
+    local->attack_backswing_time = 0;
+    local->attack_damage_done = false;
+    local->pain_time = 0;
+    Wow_QuestAwardKillCredit(attacker, local->display_id);
+    Wow_RollLoot(ent);
+
+    ent->svflags |= SVF_DEADMONSTER;
+    if (Wow_SetEntityMoveFirstAnimation(ent, &wow_move_death, death_animations) && local->animation) {
+        local->death_time = MAX(1, local->animation->interval[1] - local->animation->interval[0]);
+    } else {
+        local->death_time = WOW_DEFAULT_DEATH_TIME;
+    }
+}
+
+bool Wow_AIAdvanceLockedFrame(edict_t *ent) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+    bool finished;
+
+    if (!ent || !local) {
+        return false;
+    }
+
+    if (local->dead) {
+        if (local->death_time > 0) {
+            finished = local->death_time <= FRAMETIME;
+            if (local->death_time > FRAMETIME) {
+                local->death_time -= FRAMETIME;
+            } else {
+                local->death_time = 0;
+            }
+            Wow_AdvanceDeathFrame(ent, local);
+            if (finished) {
+                local->death_time = 0;
+                Wow_AdvanceDeathFrame(ent, local);
+                /* The dying creature is the corpse: replacing it used to leave the animated
+                 * original beside a frame-zero duplicate. */
+                local->corpse_owner = ent->s.number;
+                local->corpse_timer = BZ_WOW_CORPSE_TIME;
+                ent->svflags &= ~SVF_MONSTER;
+                local->think = Wow_RunCorpseFrame;
+            }
+        } else {
+            Wow_AdvanceDeathFrame(ent, local);
+        }
+        return true;
+    }
+
+    if (local->attack_damage_time > 0) {
+        finished = local->attack_damage_time <= FRAMETIME;
+        if (local->attack_damage_time > FRAMETIME) {
+            local->attack_damage_time -= FRAMETIME;
+        } else {
+            local->attack_damage_time = 0;
+        }
+        local->attack_time = local->attack_damage_time + local->attack_backswing_time;
+        Wow_AdvanceEntityFrame(ent);
+        if (finished && !local->attack_damage_done) {
+            edict_t *target = Wow_EntityAffectingCombat(ent) ? local->enemy : NULL;
+
+            local->attack_damage_done = true;
+            if (target) {
+                Wow_ApplyDamage(target, ent, Wow_RollWeaponDamage(local->weapon_entry));
+            }
+        }
+        return true;
+    }
+
+    if (local->attack_backswing_time > 0) {
+        finished = local->attack_backswing_time <= FRAMETIME;
+        if (local->attack_backswing_time > FRAMETIME) {
+            local->attack_backswing_time -= FRAMETIME;
+        } else {
+            local->attack_backswing_time = 0;
+        }
+        local->attack_time = local->attack_backswing_time;
+        Wow_AdvanceEntityFrame(ent);
+        if (finished) {
+            local->attack_time = 0;
+            local->attack_damage_done = false;
+            if (Wow_EntityAffectingCombat(ent)) {
+                Wow_SetCombatReadyAnimation(ent);
+                local->attack(ent); /* auto-reattack after each swing */
+            } else {
+                Wow_SetStandMove(ent);
+            }
+        }
+        return true;
+    }
+
+    if (local->pain_time > 0) {
+        finished = local->pain_time <= FRAMETIME;
+        if (local->pain_time > FRAMETIME) {
+            local->pain_time -= FRAMETIME;
+        } else {
+            local->pain_time = 0;
+        }
+        Wow_AdvanceEntityFrame(ent);
+        if (finished) {
+            if (Wow_EntityAffectingCombat(ent)) {
+                Wow_SetCombatReadyAnimation(ent);
+            } else {
+                Wow_SetStandMove(ent);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void Wow_AIRunFrame(edict_t *ent) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+
+    if (!ent || !local) {
+        return;
+    }
+
+    if (local->dead) {
+        (void)Wow_AIAdvanceLockedFrame(ent);
+        return;
+    }
+
+    if (Wow_AIAdvanceLockedFrame(ent)) {
+        return;
+    }
+
+    if (local->patrol_radius > 0.0f && local->walk_speed > 0.0f) {
+        local->patrol_phase += ((float)FRAMETIME / 1000.0f) * 0.6f;
+        if (local->move) {
+            local->move(ent);
+        }
+    } else {
+        if (local->idle) {
+            local->idle(ent);
+        }
+    }
+
+    Wow_AdvanceEntityFrame(ent);
+}
+
+void Wow_RunCreatureFrame(edict_t *ent) {
+    wowEntityLocal_t *local = Wow_EntityLocal(ent);
+
+    if (!ent || !local || !(ent->svflags & SVF_MONSTER)) {
+        return;
+    }
+    Wow_AIRunFrame(ent);
+}

@@ -1,0 +1,639 @@
+#include "server.h"
+#include <stdlib.h>
+
+static bool SV_LobbyEnsureTeams(mapInfo_t *info, uint32_t num_teams) {
+    mapTeam_t *teams;
+
+    if (!info) {
+        return false;
+    }
+    if (num_teams <= info->num_teams) {
+        return true;
+    }
+    if (num_teams > MAX_PLAYERS) {
+        num_teams = MAX_PLAYERS;
+    }
+    teams = MemAlloc(sizeof(*teams) * num_teams);
+    if (!teams) {
+        return false;
+    }
+    memset(teams, 0, sizeof(*teams) * num_teams);
+    if (info->teams && info->num_teams > 0) {
+        memcpy(teams, info->teams, sizeof(*teams) * info->num_teams);
+        MemFree(info->teams);
+    }
+    info->teams = teams;
+    info->num_teams = num_teams;
+    return true;
+}
+
+static void SV_LobbyClearPlayerTeams(mapInfo_t *info, uint32_t player) {
+    if (!info || !info->teams || player >= MAX_PLAYERS) {
+        return;
+    }
+    FOR_LOOP(i, info->num_teams) {
+        info->teams[i].playerMasks &= ~(1u << player);
+    }
+}
+
+static void SV_LobbyMovePlayerToTeam(mapInfo_t *info, uint32_t player, uint32_t team) {
+    if (!info || player >= MAX_PLAYERS || team >= MAX_PLAYERS) {
+        return;
+    }
+    if (!SV_LobbyEnsureTeams(info, team + 1)) {
+        return;
+    }
+    SV_LobbyClearPlayerTeams(info, player);
+    info->teams[team].playerMasks |= 1u << player;
+}
+
+static uint32_t SV_LobbyMapPlayerTeam(mapInfo_t const *info, uint32_t player) {
+    if (!info || !info->teams || player >= MAX_PLAYERS) {
+        return player;
+    }
+    FOR_LOOP(i, info->num_teams) {
+        if (info->teams[i].playerMasks & (1u << player)) {
+            return i;
+        }
+    }
+    return player;
+}
+
+static cstring_t SV_LobbyBaseName(cstring_t path) {
+    cstring_t base = path;
+
+    if (!path) {
+        return "";
+    }
+    for (cstring_t p = path; *p; p++) {
+        if (*p == '\\' || *p == '/') {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
+static void SV_LobbySanitizeText(cstring_t in, string_t out, uint32_t out_size) {
+    uint32_t write = 0;
+
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!in) {
+        return;
+    }
+    for (; *in && write + 1 < out_size; in++) {
+        unsigned char c = (unsigned char)*in;
+
+        if (c == '\\' || c == '"' || c == '\n' || c == '\r') {
+            c = ' ';
+        }
+        if (c < 32) {
+            continue;
+        }
+        out[write++] = (char)c;
+    }
+    out[write] = '\0';
+}
+
+static cstring_t SV_UserinfoValue(cstring_t userinfo, cstring_t key, string_t out, uint32_t out_size) {
+    uint32_t key_len;
+
+    if (!out || out_size == 0) {
+        return "";
+    }
+    out[0] = '\0';
+    if (!userinfo || !key || !key[0]) {
+        return out;
+    }
+    key_len = (uint32_t)strlen(key);
+    for (cstring_t p = userinfo; *p;) {
+        cstring_t k;
+        cstring_t v;
+        uint32_t len = 0;
+
+        if (*p == '\\') {
+            p++;
+        }
+        k = p;
+        while (*p && *p != '\\') {
+            p++;
+        }
+        if ((uint32_t)(p - k) != key_len || strncmp(k, key, key_len)) {
+            if (*p == '\\') {
+                p++;
+            }
+            while (*p && *p != '\\') {
+                p++;
+            }
+            continue;
+        }
+        if (*p == '\\') {
+            p++;
+        }
+        v = p;
+        while (v[len] && v[len] != '\\' && len + 1 < out_size) {
+            len++;
+        }
+        memcpy(out, v, len);
+        out[len] = '\0';
+        return out;
+    }
+    return out;
+}
+
+static playerType_t SV_LobbySlotPlayerType(lobbySlot_t const *slot) {
+    if (!slot) {
+        return kPlayerTypeNone;
+    }
+    if (slot->type == LOBBY_SLOT_COMPUTER) {
+        return kPlayerTypeComputer;
+    }
+    if (slot->type == LOBBY_SLOT_HUMAN && slot->occupied) {
+        return kPlayerTypeHuman;
+    }
+    return kPlayerTypeNone;
+}
+
+static cstring_t SV_LobbySlotTypeName(lobbySlotType_t type) {
+    switch (type) {
+        case LOBBY_SLOT_OPEN: return "open";
+        case LOBBY_SLOT_HUMAN: return "human";
+        case LOBBY_SLOT_COMPUTER: return "computer";
+        case LOBBY_SLOT_CLOSED: return "closed";
+    }
+    return "unknown";
+}
+
+static cstring_t SV_PlayerTypeName(playerType_t type) {
+    switch (type) {
+        case kPlayerTypeNone: return "none";
+        case kPlayerTypeHuman: return "human";
+        case kPlayerTypeComputer: return "computer";
+        case kPlayerTypeNeutral: return "neutral";
+        case kPlayerTypeRescuable: return "rescuable";
+    }
+    return "unknown";
+}
+
+static void SV_LobbySendChat(client_t *client, uint32_t clientnum, uint32_t sender_client, cstring_t text) {
+    uint8_t payload_buf[MAX_MSGLEN];
+    sizeBuf_t payload;
+
+    if (!client || !text || !text[0]) {
+        return;
+    }
+    if (client->state != cs_connected && client->state != cs_spawned) {
+        return;
+    }
+    SZ_Init(&payload, payload_buf, sizeof(payload_buf));
+    MSG_WriteByte(&payload, clientnum == sender_client ? 1 : 0);
+    MSG_WriteString(&payload, text);
+    SV_WritePayload(&client->netchan.message, svc_lobby_chat, &payload);
+    Netchan_Transmit(NS_SERVER, &client->netchan);
+}
+
+static void SV_LobbyClearClientAssignment(uint32_t clientnum) {
+    client_t *cl;
+
+    if (clientnum >= svs.num_clients) {
+        return;
+    }
+    cl = &svs.clients[clientnum];
+    cl->lobby_slot = MAX_PLAYERS;
+    cl->playernum = MAX_PLAYERS;
+}
+
+/* Release a departing client's lobby slot while keeping its map-player policy available for reassignment. */
+void SV_LobbyRemoveClient(uint32_t clientnum) {
+    bool changed = false;
+    if (clientnum >= svs.num_clients) return;
+    if (svs.lobby.active) {
+        FOR_LOOP(i, svs.lobby.slot_count) {
+            lobbySlot_t *slot = &svs.lobby.slots[i];
+            if (!slot->occupied || slot->client != clientnum) continue;
+            slot->occupied = false;
+            slot->ready = false;
+            slot->client = MAX_CLIENTS;
+            if (slot->type == LOBBY_SLOT_HUMAN) {
+                slot->type = LOBBY_SLOT_OPEN;
+                snprintf(slot->name, sizeof(slot->name), "Open");
+            }
+            changed = true;
+        }
+    }
+    SV_LobbyClearClientAssignment(clientnum);
+    if (changed) {
+        svs.lobby.revision++;
+        SV_LobbyBroadcastSetup();
+    }
+}
+
+static bool SV_LobbyAssignClientToSlot(uint32_t clientnum, uint32_t slotnum) {
+    client_t *cl;
+    lobbySlot_t *slot;
+
+    if (clientnum >= svs.num_clients || slotnum >= MAX_PLAYERS) {
+        return false;
+    }
+    cl = &svs.clients[clientnum];
+    slot = &svs.lobby.slots[slotnum];
+    if (!slot->visible || slot->map_player >= MAX_PLAYERS) {
+        return false;
+    }
+    slot->occupied = true;
+    slot->ready = false;
+    slot->client = clientnum;
+    slot->type = LOBBY_SLOT_HUMAN;
+    snprintf(slot->name, sizeof(slot->name), "%s", cl->name[0] ? cl->name : "Player");
+    cl->lobby_slot = slotnum;
+    cl->playernum = slot->map_player;
+    return true;
+}
+
+static bool SV_LobbyClientAssigned(uint32_t clientnum) {
+    FOR_LOOP(i, svs.lobby.slot_count) {
+        lobbySlot_t const *slot = &svs.lobby.slots[i];
+
+        if (slot->visible && slot->occupied && slot->client == clientnum) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SV_LobbyClientInit(client_t *cl, cstring_t userinfo) {
+    char raw_name[sizeof(cl->name)];
+
+    if (!cl) {
+        return;
+    }
+    cl->playernum = MAX_PLAYERS;
+    cl->lobby_slot = MAX_PLAYERS;
+    snprintf(cl->userinfo, sizeof(cl->userinfo), "%s", userinfo ? userinfo : "");
+    SV_UserinfoValue(userinfo, "name", raw_name, sizeof(raw_name));
+    if (!raw_name[0]) {
+        snprintf(raw_name, sizeof(raw_name), "%s", Cvar_String("name", "Player"));
+    }
+    SV_LobbySanitizeText(raw_name, cl->name, sizeof(cl->name));
+    if (!cl->name[0]) {
+        snprintf(cl->name, sizeof(cl->name), "Player");
+    }
+}
+
+void SV_LobbyInit(cstring_t mapFilename) {
+    memset(&svs.lobby, 0, sizeof(svs.lobby));
+    svs.lobby.active = true;
+    snprintf(svs.lobby.map_path, sizeof(svs.lobby.map_path), "%s", mapFilename ? mapFilename : "");
+    snprintf(svs.lobby.map_name, sizeof(svs.lobby.map_name), "%s", SV_LobbyBaseName(mapFilename));
+    svs.lobby.game_speed = (uint32_t)Cvar_Integer("sv_game_speed", 2);
+    svs.lobby.local_slot = MAX_PLAYERS;
+}
+
+bool SV_LobbyAssignClient(uint32_t clientnum, bool host) {
+    uint32_t fallback = MAX_PLAYERS;
+
+    if (!svs.lobby.active || clientnum >= svs.num_clients) {
+        return true;
+    }
+    if (SV_LobbyClientAssigned(clientnum)) {
+        return true;
+    }
+    FOR_LOOP(i, svs.lobby.slot_count) {
+        lobbySlot_t const *slot = &svs.lobby.slots[i];
+
+        if (!slot->visible || slot->occupied) {
+            continue;
+        }
+        if (host && slot->type == LOBBY_SLOT_HUMAN) {
+            return SV_LobbyAssignClientToSlot(clientnum, i);
+        }
+        if (slot->type == LOBBY_SLOT_OPEN && fallback == MAX_PLAYERS) {
+            fallback = i;
+        }
+    }
+    if (fallback != MAX_PLAYERS) {
+        return SV_LobbyAssignClientToSlot(clientnum, fallback);
+    }
+    return false;
+}
+
+void SV_LobbyWriteSetup(client_t *cl) {
+    uint8_t payload_buf[MAX_MSGLEN];
+    sizeBuf_t payload;
+    uint32_t local_slot = cl ? cl->lobby_slot : MAX_PLAYERS;
+
+    if (!cl) {
+        return;
+    }
+    SZ_Init(&payload, payload_buf, sizeof(payload_buf));
+    MSG_WriteString(&payload, svs.lobby.map_path);
+    MSG_WriteString(&payload, svs.lobby.map_name);
+    MSG_WriteByte(&payload, (int)svs.lobby.game_speed);
+    MSG_WriteByte(&payload, (int)svs.lobby.slot_count);
+    MSG_WriteByte(&payload, local_slot < MAX_PLAYERS ? (int)local_slot : 255);
+    MSG_WriteLong(&payload, (int)svs.lobby.revision);
+    FOR_LOOP(i, svs.lobby.slot_count) {
+        lobbySlot_t const *slot = &svs.lobby.slots[i];
+
+        MSG_WriteByte(&payload, slot->visible ? 1 : 0);
+        MSG_WriteByte(&payload, (slot->occupied ? 1 : 0) | (slot->occupied && slot->ready ? 2 : 0));
+        MSG_WriteByte(&payload, slot->visible && slot->client < MAX_CLIENTS ? (int)slot->client : 255);
+        MSG_WriteByte(&payload, slot->visible && slot->map_player < MAX_PLAYERS ? (int)slot->map_player : 255);
+        MSG_WriteByte(&payload, (int)slot->type);
+        MSG_WriteByte(&payload, (int)slot->race);
+        MSG_WriteByte(&payload, (int)slot->team);
+        MSG_WriteByte(&payload, (int)slot->color);
+        MSG_WriteString(&payload, slot->name);
+    }
+    SV_WritePayload(&cl->netchan.message, svc_lobby_setup, &payload);
+}
+
+void SV_LobbyBroadcastSetup(void) {
+    if (sv.state != ss_lobby || !svs.lobby.active) {
+        return;
+    }
+    FOR_LOOP(i, svs.num_clients) {
+        client_t *cl = &svs.clients[i];
+
+        if (cl->state != cs_connected && cl->state != cs_spawned) {
+            continue;
+        }
+        SV_LobbyWriteSetup(cl);
+        Netchan_Transmit(NS_SERVER, &cl->netchan);
+    }
+}
+
+void SV_LobbySetConfig(uint32_t speed, uint32_t slots, cstring_t map_name) {
+    if (!svs.lobby.active) {
+        return;
+    }
+    if (slots > MAX_PLAYERS) {
+        slots = MAX_PLAYERS;
+    }
+    svs.lobby.game_speed = speed;
+    svs.lobby.slot_count = slots;
+    SV_LobbySanitizeText(map_name && map_name[0] ? map_name : SV_LobbyBaseName(svs.lobby.map_path),
+                         svs.lobby.map_name,
+                         sizeof(svs.lobby.map_name));
+    svs.lobby.revision++;
+}
+
+void SV_LobbySetSlot(uint32_t slotnum, lobbySlot_t const *config) {
+    lobbySlot_t old;
+    lobbySlot_t *slot;
+
+    if (!svs.lobby.active || !config || slotnum >= MAX_PLAYERS) {
+        return;
+    }
+    if (slotnum >= svs.lobby.slot_count) {
+        svs.lobby.slot_count = slotnum + 1;
+    }
+    slot = &svs.lobby.slots[slotnum];
+    old = *slot;
+    *slot = *config;
+    slot->client = old.client;
+    slot->occupied = old.occupied;
+    if (slot->type != LOBBY_SLOT_HUMAN || !old.occupied) {
+        slot->occupied = false;
+        slot->client = MAX_CLIENTS;
+        if (old.occupied) {
+            SV_LobbyClearClientAssignment(old.client);
+        }
+    } else if (old.occupied && old.client < svs.num_clients) {
+        client_t *cl = &svs.clients[old.client];
+
+        slot->map_player = config->map_player;
+        cl->lobby_slot = slotnum;
+        cl->playernum = slot->map_player;
+        snprintf(slot->name, sizeof(slot->name), "%s", cl->name[0] ? cl->name : config->name);
+    }
+    if (slot->type == LOBBY_SLOT_HUMAN && !slot->occupied) {
+        SV_LobbyAssignClient(0, true);
+    }
+    if (slot->type == LOBBY_SLOT_OPEN) {
+        slot->occupied = false;
+        slot->client = MAX_CLIENTS;
+    }
+    /* Host edits keep an unchanged occupant's ready confirmation. */
+    slot->ready = slot->occupied && old.occupied && slot->client == old.client && old.ready;
+    if (!slot->name[0]) {
+        snprintf(slot->name, sizeof(slot->name), "%s",
+                 slot->type == LOBBY_SLOT_COMPUTER ? "Computer" :
+                 slot->type == LOBBY_SLOT_CLOSED ? "Closed" :
+                 slot->type == LOBBY_SLOT_HUMAN ? "Player" : "Open");
+    }
+    svs.lobby.revision++;
+}
+
+void SV_ApplyLobbySettings(mapInfo_t *info) {
+    if (!info) {
+        return;
+    }
+    FOR_LOOP(i, MAX_PLAYERS) {
+        info->players[i].color = i;
+    }
+    if (!svs.lobby.active || svs.lobby.slot_count == 0) {
+        return;
+    }
+    FOR_LOOP(i, MAX_PLAYERS) {
+        if (info->players[i].used &&
+            info->players[i].playerType != kPlayerTypeNeutral &&
+            info->players[i].playerType != kPlayerTypeRescuable) {
+            info->players[i].playerType = kPlayerTypeNone;
+            SV_LobbyClearPlayerTeams(info, i);
+        }
+    }
+    FOR_LOOP(slotnum, svs.lobby.slot_count) {
+        lobbySlot_t const *slot = &svs.lobby.slots[slotnum];
+        mapPlayer_t *player;
+        playerType_t type;
+
+        if (!slot->visible || slot->map_player >= MAX_PLAYERS) {
+            continue;
+        }
+        player = &info->players[slot->map_player];
+        if (!player->used) {
+            continue;
+        }
+        type = SV_LobbySlotPlayerType(slot);
+        fprintf(stderr,
+                "  lobby slot %u: visible=%d occupied=%d client=%u map_player=%u slot_type=%s applied_type=%s race=%u team=%u color=%u name=\"%s\"\n",
+                (unsigned)slotnum,
+                slot->visible ? 1 : 0,
+                slot->occupied ? 1 : 0,
+                (unsigned)slot->client,
+                (unsigned)slot->map_player,
+                SV_LobbySlotTypeName(slot->type),
+                SV_PlayerTypeName(type),
+                (unsigned)slot->race,
+                (unsigned)slot->team,
+                (unsigned)slot->color,
+                slot->name);
+        player->playerType = type;
+        player->playerRace = slot->race;
+        player->color = slot->color % MAX_CLIENTS;
+        if (slot->name[0]) {
+            SAFE_DELETE(player->playerName, MemFree);
+            player->playerName = MemAlloc(strlen(slot->name) + 1);
+            memcpy(player->playerName, slot->name, strlen(slot->name) + 1);
+        }
+        if (type == kPlayerTypeNone) {
+            SV_LobbyClearPlayerTeams(info, slot->map_player);
+        } else {
+            SV_LobbyMovePlayerToTeam(info, slot->map_player, slot->team);
+        }
+    }
+    FOR_LOOP(i, MAX_PLAYERS) {
+        mapPlayer_t const *player = &info->players[i];
+
+        if (!player->used && player->playerType == kPlayerTypeNone) {
+            continue;
+        }
+        fprintf(stderr,
+                "  map player %u: used=%d type=%s race=%u team=%u color=%u start=(%.1f %.1f) name=\"%s\"\n",
+                (unsigned)i,
+                player->used ? 1 : 0,
+                SV_PlayerTypeName(player->playerType),
+                (unsigned)player->playerRace,
+                (unsigned)SV_LobbyMapPlayerTeam(info, i),
+                (unsigned)player->color,
+                player->startingPosition.x,
+                player->startingPosition.y,
+                player->playerName ? player->playerName : "");
+    }
+}
+
+/* A connected player confirms (or withdraws) readiness for its own slot. */
+void SV_LobbySetReady(uint32_t clientnum, bool ready) {
+    if (!svs.lobby.active) return;
+    FOR_LOOP(i, svs.lobby.slot_count) {
+        lobbySlot_t *slot = &svs.lobby.slots[i];
+        if (!slot->occupied || slot->client != clientnum || slot->ready == ready) continue;
+        slot->ready = ready;
+        svs.lobby.revision++;
+        SV_LobbyBroadcastSetup();
+        return;
+    }
+}
+
+/* Host side selection: exchange two rows' occupants while each row keeps its map player. */
+void SV_LobbySwapSlots(uint32_t a, uint32_t b) {
+    lobbySlot_t *sa, *sb, tmp;
+    if (!svs.lobby.active || a == b || a >= svs.lobby.slot_count || b >= svs.lobby.slot_count) return;
+    sa = &svs.lobby.slots[a]; sb = &svs.lobby.slots[b];
+    if (!sa->visible || !sb->visible) return;
+    tmp = *sa;
+    sa->occupied = sb->occupied; sa->ready = sb->ready; sa->client = sb->client; sa->type = sb->type;
+    memcpy(sa->name, sb->name, sizeof(sa->name));
+    sb->occupied = tmp.occupied; sb->ready = tmp.ready; sb->client = tmp.client; sb->type = tmp.type;
+    memcpy(sb->name, tmp.name, sizeof(sb->name));
+    FOR_LOOP(i, 2) {
+        uint32_t const row = i ? b : a;
+        lobbySlot_t const *slot = &svs.lobby.slots[row];
+        if (slot->occupied && slot->client < svs.num_clients) {
+            svs.clients[slot->client].lobby_slot = row;
+            svs.clients[slot->client].playernum = slot->map_player;
+        }
+    }
+    svs.lobby.revision++;
+    SV_LobbyBroadcastSetup();
+}
+
+#ifndef TOOL_COMMON_NO_MPQ
+static void SV_LobbySwap_f(void) {
+    if (Cmd_Argc() != 3) {
+        fprintf(stderr, "usage: lobby_swap <slot> <slot>\n");
+        return;
+    }
+    SV_LobbySwapSlots((uint32_t)atoi(Cmd_Argv(1)), (uint32_t)atoi(Cmd_Argv(2)));
+}
+
+/* lobby_ready [0|1] [slot]: the host marks itself, or as administrator a seated row, ready. */
+static void SV_LobbyReady_f(void) {
+    bool const ready = Cmd_Argc() < 2 || atoi(Cmd_Argv(1)) != 0;
+    uint32_t client = 0; /* the listen host's loopback client */
+    if (Cmd_Argc() >= 3) {
+        uint32_t const row = (uint32_t)atoi(Cmd_Argv(2));
+        if (row >= svs.lobby.slot_count || !svs.lobby.slots[row].occupied) return;
+        client = svs.lobby.slots[row].client;
+    }
+    SV_LobbySetReady(client, ready);
+}
+#endif
+
+void SV_LobbyBroadcastChatFrom(uint32_t sender_client, cstring_t sender, cstring_t text) {
+    char clean_sender[64];
+    char clean_text[256];
+    char line[384];
+
+    if (sv.state != ss_lobby || !text || !text[0]) {
+        return;
+    }
+    SV_LobbySanitizeText(sender && sender[0] ? sender : "Player", clean_sender, sizeof(clean_sender));
+    SV_LobbySanitizeText(text, clean_text, sizeof(clean_text));
+    if (!clean_text[0]) {
+        return;
+    }
+    snprintf(line, sizeof(line), "%s: %s", clean_sender[0] ? clean_sender : "Player", clean_text);
+    FOR_LOOP(i, svs.num_clients) {
+        SV_LobbySendChat(&svs.clients[i], i, sender_client, line);
+    }
+}
+
+void SV_LobbyBroadcastChat(cstring_t sender, cstring_t text) {
+    SV_LobbyBroadcastChatFrom(MAX_CLIENTS, sender, text);
+}
+
+#ifndef TOOL_COMMON_NO_MPQ
+static void SV_LobbySay_f(void) {
+    SV_LobbyBroadcastChatFrom(0, "Player", Cmd_ArgsFrom(1));
+}
+
+static void SV_LobbyConfig_f(void) {
+    uint32_t speed;
+    uint32_t slots;
+
+    if (Cmd_Argc() < 4) {
+        fprintf(stderr, "usage: lobby_config <speed> <slots> <map_name>\n");
+        return;
+    }
+    speed = (uint32_t)atoi(Cmd_Argv(1));
+    slots = (uint32_t)atoi(Cmd_Argv(2));
+    SV_LobbySetConfig(speed, slots, Cmd_ArgsFrom(3));
+    SV_LobbyBroadcastSetup();
+}
+
+static void SV_LobbySlot_f(void) {
+    lobbySlot_t slot;
+    uint32_t slotnum;
+
+    if (Cmd_Argc() < 9) {
+        fprintf(stderr, "usage: lobby_slot <slot> <visible> <map_player> <type> <race> <team> <color> <name>\n");
+        return;
+    }
+    memset(&slot, 0, sizeof(slot));
+    slotnum = (uint32_t)atoi(Cmd_Argv(1));
+    slot.visible = atoi(Cmd_Argv(2)) != 0;
+    slot.map_player = (uint32_t)atoi(Cmd_Argv(3));
+    slot.type = (lobbySlotType_t)atoi(Cmd_Argv(4));
+    slot.race = (playerRace_t)atoi(Cmd_Argv(5));
+    slot.team = (uint32_t)atoi(Cmd_Argv(6));
+    slot.color = (uint32_t)atoi(Cmd_Argv(7));
+    slot.client = MAX_CLIENTS;
+    SV_LobbySanitizeText(Cmd_ArgsFrom(8), slot.name, sizeof(slot.name));
+    SV_LobbySetSlot(slotnum, &slot);
+    SV_LobbyBroadcastSetup();
+}
+#endif
+
+void SV_LobbyAddCommands(void) {
+#ifndef TOOL_COMMON_NO_MPQ
+    Cmd_AddCommand("lobby_config", SV_LobbyConfig_f);
+    Cmd_AddCommand("lobby_slot", SV_LobbySlot_f);
+    Cmd_AddCommand("lobby_say", SV_LobbySay_f);
+    Cmd_AddCommand("lobby_swap", SV_LobbySwap_f);
+    Cmd_AddCommand("lobby_ready", SV_LobbyReady_f);
+#endif
+}
